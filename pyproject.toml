@@ -24,7 +24,7 @@ rarecell = "rarecell.cli:main"
 include = ["rarecell*"]
 
 [tool.setuptools.package-data]
-rarecell = ["r/*.R", "resources/*"]
+rarecell = ["r/*.R", "resources/*", "web/*.html", "web/*.css", "web/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

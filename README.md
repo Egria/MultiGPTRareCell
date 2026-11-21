@@ -16,7 +16,7 @@ cat work/demo_core/run/usage.json
 cat work/demo_core/evaluation/targets.tsv
 ```
 
-也可直接从 ZIP 中的 wheel 安装，运行 `python -m pip install dist/llm_rarecell-1.0.0-py3-none-any.whl`。该方式同样需要锁定的核心依赖。
+也可直接从 ZIP 中的 wheel 安装，运行 `python -m pip install dist/llm_rarecell-1.0.0-1-py3-none-any.whl`。该方式同样需要锁定的核心依赖。
 
 core demo 使用真实的稀疏归一化、全基因线性与二阶 sketch、Python igraph Leiden、表达检索和隔离评估。脚本策略先列出候选，再按固定优先级对至多两个初始候选请求全局扩展，并提交通过阈值的提案。命令主动暂停一次，再从 SQLite 恢复。输入含 160 个细胞、96 个基因。Seurat 和 OntoAnno 在该模式明确关闭。每次 demo 使用新的空目录。
 
@@ -26,6 +26,31 @@ rarecell doctor --config configs/real_provider.yaml
 ```
 
 doctor 区分本地导入/版本检查和网络调用。上面的 Python 安装足以运行 core demo。真实 A3 还需要 R、固定作者包和已部署模型。R 的私有环境安装命令、精确 commit、R/Seurat 配对和 API 方言见 [THIRD_PARTY.md](THIRD_PARTY.md)。
+
+## 网页任务管理
+
+从安装了当前仓库的 Python 环境启动控制台。之前安装过初版 wheel 的环境可用 `python -m pip install -e .` 更新。首次尝试可以点「运行离线示例」，这会运行真实的 core demo 并生成可下载的 partition 和评估文件。
+
+```bash
+# 在仓库根目录运行。真实模型任务先在同一个 shell 加载密钥和所需的 R 环境。
+set +x
+set -a
+source "$HOME/.api_keys"
+set +a
+rarecell ui --workspace "$PWD/work/tasks" --port 8787
+```
+
+打开终端打印的完整私人链接（含 `#` 后的随机令牌）。页面只绑定本机回环地址。每次启动服务会生成新链接，请只在自己的浏览器使用。选择「新建任务 → 完整发现流程」，填写数据集清单或选择已有快照，再选择 A0–A3。真实任务可在表单中填模型名，或指定含模型名的 YAML 配置；相对路径以启动目录为准。A1/A3 可指定已有注释目录，留空则执行 OntoAnno。提供真值 TSV 时会在发现结束并产生结果后单独评估。凭据从启动服务的环境继承。
+
+任务详情提供当前阶段、日志末尾、最近发现事件、细胞/候选计数及已生成的结果文件。可以取消排队、停止运行、用已有 `checkpoint.json` 恢复发现，也可以单独准备、注释或评估。结果未知的 API 调用只有在恢复表单中主动勾选后才会额外重试。停止正在运行的任务会终止其本地进程组；已发出的模型请求可能仍然计费。
+
+每个工作目录有一个串行队列。队列、阶段日志和各任务输出保存在 `--workspace` 下；请选择私有、持久并支持 POSIX 文件锁的目录。关掉浏览器后，执行器继续运行。节点或作业被回收时，重新在相同目录启动服务可恢复排队项；失去执行进程的在途任务标为「已中断」，可手动从发现检查点续跑。恢复沿用原运行目录，结果链接展示该目录当前发布的文件。独立的准备和注释阶段可在详情所示的任务目录中找到产物。
+
+**在 Duke DCC 使用。** 可以在本机按 Duke 的 Remote SSH 指南配置 `dcc-cpu` 别名，再从 Windows PowerShell 打开下列连接。进入该 SSH 会话后，在分配到的计算节点启动上述控制台，并在本机浏览器打开它打印的链接。若使用已经连接到该计算节点的 VS Code，也可在 Ports 面板转发 8787。队列内的任务共享当前 Slurm allocation 的资源和时限。[Duke Remote SSH 配置](https://oit-rc.pages.oit.duke.edu/rcsupportdocs/dcc/vscode/)
+
+```powershell
+ssh -L 8787:127.0.0.1:8787 dcc-cpu
+```
 
 ## 输入
 
