@@ -1,0 +1,8 @@
+counts: counts.npz
+cells: cells.tsv
+genes: genes.tsv
+orientation: cells_by_genes
+layer: counts
+species: synthetic
+tissue: synthetic
+allowed_metadata: []

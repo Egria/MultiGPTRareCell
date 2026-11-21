@@ -1,0 +1,36 @@
+# Reference CPU smoke configuration. The endpoint must serve the named deployment.
+mode: A3
+prepare:
+  views: [V_HVG, V_GINI, V_LINEAR, V_TENSOR2]
+  graph_backend: seurat
+  resolutions: [0.4]
+  k: 8
+  n_features: 100
+  n_pcs: 8
+  linear_dim: 64
+  tensor_dim: 128
+budget:
+  max_agent_turns: 4
+  max_new_queries: 3
+  max_actions_per_turn: 4
+  stall_turns: 2
+  context_bytes: 16000
+provider:
+  kind: openai_compatible
+  api_style: chat
+  endpoint: chat/completions
+  base_url: http://127.0.0.1:18765/v1
+  model: qwen3b-synthetic-smoke
+  api_key_env: null
+  timeout: 180
+  options: {temperature: 0, max_tokens: 400}
+annotation:
+  enabled: true
+  provider: vllm
+  base_url: http://127.0.0.1:18765/v1
+  model: qwen3b-synthetic-smoke
+  api_key_env: VLLM_API_KEY
+  timeout: 180
+  top_genes: 10
+  batch_size: 1
+  single_line_stop: true

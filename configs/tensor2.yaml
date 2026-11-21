@@ -1,0 +1,4 @@
+prepare:
+  views: [V_HVG, V_GINI, V_LINEAR, V_TENSOR2]
+  tensor_dim: 256
+  seed: 1009

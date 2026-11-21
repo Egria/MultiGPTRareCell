@@ -1,0 +1,6 @@
+# Paths are relative to this file. Register all intended runs before scoring.
+replications:
+  - {replication_id: pbmc_a2_s1009, arm: pbmc_view0_A2, metrics: ../work/evaluation/pbmc_a2_s1009/metrics.json}
+  - {replication_id: pbmc_a2_s1013, arm: pbmc_view0_A2, metrics: ../work/evaluation/pbmc_a2_s1013/metrics.json}
+  - {replication_id: pbmc_a3_s1009, arm: pbmc_view0_A3, metrics: ../work/evaluation/pbmc_a3_s1009/metrics.json}
+  - {replication_id: pbmc_a3_s1013, arm: pbmc_view0_A3, metrics: ../work/evaluation/pbmc_a3_s1013/metrics.json}

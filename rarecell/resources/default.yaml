@@ -1,0 +1,55 @@
+mode: A3
+prepare:
+  views: [V_HVG, V_GINI, V_LINEAR]
+  graph_backend: seurat
+  seed: 1009
+  resolutions: [0.4, 1.0]
+  k: 15
+  n_features: 1000
+  n_pcs: 30
+  linear_dim: 128
+  tensor_dim: 256
+  chunk_cells: 256
+  target_sum: 10000
+  markers: 12
+  outlier_mad: 3.5
+  local_cosine: 0.9
+  local_pairs: 64
+  scale_max_bytes: 536870912
+  rscript: Rscript
+  r_timeout: 7200
+search:
+  neighbor_k: 32
+  background_size: 24
+  min_background: 3
+  signature_per_direction: 6
+  min_effect: 0.5
+  structure_weight: 0.25
+  min_expression_score: 0.65
+  min_score: 0.72
+  max_cells: 50
+  block_size: 1024
+budget:
+  max_agent_turns: 12
+  max_reported_tokens: 0
+  max_new_queries: 25
+  max_expansion_depth: 1
+  stall_turns: 3
+  context_bytes: 36000
+  max_actions_per_turn: 12
+provider:
+  kind: openai_compatible
+  base_url: https://api.openai.com/v1
+  endpoint: chat/completions
+  api_style: chat
+  model: null
+  api_key_env: OPENAI_API_KEY
+  timeout: 120
+  options: {}
+annotation:
+  enabled: true
+  provider: openai
+  model: null
+  api_key_env: OPENAI_API_KEY
+  timeout: 180
+  top_genes: 10

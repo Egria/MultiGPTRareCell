@@ -1,0 +1,18 @@
+# Fill both model fields with identifiers accepted by your deployments.
+mode: A3
+provider:
+  kind: openai_compatible
+  api_style: chat
+  base_url: https://api.openai.com/v1
+  endpoint: chat/completions
+  model: null
+  api_key_env: OPENAI_API_KEY
+  timeout: 120
+  options: {}
+annotation:
+  enabled: true
+  provider: openai
+  model: null
+  api_key_env: OPENAI_API_KEY
+  batch_size: 1
+  top_genes: 10

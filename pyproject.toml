@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools==75.8.2", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-rarecell"
+version = "1.0.0"
+description = "Auditable multi-view rare cell discovery on sparse single-cell expression"
+readme = "README.md"
+requires-python = ">=3.9,<3.13"
+dependencies = [
+  "numpy==1.26.4", "scipy==1.13.1", "scikit-learn==1.5.2",
+  "PyYAML==6.0.2", "igraph==0.11.8", "texttable==1.7.0",
+  "joblib==1.5.3", "threadpoolctl==3.6.0"
+]
+
+[project.optional-dependencies]
+test = ["pytest==8.3.5"]
+
+[project.scripts]
+rarecell = "rarecell.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rarecell*"]
+
+[tool.setuptools.package-data]
+rarecell = ["r/*.R", "resources/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,369 @@
+"""Checkpointed, single-writer discovery policy loop."""
+import fcntl
+from contextlib import nullcontext
+import json
+import os
+import shutil
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+import yaml
+
+from . import __version__, providers
+from .annotation import verify_annotation
+from .config import RESOURCES, atomic, contract, fingerprint, hash_file, read_json, validate_settings, write_json
+from .discovery import Controller, PROMPT_VERSION, SCIENTIFIC
+from .finalize import export
+from .prepare import verify_snapshot
+from .protocol import parse_message
+
+
+def code_fingerprint():
+    module = Path(__file__).parent
+    files = ("discovery.py", "run.py", "protocol.py", "science.py", "state.py", "providers.py",
+             "config.py", "base_evidence.py", "finalize.py", "annotation.py")
+    return fingerprint({name: hash_file(module / name) for name in files})
+
+
+def disjoint(a, b):
+    return a != b and a not in b.parents and b not in a.parents
+
+
+def new_spec(snapshot, run, cache, annotations, cfg, mode, policy, replication_id):
+    if policy not in {"live", "fixed", "scripted_demo"}:
+        raise ValueError("Unknown policy")
+    if policy == "fixed" and mode != "A3":
+        raise ValueError("The matched fixed-policy control uses A3 with shared annotations")
+    if policy == "scripted_demo" and cfg["provider"]["kind"] != "scripted_demo":
+        raise ValueError("Scripted messages require an explicit demo configuration")
+    if mode not in {"A0", "A1", "A2", "A3"}:
+        raise ValueError("Unknown discovery mode")
+    snapshot, run, cache = map(lambda p: Path(p).resolve(), (snapshot, run, cache))
+    if not disjoint(snapshot, run) or not disjoint(cache, run) or not disjoint(snapshot, cache):
+        raise ValueError("Use separate snapshot, run and cache directories")
+    if mode in ("A1", "A3"):
+        annotations = Path(annotations or run.parent / "annotation").resolve()
+        if any(not disjoint(annotations, x) for x in (snapshot, run, cache)):
+            raise ValueError("Use a separate annotation directory")
+    else:
+        annotations = None
+    return {"snapshot": str(snapshot), "cache": str(cache), "annotations": str(annotations) if annotations else None,
+            "mode": mode, "policy": policy, "run_id": uuid.uuid4().hex, "replication_id": replication_id,
+            "software": __version__, "code_sha256": code_fingerprint(), "prompt_version": PROMPT_VERSION, "cfg_hash": fingerprint(cfg), "contract_hash": fingerprint(contract())}
+
+
+def fixed_priority(ctrl, c):
+    kinds = {str(src.get("kind", "")).lower() for src in c["sources"]}
+    priority = 0 if any("outlier" in k for k in kinds) else 1 if len(c["members"]) == 1 else 2
+    return (priority, *ctrl.priority(c))
+
+
+def offline_message(ctrl, strategy, turn):
+    """The scripts know only the controller's discovered objects and run budgets."""
+    if strategy == "scripted_demo" and turn == 1:
+        return "Candidate inventory\n```json\n{\"operation\":\"list_candidates\",\"limit\":\"4\",}\n```"
+    investigated = {q["candidate_id"] for q in ctrl.state.all("Investigation")}
+    initial = sorted((c for c in ctrl.candidates.values() if c["initial"]), key=lambda c: fixed_priority(ctrl, c))
+    queue = [c for c in initial if c["id"] not in investigated]
+    remaining = ctrl.budget["max_new_queries"] - ctrl.state.usage()["new_queries"]
+    room = min(ctrl.budget["max_actions_per_turn"], remaining, 2 if strategy == "scripted_demo" else remaining)
+    can_expand = ctrl.active and room > 0 and turn < ctrl.budget["max_agent_turns"]
+    if strategy == "scripted_demo" and turn > 2:
+        can_expand = False
+    if can_expand and queue:
+        return json.dumps([{"action": "expand_candidate", "candidate_id": c["id"]} for c in queue[:room]])
+    expanded = sorted([c for c in ctrl.candidates.values() if any(x.get("kind") == "expansion" for x in c["sources"])],
+                      key=lambda c: fixed_priority(ctrl, c))
+    return json.dumps({"action": "submit", "candidate_ids": [c["id"] for c in expanded],
+                       "reason": "Submit threshold-qualified expansions. Competing assignments remain unresolved."})
+
+
+def lookup(state, kind, key):
+    try:
+        return state.get(kind, key)
+    except KeyError:
+        return None
+
+
+def obtain(ctrl, policy, turn, retry_unknown):
+    s = ctrl.state
+    mid = "%s:T%04d" % (s.get_meta("run_id"), turn)
+    saved = lookup(s, "Message", mid)
+    if saved is not None:
+        return saved
+    context = ctrl.context(turn)
+    complete = True
+    if policy != "live":
+        raw = offline_message(ctrl, policy, turn)
+        usage = {"provider": policy, "api_calls": 0}
+    else:
+        health = providers.diagnose(ctrl.cfg)
+        if health["status"] == "blocked":
+            raise providers.ProviderError(health["detail"])
+        previous = [r for r in s.all("ProviderDispatch") if r["message_id"] == mid]
+        if previous:
+            error = lookup(s, "ProviderFailure", previous[-1]["id"])
+            last_status = error["status"] if error else "unknown_execution"
+            if len(previous) >= 2 or not retry_unknown:
+                raise providers.ProviderError("Prior dispatch has no usable response; bounded explicit retry available once", last_status)
+        aid = mid + "/api/" + str(len(previous) + 1)
+        ref = s.artifact(context)
+        s.put("ProviderDispatch", aid, {"id": aid, "message_id": mid, "context_ref": ref})
+        try:
+            raw, usage = providers.complete(context, ctrl.cfg)
+        except providers.ProviderError as exc:
+            s.put("ProviderFailure", aid, {"id": aid, "status": exc.status, "detail": str(exc)})
+            if exc.status != "incomplete":
+                raise
+            # A completed HTTP exchange with an unfinished answer consumes a
+            # message turn. It yields feedback, never a partially parsed action.
+            raw, complete = "", False
+            usage = getattr(exc, "usage", {"provider": "openai_compatible", "api_calls": 1})
+    item = {"message_id": mid, "complete": complete, "raw": raw, "usage": usage, "context_hash": fingerprint(context)}
+    s.put("Message", mid, item)
+    return item
+
+
+def repaired_locally(raw, parsed):
+    if any("error" in p for p in parsed):
+        return False
+    try:
+        json.loads(raw)
+    except (ValueError, TypeError):
+        return True
+    return False
+
+
+def process_message(ctrl, message, turn):
+    s = ctrl.state
+    mid = message["message_id"]
+    parse_id = fingerprint(["protocol/1", message["raw"], message.get("complete", True)])
+    interpretation = lookup(s, "ParsedMessage", parse_id)
+    if interpretation is None:
+        parsed = parse_message(message["raw"], origin="agent", complete=message.get("complete", True))
+        with s.transaction():
+            s.put("ParsedMessage", parse_id, {"id": parse_id, "commands": parsed})
+            count = int(repaired_locally(message["raw"], parsed))
+            s.set_meta("format_repairs", s.get_meta("format_repairs", 0) + count)
+    else:
+        parsed = interpretation["commands"]
+    limit = ctrl.budget["max_actions_per_turn"]
+    if len(parsed) > limit:
+        parsed = parsed[:limit] + [{"error": "Remaining batch actions exceed max_actions_per_turn"}]
+    receipts = []
+    progress = False
+    for index, command in enumerate(parsed):
+        opid = "%s/%d" % (mid, index)
+        old = lookup(s, "Receipt", opid)
+        if old is not None:
+            receipts.append(old["result"])
+            progress |= old["progress"]
+            continue
+        # A revision/submit and its receipt commit together. Local numeric work
+        # has an independent cache-publication journal and can be reattached.
+        outer = nullcontext() if command.get("action") in SCIENTIFIC else s.transaction()
+        with outer:
+            if s.get_meta("submitted", False):
+                result = {"error": "Run already submitted; subsequent action blocked", "status": "blocked"}
+            else:
+                try:
+                    result = ctrl.execute(command, mid)
+                except (ValueError, KeyError) as exc:
+                    result = {"error": str(exc)[:500], "status": "needs_clarification" if "error" in command else "blocked",
+                              "action": command.get("action")}
+            logical = fingerprint([command.get("action"), command.get("args"), result.get("query_key"),
+                                   result.get("evidence_id"), result.get("candidate_ids"), result.get("candidate_id")])
+            changed = False
+            if "error" not in result:
+                if command.get("action") == "propose_revision":
+                    # Restating a rationale does not change the measured evidence,
+                    # member assignments, labels or statuses.
+                    projection = set()
+                    for cid in s.get_meta("selected", []):
+                        c = ctrl.candidate(cid)
+                        observations = sorted(e for e in c["evidence_ids"] if s.get("Evidence", e)["kind"] == "observation")
+                        projection.add(fingerprint([c["set_hash"], c["proposed_label"], c["status"], observations]))
+                    logical = fingerprint(["selected", sorted(projection)])
+                elif result.get("query_key"):
+                    logical = fingerprint(["query", result["query_key"]])
+                changed = lookup(s, "Progress", logical) is None
+            with s.transaction():
+                if changed:
+                    s.put("Progress", logical, {"id": logical})
+                if "error" in result:
+                    metric = "protocol_errors" if "error" in command else "action_errors"
+                    s.set_meta(metric, s.get_meta(metric, 0) + 1)
+                    if str(result["error"]).startswith("max_new_queries"):
+                        s.set_meta("denied_budget", True)
+                s.put("Receipt", opid, {"id": opid, "result": result, "progress": changed,
+                                        "metadata": command.get("metadata", {}), "message_id": mid})
+                s.event("action", {"message_id": mid, "index": index, "action": command.get("action"),
+                                   "status": result.get("status", "ok"), "receipt": opid, "changed": changed})
+        receipts.append(result)
+        progress |= changed
+    with s.transaction():
+        s.set_meta("receipts", receipts[-12:])
+        s.set_meta("finished_turn", turn)
+        s.set_meta("stall", 0 if progress else s.get_meta("stall", 0) + 1)
+        s.event("turn", {"message_id": mid, "turn": turn, "progress": progress})
+
+
+def retain_freeze(run, frozen):
+    """An evaluated partial checkpoint remains independently scoreable after resume."""
+    archive = run / "history" / hash_file(run / "frozen.json")
+    if archive.is_dir():
+        return
+    archive.parent.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=archive.parent, prefix=".retain-") as tmp:
+        stage = Path(tmp) / "export"
+        stage.mkdir()
+        for name in list(frozen["files"]) + ["frozen.json"]:
+            src, dst = run / name, stage / name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copyfile(src, dst)
+        stage.rename(archive)
+
+
+def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=False):
+    started = time.monotonic()
+    snapshot = Path(spec["snapshot"])
+    manifest = verify_snapshot(snapshot)
+    if fingerprint(cfg) != spec["cfg_hash"] or fingerprint(contract()) != spec["contract_hash"] or spec["software"] != __version__ or spec.get("code_sha256") != code_fingerprint():
+        raise ValueError("Checkpoint configuration, contract or method version changed")
+    if (run / "manifest.json").exists():
+        if read_json(run / "manifest.json")["snapshot_hash"] != manifest["snapshot_hash"]:
+            raise ValueError("Prepare snapshot differs from the pinned run")
+    else:
+        write_json(run / "manifest.json", manifest)
+    publishing = run / ".publishing.json"
+    if (run / "frozen.json").exists() and not publishing.exists():
+        frozen = read_json(run / "frozen.json")
+        if any(hash_file(run / f) != h for f, h in frozen["files"].items()):
+            raise ValueError("Frozen run checksum mismatch")
+        previous = read_json(run / "run_summary.json")
+        if not previous["resumable"]:
+            return previous
+        retain_freeze(run, frozen)
+    ann, astatus, annotation_detail = [], "disabled_by_mode", ""
+    if spec["mode"] in {"A1", "A3"}:
+        try:
+            if not cfg["annotation"]["enabled"] or not spec["annotations"]:
+                raise ValueError("Labeled mode requires an enabled, verified OntoAnno directory")
+            ann_dir = Path(spec["annotations"])
+            ann = verify_annotation(snapshot, ann_dir, _manifest=manifest, allow_partial=True)
+            astatus = read_json(ann_dir / "annotation_status.json")["status"]
+        except (OSError, KeyError, ValueError) as exc:
+            astatus, annotation_detail = "blocked", str(exc)
+    ctrl = Controller(snapshot, run, spec["cache"], cfg, spec["mode"], ann)
+    s = ctrl.state
+    try:
+        s.set_meta("run_id", spec["run_id"])
+        s.set_meta("replication_id", spec["replication_id"])
+        if resumed:
+            s.set_meta("resume_count", s.get_meta("resume_count", 0) + 1)
+        ctrl.initialize()
+        if astatus in {"success", "partial"}:
+            # The pending initialisation of a previously blocked arm needs its label projection.
+            if not s.all("Annotation") and ann:
+                ctrl.state.set_meta("initialized", False)
+                ctrl.candidates.clear()
+                ctrl.by_set.clear()
+                ctrl.initialize()
+            annotation_hash = fingerprint(ann)
+            if s.get_meta("annotation_hash", annotation_hash) != annotation_hash:
+                raise ValueError("Verified annotation contents changed after initialization")
+            s.set_meta("annotation_hash", annotation_hash)
+        if publishing.exists():
+            pending = read_json(publishing)
+            result = export(ctrl, pending["status"], pending["detail"], spec["policy"], pending["annotation_status"])
+            publishing.unlink()
+            return result
+        status, detail = "partial", "max_agent_turns"
+        s.set_meta("current_issue", None)
+        if astatus == "blocked":
+            s.set_meta("current_issue", annotation_detail)
+            detail = "annotation_blocked"
+            s.event(detail, {"reason": annotation_detail})
+        elif s.get_meta("submitted", False):
+            status, detail = "complete", "submitted"
+        else:
+            for turn in range(s.get_meta("finished_turn", 0) + 1, ctrl.budget["max_agent_turns"] + 1):
+                # A fresh invocation reconstructs context or replays a persisted full message.
+                cap = ctrl.budget.get("max_reported_tokens", 0)
+                if cap and spec["policy"] == "live":
+                    token_counts = [m["usage"].get("total_tokens") for m in s.all("Message")]
+                    if any(n is None for n in token_counts) or sum(token_counts) >= cap:
+                        detail = "token_usage_unreported" if any(n is None for n in token_counts) else "max_reported_tokens"
+                        break
+                try:
+                    message = obtain(ctrl, spec["policy"], turn, retry_unknown)
+                except providers.ProviderError as exc:
+                    detail = "provider_blocked" if exc.status == "blocked" else exc.status
+                    s.set_meta("current_issue", str(exc))
+                    s.event(detail, {"reason": str(exc), "turn": turn})
+                    break
+                except ValueError as exc:
+                    detail = "context_blocked"
+                    s.set_meta("current_issue", str(exc))
+                    s.event(detail, {"reason": str(exc), "turn": turn})
+                    break
+                process_message(ctrl, message, turn)
+                if s.get_meta("submitted", False):
+                    status, detail = "complete", "submitted"
+                    break
+                if s.get_meta("stall", 0) >= ctrl.budget["stall_turns"]:
+                    detail = "stalled"
+                    break
+                if pause_after is not None and turn >= pause_after:
+                    detail = "paused"
+                    break
+        if detail == "submitted":
+            exhausted = ctrl.active and s.usage()["new_queries"] >= ctrl.budget["max_new_queries"]
+            checked = {r["candidate_id"] for r in s.all("Investigation")}
+            pending = any(c["initial"] and c["id"] not in checked for c in ctrl.candidates.values())
+            if manifest.get("status") == "partial":
+                status, detail = "partial", "submitted_with_blocked_prepare"
+            elif astatus == "partial":
+                status, detail = "partial", "submitted_with_partial_annotations"
+            elif s.get_meta("denied_budget", False) or (exhausted and pending):
+                status, detail = "partial", "submitted_after_budget_exhaustion"
+            elif any(q["status"] != "success" for q in s.all("CanonicalQuery")):
+                status, detail = "partial", "submitted_with_blocked_queries"
+        s.set_meta("elapsed_seconds", s.get_meta("elapsed_seconds", 0) + time.monotonic() - started)
+        s.event("export", {"status": status, "detail": detail})
+        write_json(publishing, {"status": status, "detail": detail, "annotation_status": astatus})
+        result = export(ctrl, status, detail, spec["policy"], astatus)
+        publishing.unlink()
+        return result
+    finally:
+        s.close()
+
+
+def discover(snapshot, run, cache, cfg, mode=None, policy="live", annotations=None, replication_id=None, pause_after=None):
+    mode = mode or cfg["mode"]
+    cfg = validate_settings(dict(cfg, mode=mode))
+    run = Path(run).resolve()
+    spec = new_spec(snapshot, run, cache, annotations, cfg, mode, policy, replication_id)
+    run.mkdir(parents=True, exist_ok=True)
+    with (run / ".controller.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if any(p.name != ".controller.lock" for p in run.iterdir()):
+            raise ValueError("Run directory is in use; use resume or a fresh directory")
+        atomic(run / "config_resolved.yaml", yaml.safe_dump(cfg, sort_keys=True))
+        atomic(run / "project_contract.yaml", (RESOURCES / "PROJECT_CONTRACT.yaml").read_bytes())
+        write_json(run / "checkpoint.json", spec)
+        return _execute(run, spec, cfg, pause_after)
+
+
+def resume(run, retry_unknown=False):
+    run = Path(run).resolve()
+    with (run / ".controller.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        spec = read_json(run / "checkpoint.json")
+        cfg = yaml.safe_load((run / "config_resolved.yaml").read_text())
+        return _execute(run, spec, cfg, retry_unknown=retry_unknown, resumed=True)

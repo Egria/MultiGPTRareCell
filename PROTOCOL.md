@@ -1,0 +1,59 @@
+# Discovery 通信协议（soft-protocol-1.0）
+
+模型的一条完整回复包含一个动作，或者一个包含多个独立动作的数组。也接受 `{"actions":[...]}`。控制器提供当前 run、task、数据和契约版本，对回复中显式给出的绑定逐项比对。控制器按当前消融组许可、manifest 与证据登记表执行。解析器只输出结构化请求。
+
+下列两个请求都要求在 H017 的实际成员内，按 log1p 层的默认阈值 0 检查两基因共同检出。H017 必须能在当前 run 中精确解析。
+
+```json
+{"action":"coexpress","genes":["CD3D","TRAC"],"candidate_id":"H017"}
+```
+
+```json
+{"operation":"check co-expression","gene_list":"CD3D; TRAC","candidate":"H017"}
+```
+
+## 可调用动作
+
+| 动作 | 请求参数 | 语义和边界 |
+|---|---|---|
+| `list_candidates` | 可选 `offset,limit` | 候选按稳定顺序分页。offset 从 0 起计，limit 为正整数。 |
+| `get_evidence` | 可选 `candidate_id` 或 `evidence_ids`，以及 `offset,limit` | 按候选读成员页与 marker，或按证据 ID 读证据卡。省略选择器时浏览已登记证据。 |
+| `compare_groups` | `candidate_id` 或 `members`。可选 `background_id` 或 `background`、`genes` | background 是明确的 cell_id 集合，background_id 引用候选。省略背景时取 foreground 的补集。空对照由科学工具标记。 |
+| `coexpress` | `candidate_id`、`members`、`scope="all"` 三选一，`genes` 必填。可选 `logic`、`threshold` | 逻辑为 AND（默认）或 OR。每个指定基因的 log1p 表达须严格大于阈值（默认 0）。 |
+| `expand_candidate` / `retrieve_cells` | `candidate_id`。可选 `background_id` 或 `background` | 跨全数据检索，背景只用于对照。一次扩展沿原始候选 lineage 记账。预算、门槛由运行配置决定。 |
+| `propose_revision` | `parents,groups,reason,evidence_ids` | 一个提案包含一个或多个群组。每组可给 `candidate_ids`、`members` 或二者的并集。可附 `proposed_label` 和 `status`。父候选和依据必填，组内成员必须合法，同一提案中各组互斥。关联编辑在同一事务提交。 |
+| `submit` | 可选 `candidate_ids,reason,evidence_ids,status` | 省略 candidate_ids 时提交当前选中的修订。显式 `[]` 表示没有选中的候选；剩余细胞交给确定性的回退分配。 |
+
+组的 status 可取 `provisional`、`unresolved`、`confirmed`，生物学名称可以为 `unknown`。submit 的 status 可取 `provisional` 或 `final`。提交意图与运行是否耗尽预算、是否存在外部阻塞分别记录。科学查询可以显式声明固定表达层 `layer="log1p"`。原始 counts 需要通过不同的计算规则处理，因此该层请求会得到局部错误。
+
+每种动作都可显式带 `run_id,task_id,data_version,contract_version,message_id`。这些字段必须与控制器绑定值完全一致。控制器根据候选实际成员、实际基因 ID、背景、逻辑、门槛及影响结果的配置构造科学查询键。消息 ID、字段顺序和说明文字不参与科学查询键。
+
+## 可以本地归一化的输入
+
+- 动作和注册字段支持中英文别名、大小写及空格、下划线和连字符差异。例如 `检查共表达`、`gene_list`、`候选`。实体名称逐字符保留。
+- 允许 JSON 围栏、前后说明文字及可唯一修复的尾逗号。解析器只提取一个平衡的 JSON 信封。多个独立动作应写在同一数组内。
+- 支持将 `args` 或 `parameters` 对象展开；同名别名在语义归一化后须一致。单个 ID 可以写成一个字符串或单元素数组。基因字符串允许以中英文分号分隔。在 JSON 数组中每个字符串均为完整 ID。AND/OR 的基因及无序成员集按字面值去重排序；组对象的提交顺序保留。
+- 明确的数值字符串可转换为有限非负数值。分页参数须为可表示的整数。空值、未知值、布尔数值和无穷大产生错误。省略可选字段仅启用文档中约定的默认值。
+- `note,comment,explanation,uncertainty,counterevidence,summary` 接受解释文字并保存在 metadata。用 `args` 或顶层字段明确表达科学条件。未注册字段（包括 metadata 中的 scope/filter/weights）要求澄清；解析器不自行选择条件。
+- 在明确的动作名称独占首行时，也接受逐行 `字段：值`。全消息只进行一次本地语义归一化。该受限语法使用与 JSON 完全相同的合法字段和实体检查。
+
+例如同时比较两个群体、再查询一条已有证据可写成一个独立动作数组。
+
+```json
+[
+  {"action":"compare_groups","candidate":"H017","background_id":"H022","genes":["CD3D"]},
+  {"action":"get_evidence","evidence_id":"E001"}
+]
+```
+
+## 冲突、追溯与恢复
+
+`{"candidate":"H017","scope":"all"}` 同时给出两个范围，会返回 needs_clarification。相似 barcode、证据 ID、候选 ID、gene_id、数据版本不做拼写修复。基因可以使用当前 genes.tsv 的精确 symbol；映射到多个稳定 ID 时要求指定 gene_id。表达“这些细胞”时须给实际候选或明确成员。带符号权重或方向等未注册计算不能转写成无符号共表达。
+
+单条消息允许最多 512,000 个字符、32 层 JSON 和 128 个动作。只有来源为 Discovery Agent 且传输已完成的消息可以进入动作解析。包裹对象解析失败或截断时整条消息不执行。数组内可以解析的各个动作分别检查，单个动作出错只影响该动作。工具返回、引用文章、证据内容和说明字段内的 JSON 不作为后续动作重新解析。
+
+解析器使用本地确定性修复，不调用额外模型。尾逗号和逐行语法修复在解析结果的 metadata.format_repair 中标记。无法消除的歧义返回 `needs_clarification` 和具体字段。重新解释同一条证据与修复通信格式均不增加 observation 数量；执行与重试状态由控制器和状态层记录。逐项冲突测试见 `tests/test_protocol.py`。
+
+相同原始消息及完成标志的本地解析结果存在 ParsedMessage 中。再次出现时复用解析结果，执行前仍检查当前精确 ID、实体版本、模式、谱系和预算。明确截断的远端答复不会产生可执行动作，服务报告的相应用量保留。
+
+真实模型也会将操作放入单层 action 对象，如 `{"action":{"type":"expand_candidate","candidate_id":"H017"}}`。仅在 action 这个确定的容器内，type/name 映射到动作选择符。内外参数同样经过实体、冲突与范围检查；工具产物里的结构不会被提取为命令。

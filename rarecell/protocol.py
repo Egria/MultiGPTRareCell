@@ -1,0 +1,472 @@
+"""Bounded, deterministic translation of provider replies into registered requests.
+
+This module has no file, network, state or tool-execution interface. Entity
+values survive parsing unchanged. The controller resolves them in its snapshot.
+"""
+import json
+import math
+import re
+from collections import defaultdict
+from decimal import Decimal, InvalidOperation
+
+VERSION = "soft-protocol-1.0"
+MAX_CHARS = 512_000
+MAX_ACTIONS = 128
+
+
+class ProtocolError(ValueError):
+    """Ambiguous input or an unsupported scientific instruction."""
+
+
+def _word(value):
+    return re.sub(r"[\s_-]+", " ", value.strip().casefold())
+
+
+def _alias_map(groups):
+    result = {}
+    for key, aliases in groups.items():
+        for spelling in (key, *aliases):
+            normalized = _word(spelling)
+            if normalized in result and result[normalized] != key:
+                raise RuntimeError(f"conflicting built-in alias {spelling}")
+            result[normalized] = key
+    return result
+
+
+ACTIONS = _alias_map({
+    "list_candidates": ("list candidates", "show candidates", "列出候选", "列出候选群"),
+    "get_evidence": ("read evidence", "查看证据", "读取证据"),
+    "compare_groups": ("compare groups", "compare populations", "比较群体", "组间比较"),
+    "coexpress": ("check co-expression", "co-expression", "check coexpression", "共表达", "检查共表达"),
+    "expand_candidate": ("retrieve_cells", "expand candidate", "扩展候选", "检索细胞"),
+    "propose_revision": ("revise candidate", "propose revision", "修订候选", "提出修订"),
+    "submit": ("submit result", "finalize", "提交", "提交结果"),
+})
+
+FIELDS = _alias_map({
+    "action": ("operation", "tool", "动作", "操作"),
+    "args": ("arguments", "parameters", "params", "参数"),
+    "actions": ("requests", "operations", "请求列表", "动作列表"),
+    "genes": ("gene_list", "gene_ids", "基因", "基因列表"),
+    "candidate_id": ("candidate", "候选", "候选编号"),
+    "candidate_ids": ("candidates", "候选列表"),
+    "members": ("cell_ids", "cells", "成员", "细胞列表"),
+    "scope": ("范围",),
+    "background": ("background_cells", "background_members", "背景细胞"),
+    "background_id": ("background_candidate", "background_candidate_id", "背景候选"),
+    "logic": ("operator", "逻辑"),
+    "threshold": ("cutoff", "阈值"),
+    "layer": ("expression_layer", "表达层"),
+    "evidence_ids": ("evidence_id", "evidence", "证据编号"),
+    "offset": ("偏移",),
+    "limit": ("page_size", "每页数量"),
+    "groups": ("proposals", "群体"),
+    "parents": ("parent_ids", "parent_candidates", "父候选"),
+    "reason": ("rationale", "理由"),
+    "proposed_label": ("label", "暂定标签"),
+    "status": ("状态",),
+    "run_id": (), "task_id": (), "data_version": (), "contract_version": (), "message_id": (),
+    "metadata": ("meta",),
+    "note": ("notes", "备注"), "explanation": ("解释",), "comment": ("comments", "说明"),
+    "uncertainty": ("不确定性",), "counterevidence": ("反证",), "summary": ("摘要",),
+})
+EXPLANATIONS = {"note", "explanation", "comment", "uncertainty", "counterevidence", "summary"}
+BINDINGS = {"run_id", "task_id", "data_version", "contract_version", "message_id"}
+SCOPES = {"candidate_id", "members", "scope"}
+BACKGROUNDS = {"background", "background_id"}
+ALLOWED = {
+    "list_candidates": {"offset", "limit"},
+    "get_evidence": {"candidate_id", "evidence_ids", "offset", "limit"},
+    "compare_groups": SCOPES | BACKGROUNDS | {"genes", "layer"},
+    "coexpress": SCOPES | {"genes", "logic", "threshold", "layer"},
+    "expand_candidate": {"candidate_id"} | BACKGROUNDS | {"layer"},
+    "propose_revision": {"groups", "parents", "reason", "evidence_ids"},
+    "submit": {"candidate_ids", "reason", "evidence_ids", "status"},
+}
+
+
+class _Pairs(list):
+    """Retain duplicates so a bad object can fail separately inside a batch."""
+
+
+def _invalid_constant(value):
+    # Keep malformed non-finite numbers local to their batch item.
+    return float(value)
+
+
+def _decode(s):
+    return json.loads(s, object_pairs_hook=_Pairs, parse_constant=_invalid_constant)
+
+
+def _unique_pairs(node):
+    result = {}
+    for key, val in node:
+        if key in result:
+            raise ProtocolError(f"duplicate JSON field: {key[:80]}")
+        result[key] = val
+    return result
+
+
+def _materialize(node):
+    if isinstance(node, _Pairs):
+        return {k: _materialize(v) for k, v in _unique_pairs(node).items()}
+    if isinstance(node, list):
+        return [_materialize(v) for v in node]
+    if isinstance(node, float) and not math.isfinite(node):
+        raise ProtocolError("non-finite value")
+    return node
+
+
+def _field(key):
+    name = FIELDS.get(_word(key))
+    if name is None:
+        raise ProtocolError(f"unsupported field: {key[:80]}")
+    return name
+
+
+def _single(value, key):
+    if isinstance(value, list):
+        if len(value) != 1:
+            raise ProtocolError(f"{key} requires one value")
+        return value[0]
+    return value
+
+
+def _string(value, key):
+    value = _single(value, key)
+    if not isinstance(value, str) or not value.strip():
+        raise ProtocolError(f"{key} requires a nonempty string")
+    return value
+
+
+def _ids(value, key, *, allow_empty=False):
+    if isinstance(value, str):
+        if key == "genes" and re.search(r"[;；]", value):
+            value = [token.strip() for token in re.split(r"[;；]", value)]
+        else:
+            value = [value]
+    if not isinstance(value, list) or (not value and not allow_empty):
+        raise ProtocolError(f"{key} requires an explicit ID or list")
+    if any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ProtocolError(f"{key} contains an invalid ID")
+    return sorted(set(value))
+
+
+def _number(value, key, *, integer=False):
+    value = _single(value, key)
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ProtocolError(f"{key} requires a number")
+    raw = str(value).strip()
+    if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", raw):
+        raise ProtocolError(f"{key} requires a finite number")
+    try:
+        number = Decimal(raw)
+        if number < 0 or not math.isfinite(float(number)):
+            raise ProtocolError(f"{key} requires a finite nonnegative number")
+        if integer:
+            if number != number.to_integral_value() or number > 2**63 - 1:
+                raise ProtocolError(f"{key} requires a nonnegative 64-bit integer")
+            return int(number)
+        result = float(number)
+        if result == 0 and number != 0:
+            raise ProtocolError(f"{key} is outside the floating-point range")
+        return result
+    except (OverflowError, InvalidOperation) as exc:
+        raise ProtocolError(f"invalid number for {key}") from exc
+
+
+def _choice(value, key, choices):
+    text = _word(_string(value, key))
+    if text not in choices:
+        raise ProtocolError(f"unsupported {key}: {text[:80]}")
+    return choices[text]
+
+
+def _merge(target, key, value):
+    if key in target and target[key] != value:
+        raise ProtocolError(f"conflicting values for {key}")
+    target[key] = value
+
+
+def _group(value):
+    if not isinstance(value, dict):
+        raise ProtocolError("each group requires an object")
+    out = {}
+    for raw, val in value.items():
+        key = _field(raw)
+        if key in {"members", "candidate_ids"}:
+            clean = _ids(val, key)
+        elif key == "candidate_id":
+            key, clean = "candidate_ids", [_string(val, key)]
+        elif key == "proposed_label":
+            clean = _string(val, key)
+        elif key == "status":
+            clean = _choice(val, key, {s: s for s in ("confirmed", "provisional", "unresolved")})
+        else:
+            raise ProtocolError(f"unsupported group field: {key}")
+        _merge(out, key, clean)
+    if not ({"members", "candidate_ids"} & out.keys()):
+        raise ProtocolError("each group requires members or candidate_ids")
+    return out
+
+
+def _value(key, value):
+    if key in {"genes", "members", "background", "evidence_ids", "candidate_ids", "parents"}:
+        return _ids(value, key, allow_empty=key in {"evidence_ids", "candidate_ids"})
+    if key in BINDINGS | {"reason", "candidate_id", "background_id"}:
+        return _string(value, key)
+    if key == "logic":
+        return _choice(value, key, {"and": "AND", "all": "AND", "与": "AND",
+                                    "且": "AND", "or": "OR", "any": "OR", "或": "OR"})
+    if key == "layer":
+        return _choice(value, key, {"log1p": "log1p"})
+    if key == "scope":
+        return _choice(value, key, {"all": "all", "all cells": "all", "全部细胞": "all"})
+    if key in {"limit", "offset", "threshold"}:
+        val = _number(value, key, integer=key != "threshold")
+        if key == "limit" and val == 0:
+            raise ProtocolError("limit must be positive")
+        return val
+    if key == "groups":
+        items = [value] if isinstance(value, dict) else value
+        if not isinstance(items, list) or not items:
+            raise ProtocolError("groups requires a nonempty list of group objects")
+        return [_group(item) for item in items]
+    if key == "status":
+        return _choice(value, key, {s: s for s in ("provisional", "final")})
+    raise ProtocolError(f"unsupported parameter: {key}")
+
+
+def _validate(action, args):
+    present = args.keys()
+    if len(SCOPES & present) > 1 or len(BACKGROUNDS & present) > 1:
+        raise ProtocolError("choose one foreground scope and one background scope")
+    if action in {"compare_groups", "coexpress", "expand_candidate"} and not (SCOPES & present):
+        raise ProtocolError("an explicit candidate or cell scope is required")
+    if action == "compare_groups" and args.get("scope") == "all":
+        raise ProtocolError("compare_groups requires an explicit foreground within the dataset")
+    if action == "coexpress":
+        if "genes" not in args:
+            raise ProtocolError("coexpress requires genes")
+        args.setdefault("logic", "AND")
+        args.setdefault("threshold", 0.0)
+    if action == "get_evidence" and "evidence_ids" in args and "candidate_id" in args:
+        raise ProtocolError("choose evidence_ids or candidate_id")
+    if action == "propose_revision":
+        missing = {"groups", "parents", "reason", "evidence_ids"} - present
+        if missing:
+            raise ProtocolError("revision missing " + ", ".join(sorted(missing)))
+        if not args["evidence_ids"]:
+            raise ProtocolError("revision requires supporting evidence_ids")
+    # The one available expression layer was checked before removing the assertion.
+    args.pop("layer", None)
+
+
+def _normalize(obj):
+    if not isinstance(obj, dict):
+        raise ProtocolError("each action requires an object")
+    entries = []
+    for key, value in obj.items():
+        key = _field(key)
+        if key == "action" and isinstance(value, dict):
+            # Some providers put the selector and its parameters in an action
+            # object. Normalize at this one boundary; unknown keys, duplicate
+            # entities and conflicting selectors still pass through all guards.
+            if not any(_word(k) in {"type", "name"} or FIELDS.get(_word(k)) == "action" for k in value):
+                raise ProtocolError("nested action needs an explicit action selector")
+            for inner, item in value.items():
+                name = "action" if _word(inner) in {"type", "name"} else _field(inner)
+                entries.append((name, item))
+        else:
+            entries.append((key, value))
+    types = set()
+    for key, val in entries:
+        if key == "action":
+            types.add(_choice(val, "action", ACTIONS))
+    if len(types) != 1:
+        raise ProtocolError("a single unambiguous action is required")
+    action = types.pop()
+    params = []
+    metadata = {}
+    for key, val in entries:
+        if key == "action":
+            continue
+        if key == "args":
+            if not isinstance(val, dict):
+                raise ProtocolError("args requires an object")
+            params.extend((_field(k), v) for k, v in val.items())
+        else:
+            params.append((key, val))
+    args = {}
+    for key, val in params:
+        if key == "metadata":
+            if not isinstance(val, dict):
+                raise ProtocolError("metadata requires an object")
+            for k, v in val.items():
+                name = _field(k)
+                if name not in EXPLANATIONS:
+                    raise ProtocolError(f"{name} cannot be hidden in metadata")
+                _merge(metadata, name, _string(v, name))
+        elif key in EXPLANATIONS or (key == "reason" and key not in ALLOWED[action]):
+            _merge(metadata, key, _string(val, key))
+        elif key in ALLOWED[action] | BINDINGS:
+            _merge(args, key, _value(key, val))
+        else:
+            raise ProtocolError(f"unsupported {action} parameter: {key}")
+    _validate(action, args)
+    return {"action": action, "args": args, "metadata": metadata}
+
+
+def _json_region(raw):
+    # One structured envelope only. Never search inside a malformed parent for
+    # an executable child. Brackets after it may begin a truncated second action.
+    start = next((i for i, c in enumerate(raw) if c in "[{"), None)
+    if start is None:
+        raise ProtocolError("supply one JSON action or action list")
+    stack = []
+    quote = escape = False
+    for i in range(start, len(raw)):
+        c = raw[i]
+        if quote:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                quote = False
+        elif c == '"':
+            quote = True
+        elif c in "[{":
+            stack.append("}" if c == "{" else "]")
+            if len(stack) > 32:
+                raise ProtocolError("JSON nesting exceeds 32 levels")
+        elif c in "]}":
+            if not stack or c != stack.pop():
+                raise ProtocolError("unbalanced JSON")
+            if not stack:
+                if any(char in raw[i + 1:] for char in "{}[]"):
+                    raise ProtocolError("multiple or incomplete JSON envelopes")
+                return raw[start:i + 1]
+    raise ProtocolError("incomplete JSON envelope")
+
+
+def _trim_trailing_commas(text):
+    chars = list(text)
+    previous = None
+    quote = escape = False
+    for i, c in enumerate(text):
+        if quote:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                quote = False
+                previous = c
+        elif c == '"':
+            quote = True
+        elif c == "," and previous not in (None, "[", "{", ":", ","):
+            j = i + 1
+            while j < len(text) and text[j] in " \t\r\n":
+                j += 1
+            if j < len(text) and text[j] in "]}":
+                chars[i] = " "
+            previous = c
+        elif not c.isspace():
+            previous = c
+    return "".join(chars)
+
+
+def _line_request(raw):
+    """A local one-pass fallback for 'action name' followed by field:value lines."""
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not lines or _word(lines[0]) not in ACTIONS:
+        raise ProtocolError("supply one JSON action or action list")
+    action = _Pairs([("action", lines[0])])
+    for line in lines[1:]:
+        match = re.fullmatch(r"([^:：]+)[:：]\s*(.+)", line)
+        if not match:
+            raise ProtocolError("ambiguous field/value line")
+        key, value = match.groups()
+        if value.startswith(("[", "{", '"')) or value in {"null", "true", "false"}:
+            value = _decode(value)
+        action.append((key.strip(), value))
+    return action
+
+
+def _error(exc):
+    return {"error": str(exc), "status": "needs_clarification"}
+
+
+def parse_message(raw, *, complete=True, origin="agent"):
+    """Parse a completed, trusted-origin provider reply without executing it."""
+    try:
+        if origin != "agent" or complete is not True:
+            raise ProtocolError("requires a complete message from the discovery agent")
+        if not isinstance(raw, str) or not raw.strip() or len(raw) > MAX_CHARS:
+            raise ProtocolError(f"message must have 1–{MAX_CHARS} characters")
+        first = raw.lstrip().split("\n", 1)[0].strip()
+        repaired = None
+        if _word(first) in ACTIONS:
+            node = _line_request(raw)
+            repaired = "field_lines"
+        else:
+            region = _json_region(raw)
+            try:
+                node = _decode(region)
+            except json.JSONDecodeError:
+                cleaned = _trim_trailing_commas(region)
+                if cleaned == region:
+                    raise
+                node = _decode(cleaned)
+                repaired = "trailing_comma"
+        if isinstance(node, _Pairs):
+            # A wrapper can only contain the batch. Parameters on the wrapper
+            # cannot silently be ignored or distributed across sibling actions.
+            outer = _unique_pairs(node)
+            if len(outer) == 1 and FIELDS.get(_word(next(iter(outer)))) == "actions":
+                node = next(iter(outer.values()))
+                if isinstance(node, _Pairs) or not isinstance(node, list):
+                    raise ProtocolError("actions requires an array")
+        batch = [node] if isinstance(node, _Pairs) else node
+        if not isinstance(batch, list) or not 1 <= len(batch) <= MAX_ACTIONS:
+            raise ProtocolError(f"expected 1–{MAX_ACTIONS} actions")
+        result = []
+        for item in batch:
+            try:
+                parsed = _normalize(_materialize(item))
+                if repaired:
+                    parsed["metadata"]["format_repair"] = repaired
+                result.append(parsed)
+            except (ValueError, RecursionError) as exc:
+                result.append(_error(exc))
+        return result
+    except (ValueError, RecursionError) as exc:
+        return [_error(exc)]
+
+
+def resolve_genes(tokens, rows, *, species=None):
+    """Resolve IDs or exact symbols using only the caller's versioned manifest.
+
+    An exact stable ID takes precedence in the ID namespace. Symbol collisions
+    require the caller to supply a stable ID. No case-folding or edit distance.
+    """
+    identifiers = set()
+    symbols = defaultdict(set)
+    for row in rows:
+        if species is not None and row.get("species") not in (species, None, ""):
+            continue
+        gene_id = row["gene_id"]
+        identifiers.add(gene_id)
+        if row.get("symbol"):
+            symbols[row["symbol"]].add(gene_id)
+    resolved = set()
+    for token in _ids(tokens, "genes"):
+        if token in identifiers:
+            resolved.add(token)
+        elif len(symbols[token]) == 1:
+            resolved.update(symbols[token])
+        else:
+            issue = "ambiguous" if symbols[token] else "unknown"
+            raise ProtocolError(f"{issue} gene {token!r}; provide a manifest gene_id")
+    return sorted(resolved)

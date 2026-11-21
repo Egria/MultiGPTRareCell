@@ -1,0 +1,8 @@
+mode: A2
+prepare:
+  views: [V_LINEAR, V_TENSOR2]
+  graph_backend: igraph
+provider:
+  kind: scripted_demo
+annotation:
+  enabled: false

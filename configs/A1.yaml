@@ -1,0 +1,7 @@
+# Override the model IDs with actual deployments before live discovery.
+mode: A1
+annotation:
+  enabled: true
+  model: null
+provider:
+  model: null
