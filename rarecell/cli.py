@@ -71,6 +71,9 @@ def parser():
         if cfg:
             sub.add_argument("--config", type=Path, help="YAML overrides for the bundled defaults")
         return sub
+    ui = cmd("ui", False)
+    ui.add_argument("--workspace", type=Path, default=Path("work/tasks"), help="persistent dashboard task directory")
+    ui.add_argument("--port", type=int, default=8787, help="loopback HTTP port (0 chooses a free port)")
     cmd("doctor")
     prep = cmd("prepare")
     prep.add_argument("--dataset", type=Path, required=True)
@@ -109,6 +112,9 @@ def parser():
 
 def dispatch(a):
     cmd = a.cmd
+    if cmd == "ui":
+        from .dashboard import serve
+        return serve(a.workspace, a.port)
     if cmd == "resume":
         return resume(a.run, a.retry_unknown)
     if cmd == "evaluate":
@@ -150,6 +156,8 @@ def dispatch(a):
 def main(argv=None):
     try:
         answer = dispatch(parser().parse_args(argv))
+        if answer is None:
+            return 0
         print(json.dumps(answer, indent=2, ensure_ascii=False, default=str))
         if isinstance(answer, dict):
             result = answer.get("summary", answer)

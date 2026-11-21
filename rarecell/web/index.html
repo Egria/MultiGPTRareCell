@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>任务管理 · RareCell</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/app.css" />
+    <script defer src="/app.js"></script>
+  </head>
+  <body>
+    <header class="top">
+      <div class="wrap top-inner">
+        <div class="brand">
+          <span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>RareCell
+        </div>
+        <span class="divider"></span><span class="workspace-title">研究工作台</span>
+        <span class="connection" id="connection"><i></i><span>正在连接</span></span>
+      </div>
+    </header>
+    <main class="wrap">
+      <div class="heading">
+        <div>
+          <h1>任务管理</h1>
+          <div class="host-line">
+            <span class="small-icon" aria-hidden="true">▤</span><span id="workspace">正在读取工作目录…</span>
+          </div>
+        </div>
+        <button class="primary" id="new" disabled><span aria-hidden="true">＋</span> 新建任务</button>
+      </div>
+      <div id="notice" class="notice" role="alert" hidden></div>
+      <section class="stats" aria-label="任务统计">
+        <div class="stat">
+          <span class="stat-label"><i class="dot gray"></i>全部任务</span><strong id="total">—</strong>
+        </div>
+        <div class="stat">
+          <span class="stat-label"><i class="dot amber"></i>排队中</span><strong id="queued">—</strong>
+        </div>
+        <div class="stat">
+          <span class="stat-label"><i class="dot blue"></i>执行中</span><strong id="active">—</strong>
+        </div>
+        <div class="stat">
+          <span class="stat-label"><i class="dot green"></i>已完成</span><strong id="done">—</strong>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>任务列表</h2>
+          <div class="toolbar">
+            <label class="search"
+              ><span aria-hidden="true">⌕</span
+              ><input type="search" id="search" aria-label="搜索任务名称" placeholder="搜索任务名称"
+            /></label>
+            <select id="filter" aria-label="按状态筛选">
+              <option value="all">全部状态</option>
+              <option value="queued">排队中</option>
+              <option value="active">执行中</option>
+              <option value="done">已完成</option>
+              <option value="attention">需关注</option>
+              <option value="stopped">已停止</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">任务名称</th>
+                <th scope="col">实验臂</th>
+                <th scope="col">当前阶段</th>
+                <th scope="col">状态</th>
+                <th scope="col">创建时间</th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+        <div id="empty" class="empty" hidden>
+          <span class="stack-icon" aria-hidden="true"><b></b><b></b><b></b></span>
+          <h3 id="empty-title"></h3>
+          <p id="empty-detail"></p>
+          <button id="empty-action" class="secondary"></button>
+        </div>
+        <div class="panel-foot"><span id="count">—</span><span>单任务串行执行</span></div>
+      </section>
+    </main>
+    <dialog id="create" aria-labelledby="create-title">
+      <form id="form">
+        <div class="dialog-head">
+          <h2 id="create-title">新建任务</h2>
+          <button class="close" type="button" data-close="create" aria-label="关闭">×</button>
+        </div>
+        <div class="form-body">
+          <div class="pair">
+            <label
+              >任务类型<select name="kind" id="kind">
+                <option value="pipeline">完整发现流程</option>
+                <option value="prepare">准备快照</option>
+                <option value="annotate">注释快照</option>
+                <option value="discover">从快照发现</option>
+                <option value="resume">恢复发现</option>
+                <option value="evaluate">评估结果</option>
+                <option value="demo">离线 Core demo</option>
+              </select></label
+            ><label
+              >任务名称 <small>可选</small
+              ><input name="name" maxlength="120" placeholder="如 PBMC-TCR · view0"
+            /></label>
+          </div>
+          <label data-kinds="pipeline discover"
+            >实验臂<select name="mode" id="mode">
+              <option value="A3">A3 · 注释 + 主动查询</option>
+              <option value="A2">A2 · 主动查询</option>
+              <option value="A1">A1 · 仅注释建议</option>
+              <option value="A0">A0 · 仅预计算证据</option>
+            </select></label
+          >
+          <label data-kinds="pipeline"
+            >起点<select id="start">
+              <option value="dataset">从数据集准备快照</option>
+              <option value="snapshot">复用已有快照</option>
+            </select></label
+          >
+          <label id="dataset-field"
+            >数据集清单<input name="dataset" placeholder="data/pbmc_tcr/dataset.yaml"
+          /></label>
+          <label id="snapshot-field">快照目录<input name="snapshot" placeholder="work/prepared" /></label>
+          <label id="annotations-field"
+            >已有注释目录 <small id="annotations-hint"></small
+            ><input name="annotations" placeholder="work/annotations"
+          /></label>
+          <label data-kinds="resume evaluate"
+            >发现运行目录<input name="run" placeholder="work/A3" required
+          /></label>
+          <label data-kinds="pipeline prepare annotate discover"
+            >配置文件 <small>可选，YAML</small><input name="config" placeholder="real_openai.yaml"
+          /></label>
+          <div class="pair" id="models">
+            <label id="model-field">发现模型<input name="model" placeholder="沿用配置文件中的模型" /></label>
+            <label id="ann-model-field"
+              >注释模型<input name="annotation_model" placeholder="沿用配置文件中的模型"
+            /></label>
+          </div>
+          <label data-kinds="pipeline discover resume evaluate"
+            >真值标签 TSV <small id="gt-hint"></small><input name="gt" placeholder="fixtures/pbmc_tcr/gt.tsv"
+          /></label>
+          <label class="check" data-kinds="resume"
+            ><input type="checkbox" name="retry_unknown" value="yes" />允许重试一次结果未知的 API
+            调用，可能额外计费</label
+          >
+          <p class="hint" id="form-hint"></p>
+          <p class="error" id="form-error" role="alert" hidden></p>
+        </div>
+        <div class="dialog-foot">
+          <button type="button" class="secondary" data-close="create">取消</button
+          ><button class="primary" id="enqueue" type="submit">加入队列</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="detail" aria-labelledby="detail-title">
+      <div class="dialog-head">
+        <div class="detail-heading">
+          <span class="meta" id="detail-type"></span>
+          <h2 id="detail-title"></h2>
+        </div>
+        <button class="close" data-close="detail" aria-label="关闭">×</button>
+      </div>
+      <div class="detail-body">
+        <div id="detail-status"></div>
+        <dl id="facts"></dl>
+        <p class="error" id="detail-error" role="alert" hidden></p>
+        <div id="outputs"></div>
+        <details id="events" hidden>
+          <summary>最近发现事件</summary>
+          <pre id="event-log"></pre>
+        </details>
+        <h3>执行日志</h3>
+        <pre id="log" tabindex="0"></pre>
+      </div>
+      <div class="dialog-foot">
+        <button id="stop" class="danger" hidden>停止任务</button
+        ><button id="resume" class="primary" hidden>恢复发现</button
+        ><button class="secondary" data-close="detail">关闭</button>
+      </div>
+    </dialog>
+  </body>
+</html>
