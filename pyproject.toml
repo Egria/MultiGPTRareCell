@@ -18,7 +18,7 @@ dependencies = [
 test = ["pytest==8.3.5"]
 
 [project.scripts]
-rarecell = "rarecell.cli:main"
+rarecell = "rarecell.runtime:main"
 
 [tool.setuptools.packages.find]
 include = ["rarecell*"]

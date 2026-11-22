@@ -32,13 +32,11 @@ doctor 区分本地导入/版本检查和网络调用。上面的 Python 安装�
 从安装了当前仓库的 Python 环境启动控制台。之前安装过初版 wheel 的环境可用 `python -m pip install -e .` 更新。首次尝试可以点「运行离线示例」，这会运行真实的 core demo 并生成可下载的 partition 和评估文件。
 
 ```bash
-# 在仓库根目录运行。真实模型任务先在同一个 shell 加载密钥和所需的 R 环境。
-set +x
-set -a
-source "$HOME/.api_keys"
-set +a
-rarecell ui --workspace "$PWD/work/tasks" --port 8787
+# 在仓库根目录运行。安装过初版的环境先执行 .venv/bin/python -m pip install -e .
+.venv/bin/rarecell ui --workspace "$PWD/work/tasks" --port 8787
 ```
+
+在首页「全局模型」填入部署模型 ID（例如 `gpt-6-luna`）并保存，即可同时设置发现和 OntoAnno 的模型。该值保存在当前项目的 `.rarecell-model`，GUI 和同一 checkout 提交的 Slurm 作业均可读取。清空并保存即可恢复 YAML 中的模型。优先级从高到低为任务表单的分项模型或命令行 `--model`、项目全局模型、YAML 中的模型。GUI 任务在入队时保存解析后的配置，恢复任务使用原运行的配置。
 
 打开终端打印的完整私人链接（含 `#` 后的随机令牌）。页面只绑定本机回环地址。每次启动服务会生成新链接，请只在自己的浏览器使用。选择「新建任务 → 完整发现流程」，填写数据集清单或选择已有快照，再选择 A0–A3。真实任务可在表单中填模型名，或指定含模型名的 YAML 配置；相对路径以启动目录为准。A1/A3 可指定已有注释目录，留空则执行 OntoAnno。提供真值 TSV 时会在发现结束并产生结果后单独评估。凭据从启动服务的环境继承。
 
@@ -51,6 +49,24 @@ rarecell ui --workspace "$PWD/work/tasks" --port 8787
 ```powershell
 ssh -L 8787:127.0.0.1:8787 dcc-cpu
 ```
+
+### DCC 的 R 环境、密钥与批处理
+
+在 DCC 登录或计算节点从 checkout 运行 `rarecell` 时，启动器自动执行 `module load R/4.3.1-rhel8`，并将 `R_LIBS_USER` 指向仓库同级的 `r-libs/MultiGPTRareCell/4.3.1-rhel8`。其他安装位置可用 `RARECELL_R_MODULE` 和 `RARECELL_R_LIBS_USER` 指定；将前者设为空字符串可使用自己已加载的 R 环境。在其他主机默认沿用当前 R 环境。
+
+将已有的 `.api_keys` 放在仓库根目录，每行使用 `NAME=value` 或 `export NAME="value"`。支持引号、空行和注释，值按字面量读取。官方 OpenAI 接口默认使用 `OPENAI_API_KEY`。文件存在时其中的值覆盖同名环境变量；没有文件时沿用现有环境。密钥由启动进程传给子进程。更新密钥后重新启动 GUI，新提交的批处理作业会在计算节点重新读取文件。可以用 `chmod 600 .api_keys` 限制文件访问。
+
+在仓库根目录执行以下命令。网页与命令行均可设置同一份全局模型。
+
+```bash
+.venv/bin/rarecell model --set gpt-6-luna
+.venv/bin/rarecell doctor --config real.yaml
+sbatch --time=00:10:00 scripts/rarecell.sbatch doctor --config real.yaml
+sbatch --time=02:00:00 --cpus-per-task=4 --mem=16G scripts/rarecell.sbatch \
+  discover --snapshot work/prepared --annotations work/annotations --run work/A3 --mode A3 --config real.yaml
+```
+
+资源、账号和 partition 参数放在脚本名之前。批处理入口使用提交目录中的 `.venv` 和 `.api_keys`，按作业启动时的全局模型运行。要在提交时指定模型，可在子命令后加 `--model gpt-6-luna`。脚本默认使用 Slurm 的 `--export=NIL`，自定义模块和库目录可在自己的作业脚本里设置。GUI 队列在它所在的 allocation 内串行运行。
 
 ## 输入
 
@@ -78,11 +94,11 @@ examples/minimal_sparse/input 是可读的最小文件实例。examples/datasets
 
 ## 真实准备与模型配置
 
-复制配置文件，填写两个真实的部署模型名。provider 控制主 Agent，annotation 控制作者的注释模块。密钥通过对应环境变量提供。自定义兼容接口须按服务配置 base_url、endpoint 和 api_style。脚本不假定模型支持 temperature、seed 或固定 token 上限。应在集群作业环境继承凭据和私有 R 库。
+复制配置文件，在全局模型或两个模型字段中填写实际部署的模型名。provider 控制主 Agent，annotation 控制作者的注释模块。密钥通过对应环境变量提供。自定义兼容接口须按服务配置 base_url、endpoint 和 api_style。脚本不假定模型支持 temperature、seed 或固定 token 上限。应在集群作业环境继承凭据和私有 R 库。
 
 ```bash
 cp configs/real_provider.yaml real.yaml
-# 编辑 real.yaml 中 provider.model 和 annotation.model，在作业环境设置对应的凭据。
+# 若两个组件使用不同模型，可清空全局模型后分别设置 provider.model 与 annotation.model。
 rarecell doctor --config real.yaml
 rarecell prepare --dataset data/pbmc_tcr/dataset.yaml --out work/prepared --config real.yaml
 rarecell annotate --snapshot work/prepared --out work/annotations --config real.yaml

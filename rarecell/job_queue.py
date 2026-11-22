@@ -16,6 +16,7 @@ from contextlib import closing, contextmanager
 import yaml
 
 from .config import config, read_json, write_json
+from .runtime import model_overrides, project_model
 
 KINDS = {"pipeline", "prepare", "annotate", "discover", "resume", "evaluate", "demo"}
 ACTIVE = {"queued", "running", "stopping"}
@@ -95,7 +96,7 @@ def submit(root, project, form):
     if kind == "evaluate" and not (Path(spec["run"]) / "frozen.json").is_file():
         raise ValueError("运行目录中缺少 frozen.json")
     if kind in {"pipeline", "prepare", "discover", "annotate"}:
-        override = {}
+        override = model_overrides(project_model(project))
         for field, section in (("model", "provider"), ("annotation_model", "annotation")):
             if form.get(field):
                 override[section] = {"model": form[field]}

@@ -16,6 +16,7 @@ import yaml
 
 from . import job_queue as jobs
 from .config import read_json
+from .runtime import project_model, save_project_model
 
 WEB = Path(__file__).with_name("web")
 ASSETS = {"/": "index.html", "/app.css": "app.css", "/app.js": "app.js"}
@@ -130,10 +131,17 @@ class Handler(BaseHTTPRequestHandler):
         if not secrets.compare_digest(key.encode(), ("Bearer " + self.server.token).encode()):
             return self.reply({"error": "请使用启动终端显示的完整链接重新打开控制台"}, 401)
         root = self.server.root
+        if method == "POST" and path == "/api/model":
+            body = self.body()
+            if not isinstance(body, dict) or set(body) != {"model"}:
+                raise ValueError("请提交模型 ID")
+            save_project_model(self.server.project, body["model"])
+            return self.reply({"model": body["model"]})
         if path == "/api/tasks":
             if method == "GET":
                 return self.reply({"tasks": jobs.list_tasks(root), "host": socket.gethostname(),
-                                   "workspace": str(root), "project": str(self.server.project)})
+                                   "workspace": str(root), "project": str(self.server.project),
+                                   "model": project_model(self.server.project)})
             task_id = jobs.submit(root, self.server.project, self.body())
             return self.reply({"id": task_id}, 201)
         m = re.fullmatch(r"/api/tasks/([0-9a-f]{32})(?:/(stop|files/([a-z_.]+)))?", path)

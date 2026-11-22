@@ -82,6 +82,14 @@ def test_http_restart_cancel_and_download(tmp_path):
             with pytest.raises(error.HTTPError) as missing:
                 call("/api/tasks", {"kind": "demo"}, key=False)
             assert missing.value.code == 401
+            with pytest.raises(error.HTTPError) as unauthorized:
+                call("/api/model", {"model": "global"}, key=False)
+            assert unauthorized.value.code == 401
+            assert json.loads(call("/api/model", {"model": "global"}))["model"] == "global"
+            assert json.loads(call("/api/tasks"))["model"] == "global"
+            with pytest.raises(error.HTTPError) as invalid:
+                call("/api/model", {"model": ["invalid"]})
+            assert invalid.value.code == 400
             tid = json.loads(call("/api/tasks", {"kind":"demo", "name":"HTTP demo"}))["id"]
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline:

@@ -651,3 +651,21 @@ dd {
   cursor: pointer;
   color: var(--muted);
 }
+
+.project-settings {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin: 0 0 16px;
+}
+.project-settings label { font-weight: 600; }
+.project-settings input {
+  min-width: 0;
+  width: min(230px, 100%);
+  padding: 8px 10px;
+  border: 1px solid #cfd3de;
+  border-radius: 6px;
+  font: inherit;
+}
+.project-settings small, #model-status { color: var(--muted); }

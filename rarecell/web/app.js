@@ -139,12 +139,37 @@ function render() {
       ? "共 " + tasks.length + " 个任务"
       : "显示 " + rows.length + " / " + tasks.length + " 个任务";
 }
+let savedModel = null;
+function displayModel(value) {
+  const input = $("project-model");
+  if (savedModel === null || input.value === savedModel) input.value = value;
+  savedModel = value;
+  input.disabled = false;
+  $("save-model").disabled = false;
+  const hint = value ? "全局模型：" + value : "沿用配置文件中的模型";
+  for (const name of ["model", "annotation_model"]) form.elements[name].placeholder = hint;
+}
+$("project-settings").onsubmit = async (event) => {
+  event.preventDefault();
+  const input = $("project-model");
+  const model = input.value.trim();
+  try {
+    await api("/api/model", { model });
+    input.value = model;
+    displayModel(model);
+    $("model-status").textContent = model ? "已保存" : "已清除";
+  } catch (err) {
+    $("model-status").textContent = err.message;
+  }
+};
+$("project-model").oninput = () => ($("model-status").textContent = "");
 async function refresh() {
   if (loading) return;
   loading = true;
   try {
     const data = await api("/api/tasks");
     tasks = data.tasks;
+    displayModel(data.model);
     render();
     $("workspace").textContent = data.workspace;
     $("connection").lastElementChild.textContent = data.host;
