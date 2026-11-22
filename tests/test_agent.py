@@ -270,3 +270,153 @@ def test_context_deduplicates_repeated_read_receipts(app):
         assert not shown.intersection(c["id"] for c in ctxs[0]["current_candidates"])
     finally:
         ctrl.state.close()
+
+
+@pytest.mark.parametrize("mode", ["A0", "A1", "A2", "A3", "A3_adaptive"])
+def test_live_deadline_rejects_recorded_browse_then_accepts_submission(app, mode):
+    from rarecell.run import explore
+    snap, cfg, root = app
+    cfg["budget"].update(max_agent_turns=12, max_actions_per_turn=1)
+    ctrl = Controller(snap, root/"deadline", root/"cache", cfg, mode)
+    try:
+        ctrl.initialize()
+        s = ctrl.state
+        s.set_meta("run_id", "deadline")
+        s.set_meta("finished_turn", 10)
+        cid = ctrl.ordered()[0]["id"]
+        # Exact last reply from the PGC trace, followed by a mixed correction.
+        browse = {"action": "list_candidates", "offset": 0, "limit": 50}
+        for turn, payload in [(11, browse), (12, [browse, {"action": "submit", "candidate_ids": [cid]}])]:
+            mid = f"deadline:T{turn:04d}"
+            s.put("Message", mid, {"message_id": mid, "raw": json.dumps(payload), "usage": {}})
+        assert explore(ctrl, "live", pause_after=11) == ("partial", "paused")
+        assert "list_candidates" not in ctrl.context(12)["actions"]
+        result = s.get("Receipt", "deadline:T0011/0")["result"]
+        assert result["status"] == "blocked" and "candidates" not in result
+        assert not s.all("SeedFollowupPlan") and not s.all("CanonicalQuery")
+        assert explore(ctrl, "live") == ("complete", "submitted")
+        assert s.get_meta("selected") == [cid] and s.get_meta("submission_source") == "agent"
+        assert s.get_meta("finished_turn") == 12
+    finally:
+        ctrl.state.close()
+
+
+@pytest.mark.parametrize("has_draft", [True, False])
+def test_ordinary_live_closeout_after_two_nondecisions(app, has_draft):
+    from rarecell.run import explore
+    snap, cfg, root = app
+    cfg["budget"].update(max_agent_turns=3)
+    ctrl = Controller(snap, root/"draft", root/"cache", cfg, "A3")
+    try:
+        ctrl.initialize()
+        s = ctrl.state
+        s.set_meta("run_id", "draft")
+        c = ctrl.ordered()[0]
+        first = ({"action": "propose_revision", "parents": [c["id"]], "groups": [{"candidate_ids": [c["id"]]}],
+                  "reason": "retain measured membership", "evidence_ids": c["evidence_ids"]} if has_draft
+                 else {"action": "get_evidence", "candidate_id": c["id"]})
+        for turn, action in enumerate([first, {"action":"expand_candidate", "candidate_id":c["id"]},
+                                      {"action":"list_candidates", "offset":0, "limit":50}], 1):
+            mid = f"draft:T{turn:04d}"
+            s.put("Message", mid, {"message_id": mid, "raw": json.dumps(action), "usage": {}})
+        assert explore(ctrl, "live") == ("partial", "max_agent_turns" if has_draft else "decision_missing")
+        assert s.get_meta("closeout_trigger") == "max_agent_turns"
+        assert not s.all("CanonicalQuery") and not s.all("SeedFollowup")
+        assert bool(s.get_meta("submitted")) == has_draft
+        if has_draft:
+            assert s.get_meta("submission_source") == "controller_budget"
+            assert s.get_meta("submission_status") == "provisional"
+    finally:
+        ctrl.state.close()
+
+
+def test_seed_screen_and_journalled_followup_on_browse(app):
+    from rarecell.run import follow_browsing_with_seed, explore
+    snap, cfg, root = app
+    run = root/"seed-review"
+    ctrl = Controller(snap, run, root/"cache", cfg, "A3")
+    try:
+        ctrl.initialize()
+        s = ctrl.state
+        s.set_meta("run_id", "seeds")
+        for i in range(1, 3):
+            mid = f"seeds:T{i:04d}"
+            s.put("Message", mid, {"message_id": mid, "raw": '{"action":"list_candidates"}', "usage": {}})
+        assert explore(ctrl, "live", pause_after=1) == ("partial", "paused")
+        seed, = ctrl.screened_seeds
+        record = s.get("SeedFollowup", "seeds:T0001")
+        assert record["source"] == "controller_seed_review" and record["anchor_id"] == seed["candidate_id"]
+        assert record["result"]["query_key"] and s.usage()["new_queries"] == 1
+        assert not ctrl.context(2)["seed_review"]["priority"]
+    finally:
+        ctrl.state.close()
+    ctrl = Controller(snap, run, root/"cache", cfg, "A3")
+    try:
+        s = ctrl.state
+        assert follow_browsing_with_seed(ctrl, "seeds:T0001") == record
+        assert explore(ctrl, "live", pause_after=2) == ("partial", "paused")
+        assert len(s.all("SeedFollowupPlan")) == len(s.all("Investigation")) == 1
+        assert s.usage()["compute_executions"] == 1
+    finally:
+        ctrl.state.close()
+
+
+@pytest.mark.parametrize("setting", ["max_new_queries", "max_seed_followups", "max_expansion_depth", "max_actions_per_turn"])
+def test_seed_followup_respects_all_caps(app, setting):
+    snap, cfg, root = app
+    cfg["budget"][setting] = 1 if setting == "max_actions_per_turn" else 0
+    ctrl = Controller(snap, root/"caps", root/"cache", cfg, "A2")
+    try:
+        ctrl.initialize()
+        ctrl.state.set_meta("policy", "live")
+        process_message(ctrl, {"message_id": "cap:T0001", "raw": '{"action":"list_candidates"}'}, 1)
+        assert not ctrl.state.all("SeedFollowupPlan") and not ctrl.state.all("CanonicalQuery")
+    finally:
+        ctrl.state.close()
+
+
+def test_live_ordinary_stall_enters_decision_with_no_draft(app):
+    from rarecell.run import explore
+    snap, cfg, root = app
+    cfg["budget"].update(stall_turns=1, max_seed_followups=0)
+    ctrl = Controller(snap, root/"early-stall", root/"cache", cfg, "A3")
+    try:
+        ctrl.initialize()
+        s = ctrl.state
+        s.set_meta("run_id", "stall")
+        for i, payload in enumerate([{"action":"list_candidates"}, {"action":"list_candidates"},
+                                      {"action":"submit", "candidate_ids":[]}], 1):
+            mid = f"stall:T{i:04d}"
+            s.put("Message", mid, {"message_id":mid, "raw":json.dumps(payload), "usage":{}})
+        assert explore(ctrl, "live", pause_after=2) == ("partial", "paused")
+        assert set(ctrl.context(3)["actions"]) == {"submit", "propose_revision"}
+        assert explore(ctrl, "live") == ("complete", "submitted")
+        assert s.get_meta("decision_start_turn") == 3 and s.get_meta("selected") == []
+    finally:
+        ctrl.state.close()
+
+
+def test_frozen_seed_and_decision_diagnostics(app, monkeypatch):
+    import csv
+    from rarecell.dashboard_transcript import discovery_blocks
+    snap, cfg, root = app
+    cfg["provider"].update(kind="openai_compatible", model="test", api_key_env=None)
+    cfg["budget"]["max_agent_turns"] = 3
+    calls = []
+    def reply(ctx, _):
+        calls.append(ctx)
+        if len(calls) > 1:
+            assert "list_candidates" not in ctx["actions"] and ctx["phase"] == "decision"
+        return '{"action":"list_candidates","offset":0,"limit":50}', {"api_calls":1}
+    monkeypatch.setattr(providers, "complete", reply)
+    run = root/"frozen-review"
+    summary = discover(snap, run, root/"cache", cfg)
+    assert len(calls) == 3 and calls[0]["seed_review"]["screened"] == 1
+    assert summary["detail"] == "decision_missing" and summary["closeout_trigger"] == "max_agent_turns"
+    assert not summary["submitted"] and summary["n_expanded_seeds"] == summary["n_controller_seed_followups"] == 1
+    assert summary["n_screened_seeds"] == 1 and summary["unresolved_cells"] == summary["n_cells"]
+    with (run/"seeds.tsv").open() as stream:
+        row, = csv.DictReader(stream, delimiter="\t")
+        assert row["screened"] == "True" and row["task_status"] == "investigated" and row["controller_followup"]
+    display = "\n".join(discovery_blocks(run, read_json(run/"checkpoint.json")))
+    assert "控制器种子补查" in display and "controller_seed_review" in display and "decision_missing" in display

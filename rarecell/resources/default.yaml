@@ -33,6 +33,7 @@ budget:
   max_agent_turns: 12
   max_reported_tokens: 0
   max_new_queries: 25
+  max_seed_followups: 3
   max_expansion_depth: 1
   stall_turns: 3
   context_bytes: 36000

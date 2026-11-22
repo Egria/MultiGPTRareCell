@@ -115,7 +115,7 @@ def turn_detail(db, number):
     for key, body in db.execute("SELECT id,body FROM record WHERE kind='Receipt' AND id>=? AND id<?",
                                 (mid + "/", mid + "0")):
         receipts[int(key.rsplit("/", 1)[1])] = fields(json.loads(body), "result progress metadata")
-    return {"message": fields(msg, "message_id raw complete usage"), "commands": commands,
+    return {"seed_followup": record(db, "SeedFollowup", mid), "message": fields(msg, "message_id raw complete usage"), "commands": commands,
             "receipts": [dict(index=i, **receipts[i]) for i in sorted(receipts)],
             "dispatches": dispatches, "failures": [fields(a, "id status detail") for a in failures if a]}
 
@@ -165,7 +165,7 @@ def diagnostics(root, task, page=None, turn=None):
     scores = evaluation((run.parent if inspected else base) / "evaluation" / "metrics.json",
                         run / "frozen.json" if inspected else None)
     return {"trace": trace, "summary": fields(summary, "status detail issue submitted submission_status submission_source n_cells n_candidates n_groups "
-                                           "unresolved_cells n_pending_seeds fallback_view_resolution annotation_status"),
+                                           "unresolved_cells n_screened_seeds n_expanded_seeds n_controller_seed_followups closeout_trigger n_pending_seeds fallback_view_resolution annotation_status"),
             "pending_seeds": seeds, "annotation_model": (ann.get("settings") or {}).get("model"),
             "stall_limit": (cfg.get("budget") or {}).get("stall_turns"),
             "usage": fields(usage, "turns provider_dispatches protocol_errors action_errors new_queries compute_executions"),

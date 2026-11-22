@@ -23,7 +23,7 @@ from .protocol import VERSION as PROTOCOL_VERSION, ProtocolError, parse_message
 def code_fingerprint():
     module = Path(__file__).parent
     files = ("discovery.py", "run.py", "protocol.py", "science.py", "state.py", "providers.py",
-             "config.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py")
+             "config.py", "seed_review.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py")
     return fingerprint({name: hash_file(module / name) for name in files})
 
 
@@ -136,6 +136,34 @@ def repaired_locally(raw, parsed):
     return False
 
 
+def follow_browsing_with_seed(ctrl, mid):
+    """Use one spare local action on a screened seed. Journal the choice before computation."""
+    s = ctrl.state
+    done = lookup(s, "SeedFollowup", mid)
+    if done is not None:
+        return done
+    plan = lookup(s, "SeedFollowupPlan", mid)
+    if plan is None:
+        if (len(s.all("SeedFollowupPlan")) >= ctrl.budget.get("max_seed_followups", 3) or
+                s.usage()["new_queries"] >= ctrl.budget["max_new_queries"] or
+                not ctrl.budget["max_expansion_depth"]):
+            return None
+        queue = ctrl.pending_seed_reviews()
+        if not queue:
+            return None
+        plan = dict(queue[0], source="controller_seed_review")
+        s.put("SeedFollowupPlan", mid, plan)
+    cid = plan["candidate_id"]
+    try:
+        result = ctrl.scientific("expand_candidate", {"candidate_id": cid})
+    except (ValueError, KeyError) as exc:
+        result = {"status": "blocked", "error": str(exc)[:500]}
+    record = {"source": plan["source"], "anchor_id": cid, "peer": plan["peer"],
+              "shared_markers": plan["shared_markers"], "views": plan["views"], "result": result}
+    s.put("SeedFollowup", mid, record)
+    return record
+
+
 def process_message(ctrl, message, turn):
     s = ctrl.state
     mid = message["message_id"]
@@ -150,13 +178,18 @@ def process_message(ctrl, message, turn):
     else:
         parsed = interpretation["commands"]
     limit = ctrl.budget["max_actions_per_turn"]
-    if len(parsed) > limit:
+    closing = ctrl.closing_actions(turn)
+    if closing and s.get_meta("decision_start_turn") is None:
+        s.set_meta("decision_start_turn", turn)
+    if not closing and len(parsed) > limit:
         parsed = parsed[:limit] + [{"error": "Remaining batch actions exceed max_actions_per_turn"}]
-    decision_only = ctrl.stall_review()
+    eligible = 0
     receipts = []
     progress = False
     for index, command in enumerate(parsed):
         opid = "%s/%d" % (mid, index)
+        if closing and command.get("action") in closing:
+            eligible += 1
         old = lookup(s, "Receipt", opid)
         if old is not None:
             receipts.append(old["result"])
@@ -170,8 +203,13 @@ def process_message(ctrl, message, turn):
                 result = {"error": "Run already submitted; subsequent action blocked", "status": "blocked"}
             else:
                 try:
-                    if decision_only and command.get("action") not in {"submit", "select_boundary", "propose_revision"}:
-                        raise ValueError("Closing review accepts select_boundary, propose_revision and submit")
+                    if closing and command.get("action") and command["action"] not in closing:
+                        raise ValueError("Decision phase accepts only: " + ", ".join(closing))
+                    if closing and eligible > limit:
+                        raise ValueError("Remaining decision actions exceed max_actions_per_turn")
+                    if (closing and command.get("action") == "submit" and "candidate_ids" not in command["args"]
+                            and not s.get_meta("selected", [])):
+                        raise ValueError("No saved selection. Submit candidate_ids explicitly, including [] to decline all.")
                     result = ctrl.execute(command, mid)
                 except (ValueError, KeyError) as exc:
                     clarification = "error" in command or isinstance(exc, ProtocolError)
@@ -222,6 +260,14 @@ def process_message(ctrl, message, turn):
                                    "status": result.get("status", "ok"), "receipt": opid, "changed": changed})
         receipts.append(result)
         progress |= changed
+    browse_only = parsed and all(c.get("action") == "list_candidates" for c in parsed)
+    if (not closing and ctrl.active and s.get_meta("policy") == "live" and browse_only
+            and len(parsed) < limit and any("candidates" in r for r in receipts)):
+        followup = follow_browsing_with_seed(ctrl, mid)
+        if followup:
+            receipts.append(dict(followup["result"], source=followup["source"], anchor_id=followup["anchor_id"],
+                                 peer=followup["peer"], shared_markers=followup["shared_markers"]))
+            progress |= "query_key" in followup["result"]
     with s.transaction():
         s.set_meta("receipts", receipts[-12:])
         s.set_meta("finished_turn", turn)
@@ -251,6 +297,7 @@ def retain_freeze(run, frozen):
 def explore(ctrl, policy, pause_after=None, retry_unknown=False):
     """Run bounded discovery turns and publish a saved draft on a terminal stall."""
     s = ctrl.state
+    s.set_meta("policy", policy)
     status, detail = "partial", "max_agent_turns"
     for turn in range(s.get_meta("finished_turn", 0) + 1, ctrl.budget["max_agent_turns"] + 1):
         if ctrl.stall_review():
@@ -292,7 +339,7 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
             if not ctrl.stall_review() or turn == ctrl.budget["max_agent_turns"]:
                 detail = "stalled"
                 break
-        if pause_after is not None and turn >= pause_after:
+        if pause_after is not None and turn >= pause_after and (policy != "live" or turn < ctrl.budget["max_agent_turns"]):
             detail = "paused"
             break
     # A stalled run may use one remaining turn to choose among held hypotheses.
@@ -301,7 +348,7 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
     terminal_stall = detail == "stalled" or (
         ctrl.stall_review() and detail in {"max_agent_turns", "max_reported_tokens", "token_usage_unreported"})
     budget_stop = detail in {"max_agent_turns", "max_reported_tokens", "token_usage_unreported"}
-    if ctrl.adaptive and (terminal_stall or budget_stop) and s.get_meta("selected", []) and not s.get_meta("submitted", False):
+    if (policy == "live" or ctrl.adaptive) and (terminal_stall or budget_stop) and s.get_meta("selected", []) and not s.get_meta("submitted", False):
         source = "controller_stall" if terminal_stall else "controller_budget"
         with s.transaction():
             outcome = ctrl.decide("submit", {"status": "provisional", "reason":
@@ -312,6 +359,11 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
         return "partial", "stalled_provisional"
     if s.get_meta("submission_source") == "controller_budget":
         return "partial", detail
+    if (policy == "live" and not s.get_meta("submitted", False) and detail in {"stalled", "max_agent_turns"}
+            and s.get_meta("decision_start_turn") is not None):
+        s.set_meta("closeout_trigger", detail)
+        s.set_meta("current_issue", "Decision phase ended without an explicit submission or a saved selection.")
+        return "partial", "decision_missing"
     return status, detail
 
 

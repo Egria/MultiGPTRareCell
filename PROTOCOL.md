@@ -83,6 +83,14 @@
 
 `select_boundary(candidate_id=..., reason=...)` 替换同一种子的工作边界，保留其他互不重叠的草案。跨群重叠可用 `propose_revision` 分配成员。模型可以用 `submit` 提交当前选择，用显式候选列表指定最终选择，或用空列表放弃全部候选。同一种子的互斥边界只能选一个，除非先修订为互不重叠的群。
 
-停滞时，只要已有提案或工作草案，且原轮数和 token 预算允许，就保留一次只接受 `select_boundary`、`propose_revision` 和 `submit` 的收尾轮。如果该轮没有提交，或在停滞时预算已经用尽，控制器只发布已选的非空草案。此时 `submitted=true`、`submission_status=provisional`、`submission_source=controller_stall`，运行状态为 `partial / stalled_provisional`。没有已选草案时保留未提交状态。服务连接失败按既有规则记录和恢复。模型明确提交的结果标记 `submission_source=agent`。
+### Live 决策轮
 
-在 A3_adaptive 中，触及已报告 token 或轮数上限、或受限运行缺失 token 用量时，即使上一轮有实质进展，也会暂定提交已经选定的非空草案。结果保留原始停止原因，标记 `submission_source=controller_budget` 和 `submission_status=provisional`。到达上限后的收尾不调用模型，未选候选不自动加入。模型在接近用量上限时可主动提交；单次调用的实际用量由服务端在返回后报告。
+所有 live 模式从同一动作许可表生成提示并执行请求。总轮数至少为 3 时保留最后两轮决策，设为 1 或 2 时保留最后一轮。已有充分证据可提前提交。提前停滞时，预算允许即进入一次决策轮。此时可用已有证据修订和提交；自适应臂也可选择已保存的边界，在轮数收尾时还可对已有排名应用阈值。翻页与新科学查询会留下拒绝回执。同批回复中合法的决策仍可执行。提交已选草案可以省略 candidate_ids，明确放弃全部候选请给出空数组。
+
+在停滞或轮数、已报告 token 预算停止时，有非空工作草案则暂定提交，来源标记 controller_stall 或 controller_budget。若模型已进入决策阶段且始终没有提交或留下草案，记录 decision_missing 和 closeout_trigger。服务派发失败继续使用既有的恢复协议。
+
+### 单细胞种子初筛和补查
+
+对 live 主动臂，初筛按冻结的前三个 marker 比较基因 ID 和效应方向，优先较长的共享组合及较多提名视图。每个种子保存一个代表性同伴；可从证据 ID 引用原观察。该顺序只用于安排调查。同一 RNA 的多个视图仍共用证据来源。
+
+探索阶段整轮只请求 list_candidates、至少一次成功且本轮还有动作额度时，控制器可补查一个待查种子。补查使用标准 expand_candidate，受同一查询数、深度和缓存约束，不调用语言模型。budget.max_seed_followups 控制全程上限。开始计算前固定锚点，重启后复用同一计划。逐轮输出中的 controller_seed_review 标出来源。seeds.tsv 保留初筛、实际调查状态以及最终归属。
