@@ -1,4 +1,7 @@
 /work/
+/data/
+/benchmark/
+/real.yaml
 .venv/
 __pycache__/
 .pytest_cache/
