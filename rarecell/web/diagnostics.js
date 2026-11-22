@@ -42,6 +42,7 @@ function showOverview(data) {
     if (s.detail === "stalled") note.append(element("p", "连续多轮动作都没有被控制器计为新进展，运行已停止。"));
     if (s.detail === "stalled_provisional") note.append(element("p", "探索停滞。控制器已暂定提交当前草案，模型尚未作出最终提交。"));
     if (s.submission_source === "controller_budget") note.append(element("p", "预算检查结束了探索。控制器已暂定提交模型保存的候选，具体触发原因见上方。"));
+    if (s.detail === "decision_missing") note.append(element("p", "决策阶段结束，模型未提交分群，也没有可暂存的草案。"));
     if (s.issue) note.append(element("p", s.issue));
     box.append(note);
   }
@@ -49,6 +50,8 @@ function showOverview(data) {
     ["准备 / 注释", [data.prepare.status, a.status || s.annotation_status].map(v => v ?? "暂无记录").join(" / ")],
     ["注释详情", a.detail], ["已提交分群", s.submitted == null ? null : s.submitted ? "是" : "否"],
     ["未决细胞 / 总数", s.n_cells == null ? null : (s.unresolved_cells ?? "—") + " / " + s.n_cells],
+    ["收尾触发原因", s.closeout_trigger], ["已初筛种子", s.n_screened_seeds],
+    ["已直接扩展调查的种子", s.n_expanded_seeds], ["控制器补查次数", s.n_controller_seed_followups],
     ["待调查种子", s.n_pending_seeds], ["回退规则", s.fallback_view_resolution?.join(" · 分辨率 ")],
     ["连续无进展 / 停机阈值", data.trace.stall != null ?
       data.trace.stall + " / " + (data.stall_limit ?? "—") : null]
@@ -98,6 +101,7 @@ function turnDisclosure(id, turn) {
       const data = await api("/api/tasks/" + id + "/diagnostics/turn/" + turn.number);
       if (!box.isConnected || diagTask !== id) return;
       body.replaceChildren(element("h4", "模型原始回复"), element("pre", data.message.raw || "尚无可用的回复正文"));
+      if (data.seed_followup?.source) body.append(element("h4", "控制器种子补查"), element("pre", JSON.stringify(data.seed_followup, null, 2)));
       if (data.message.complete === false) body.append(element("p","传输记录标记为未完成。"));
       for (const [label, value] of [["已解析的请求", data.commands], ["动作回执", data.receipts], ["服务端调用错误", data.failures]]) {
         if (value.length) body.append(element("h4", label),element("pre", JSON.stringify(value, null, 2)));

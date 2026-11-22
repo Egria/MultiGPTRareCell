@@ -89,12 +89,17 @@ def export(ctrl, status, detail, policy, annotation_status):
     selected = set(s.get_meta("selected", []))
     depths = s.get_meta("depths", {})
     final = {r["cell_id"]: r for r in part}
+    screened = {r["candidate_id"]: r for r in ctrl.screened_seeds} if ctrl.active and s.get_meta("policy") == "live" else {}
+    followups = {r["anchor_id"]: r for r in s.all("SeedFollowup")}
     seed_rows = []
     for seed in seeds:
         cid = seed["candidate_id"]
         activity = "investigated" if depths.get(cid, 0) else "selected" if cid in selected else "pending"
-        seed_rows.append(dict(seed, seed_id=seed["id"], barcode=seed.get("barcode", seed["cell_id"]), task_status=activity, final_group=final[seed["cell_id"]]["group_id"]))
-    tsv(run / "seeds.tsv", ["seed_id", "cell_id", "barcode", "candidate_id", "task_status", "final_group"], seed_rows)
+        seed_rows.append(dict(seed, seed_id=seed["id"], barcode=seed.get("barcode", seed["cell_id"]), task_status=activity,
+                              screened=cid in screened, priority_peer=screened.get(cid, {}).get("peer"),
+                              shared_markers=",".join(screened.get(cid, {}).get("shared_markers", [])),
+                              controller_followup=followups.get(cid, {}).get("result", {}).get("status"), final_group=final[seed["cell_id"]]["group_id"]))
+    tsv(run / "seeds.tsv", ["seed_id", "cell_id", "barcode", "candidate_id", "task_status", "final_group", "screened", "priority_peer", "shared_markers", "controller_followup"], seed_rows)
     # One durable queue covers all base candidates, including seeds left untouched
     # when the policy submits early or reaches its budget.
     investigated = {row["candidate_id"] for row in s.all("Investigation")}
@@ -140,7 +145,12 @@ def export(ctrl, status, detail, policy, annotation_status):
                "fallback_view_resolution": list(base) if base else None,
                "replication_id": s.get_meta("replication_id"), "run_id": s.get_meta("run_id"),
                "resumable": detail in ("paused", "provider_blocked", "annotation_blocked", "unknown_execution", "temporary_failure", "incomplete")}
-    if ctrl.adaptive:
+    if policy == "live" and ctrl.active:
+        summary.update(n_screened_seeds=len(screened), n_controller_seed_followups=len(followups),
+                       n_expanded_seeds=sum(seed["candidate_id"] in investigated for seed in seeds))
+    if s.get_meta("closeout_trigger"):
+        summary["closeout_trigger"] = s.get_meta("closeout_trigger")
+    if ctrl.adaptive or policy == "live":
         summary["submission_source"] = s.get_meta("submission_source")
     write_json(run / "run_summary.json", summary)
     files = ["run_summary.json", "usage.json", "manifest.json", "config_resolved.yaml", "project_contract.yaml",

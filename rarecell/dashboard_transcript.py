@@ -120,6 +120,8 @@ def discovery_blocks(run, checkpoint):
             yield block("完成状态与用量", fields(message, "complete usage"))
         else:
             yield "尚无已保存的回复。"
+        if turn["seed_followup"]:
+            yield block("控制器种子补查", turn["seed_followup"])
         for i, command in enumerate(turn["commands"]):
             yield block("解析请求 [%d]" % i, command)
         for receipt in turn["receipts"]:
@@ -133,7 +135,7 @@ def discovery_blocks(run, checkpoint):
             yield block("停滞时保存的暂定提交", decisions[event["decision_id"]])
     summary = optional_json(run / "run_summary.json")
     if summary:
-        yield block("发现结果", fields(summary, "status detail issue submitted submission_status submission_source n_groups n_pending_seeds"))
+        yield block("发现结果", fields(summary, "status detail issue submitted submission_status submission_source n_groups n_screened_seeds n_expanded_seeds n_controller_seed_followups closeout_trigger n_pending_seeds"))
 
 
 def transcript(root, task, previous=None):

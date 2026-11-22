@@ -1,8 +1,9 @@
 """One discovery controller. All model inputs and operations pass this boundary."""
 import csv
+from functools import cached_property
 from pathlib import Path
 
-from . import __version__, adaptive
+from . import __version__, adaptive, seed_review
 from .base_evidence import FrozenSeurat, annotation_parents, prepared_page
 from .config import ADAPTIVE_MODE, ANNOTATED_MODES, contract, fingerprint, json_bytes, read_json, read_lines
 from .protocol import ProtocolError, resolve_genes
@@ -35,8 +36,8 @@ GOAL = (
 
 def prompt_version(mode):
     if mode == ADAPTIVE_MODE:
-        return "discovery/adaptive-4"
-    return "discovery/1.4"
+        return "discovery/adaptive-5"
+    return "discovery/1.5"
 
 
 def rows(path):
@@ -224,7 +225,37 @@ class Controller:
     def ordered(self):
         return sorted(self.candidates.values(), key=self.priority)
 
+    @cached_property
+    def screened_seeds(self):
+        return seed_review.screen(self.candidate(seed["candidate_id"]) for seed in self.state.all("Seed"))
+
+    def pending_seed_reviews(self):
+        depths = self.state.get_meta("depths", {})
+        excluded = set(self.state.get_meta("selected", []))
+        excluded.update(r["candidate_id"] for r in self.state.all("SeedFollowupPlan"))
+        return [r for r in self.screened_seeds if not depths.get(r["candidate_id"]) and r["candidate_id"] not in excluded]
+
+    def decision_start(self):
+        limit = self.budget["max_agent_turns"]
+        return limit - 1 if limit >= 3 else max(1, limit)
+
+    def closing_actions(self, turn):
+        """One gate shared by the model's catalogue and the command dispatcher."""
+        stall = self.stall_review()
+        live = self.state.get_meta("policy") == "live"
+        if not stall and not (live and turn >= self.decision_start()):
+            return ()
+        actions = ["propose_revision", "submit"]
+        if self.adaptive:
+            actions.append("select_boundary")
+            if not stall:
+                actions.append("apply_boundary")  # Reuse an existing numeric ranking.
+        return tuple(actions)
+
     def stall_review(self):
+        if self.state.get_meta("policy") == "live":
+            return (self.state.get_meta("closing_turn") is not None or
+                    self.state.get_meta("stall", 0) >= self.budget["stall_turns"])
         if not self.adaptive:
             return False
         if self.state.get_meta("closing_turn") is not None:
@@ -306,15 +337,30 @@ class Controller:
             reviews = s.all("BoundaryReview")
             ctx["boundary_review_count"] = len(reviews)
             ctx["recent_evidence_pages"] = s.get_meta("evidence_pages", [])[-5:]
-            if self.stall_review():
-                ctx["actions"] = {k: actions[k] for k in ("select_boundary", "propose_revision", "submit")}
-                ctx["turn_instruction"] = (
-                    "Final decision after stalled exploration. Compare the requested and wider candidates in "
-                    "boundary_reviews. Submit candidate_ids and explain the margin and global fit, or submit the "
-                    "working selection by omitting candidate_ids. An explicit empty list declines all groups. "
-                    "You may revise or select_boundary before submitting in this message. If there is no submission, "
-                    "the controller publishes a nonempty saved selection as provisional. Unselected suggestions stay on file."
-                )
+        closing = self.closing_actions(turn)
+        live_active = self.active and s.get_meta("policy") == "live"
+        if live_active:
+            ctx.pop("pending_seeds", None)  # The ranked screen below replaces the legacy ID sample.
+        if closing:
+            ctx["actions"] = {k: actions[k] for k in closing}
+            ctx["phase"] = "decision"
+            ctx["turn_instruction"] = (
+                "Exploration is closed. Submit now using exact candidate_ids, or omit the IDs to publish a saved "
+                "selection. Use an explicit empty list and a reason if you decline all groups. You may revise "
+                "memberships with existing evidence then submit in the same reply. New queries and browsing are closed."
+            )
+            ctx["reviewed_anchors"] = []
+        if s.get_meta("policy") == "live":
+            ctx["remaining"]["exploration_turns_including_this"] = 0 if closing else self.decision_start() - turn
+            if not closing and turn + 1 == self.decision_start():
+                ctx["turn_instruction"] += " This is your last exploration turn. Batch the measurements needed for your decision now."
+        if live_active:
+            queue = self.screened_seeds if closing else self.pending_seed_reviews()
+            ctx["seed_review"] = {"screened": len(self.screened_seeds), "priority": [],
+                                  "basis": "Shared signed markers and RNA views guide follow-up. These are not independent "
+                                           "validation. Use their evidence IDs to propose a joint group if warranted."}
+            if not closing:
+                ctx["seed_review"]["pending_followup"] = len(queue)
         if self.adaptive and self.budget.get("max_reported_tokens"):
             consumed = [m["usage"].get("total_tokens") for m in s.all("Message")]
             if all(n is not None for n in consumed):
@@ -336,6 +382,18 @@ class Controller:
                 ctx[key].pop()
                 return False
             return True
+        if closing:
+            for item in reversed(s.all("Investigation")[-12:]):
+                record = {k: item[k] for k in ("candidate_id", "evidence_id", "proposed_revision_id")}
+                if not append_if_fits("reviewed_anchors", record):
+                    break
+        if live_active:
+            for row in queue[:4]:
+                refs = [self.candidate(cid)["evidence_ids"][0] for cid in (row["candidate_id"], row["peer"]) if cid]
+                ctx["seed_review"]["priority"].append(dict(row, evidence_ids=refs))
+                if len(json_bytes(ctx)) > limit:
+                    ctx["seed_review"]["priority"].pop()
+                    break
         links = self.expansion_links(recent) if self.active else []
         if links:
             ctx["recent_expansions"] = []
@@ -681,6 +739,7 @@ class Controller:
             decision["status"] = args.get("status", "final")
             if self.adaptive:
                 decision["assignment_preview"] = adaptive.preview(self, {"candidate_ids": sorted(selected)})
+            if self.state.get_meta("policy") == "live" or self.adaptive:
                 decision["source"] = source
                 self.state.set_meta("submission_source", source)
             if evidence_ids and source == "agent":
