@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
-VERSION = "soft-protocol-1.1"
+VERSION = "soft-protocol-1.2"
 MAX_CHARS = 512_000
 MAX_ACTIONS = 128
 
@@ -34,6 +34,8 @@ def _alias_map(groups):
 
 
 ACTIONS = _alias_map({
+    "apply_boundary": (),
+    "preview_submission": (),
     "list_candidates": ("list candidates", "show candidates", "列出候选", "列出候选群"),
     "get_evidence": ("read evidence", "查看证据", "读取证据"),
     "compare_groups": ("compare groups", "compare populations", "比较群体", "组间比较"),
@@ -44,6 +46,8 @@ ACTIONS = _alias_map({
 })
 
 FIELDS = _alias_map({
+    "metric": (), "matched_evidence_id": (), "min_detected": (), "exclude_candidate_ids": (), "reference_id": (),
+    "background_mode": (), "biological_rarity": (), "rarity_reason": (),
     "action": ("operation", "tool", "动作", "操作"),
     "args": ("arguments", "parameters", "params", "参数"),
     "actions": ("requests", "operations", "请求列表", "动作列表"),
@@ -75,11 +79,13 @@ BINDINGS = {"run_id", "task_id", "data_version", "contract_version", "message_id
 SCOPES = {"candidate_id", "members", "scope"}
 BACKGROUNDS = {"background", "background_id"}
 ALLOWED = {
+    "apply_boundary": {"candidate_id", "evidence_ids", "metric", "threshold", "reason"},
+    "preview_submission": {"candidate_ids", "candidate_id", "reference_id"},
     "list_candidates": {"offset", "limit"},
-    "get_evidence": {"candidate_id", "evidence_ids", "offset", "limit"},
+    "get_evidence": {"candidate_id", "evidence_ids", "metric", "offset", "limit"},
     "compare_groups": SCOPES | BACKGROUNDS | {"genes", "layer", "evidence_ids"},
-    "coexpress": SCOPES | {"genes", "logic", "threshold", "layer", "evidence_ids"},
-    "expand_candidate": {"candidate_id"} | BACKGROUNDS | {"layer", "evidence_ids"},
+    "coexpress": SCOPES | {"min_detected", "genes", "logic", "threshold", "layer", "evidence_ids"},
+    "expand_candidate": {"candidate_id", "background_mode"} | BACKGROUNDS | {"layer", "evidence_ids"},
     "propose_revision": {"groups", "parents", "reason", "evidence_ids"},
     "submit": {"candidate_ids", "reason", "evidence_ids", "status"},
 }
@@ -194,26 +200,34 @@ def _group(value):
     out = {}
     for raw, val in value.items():
         key = _field(raw)
-        if key in {"members", "candidate_ids"}:
+        if key in {"members", "candidate_ids", "exclude_candidate_ids"}:
             clean = _ids(val, key)
+        elif key == "matched_evidence_id":
+            clean = _string(val, key)
         elif key == "candidate_id":
             key, clean = "candidate_ids", [_string(val, key)]
-        elif key == "proposed_label":
+        elif key in {"proposed_label", "rarity_reason"}:
             clean = _string(val, key)
+        elif key == "biological_rarity":
+            clean = _choice(val, key, {s: s for s in ("yes", "no", "uncertain")})
         elif key == "status":
             clean = _choice(val, key, {s: s for s in ("confirmed", "provisional", "unresolved")})
         else:
             raise ProtocolError(f"unsupported group field: {key}")
         _merge(out, key, clean)
-    if not ({"members", "candidate_ids"} & out.keys()):
-        raise ProtocolError("each group requires members or candidate_ids")
+    if not ({"members", "candidate_ids", "matched_evidence_id"} & out.keys()):
+        raise ProtocolError("each group requires members, candidate_ids or matched_evidence_id")
     return out
 
 
 def _value(key, value):
     if key in {"genes", "members", "background", "evidence_ids", "candidate_ids", "parents"}:
         return _ids(value, key, allow_empty=key in {"evidence_ids", "candidate_ids"})
-    if key in BINDINGS | {"reason", "candidate_id", "background_id"}:
+    if key == "metric":
+        return _choice(value, key, {_word(name): name for name in ("score", "expression", "positive_expression")})
+    if key == "background_mode":
+        return _choice(value, key, {name: name for name in ("local", "complement")})
+    if key in BINDINGS | {"reason", "candidate_id", "background_id", "reference_id"}:
         return _string(value, key)
     if key == "logic":
         return _choice(value, key, {"and": "AND", "all": "AND", "与": "AND",
@@ -222,10 +236,10 @@ def _value(key, value):
         return _choice(value, key, {"log1p": "log1p"})
     if key == "scope":
         return _choice(value, key, {"all": "all", "all cells": "all", "全部细胞": "all"})
-    if key in {"limit", "offset", "threshold"}:
+    if key in {"limit", "offset", "threshold", "min_detected"}:
         val = _number(value, key, integer=key != "threshold")
-        if key == "limit" and val == 0:
-            raise ProtocolError("limit must be positive")
+        if key in {"limit", "min_detected"} and val == 0:
+            raise ProtocolError(f"{key} must be positive")
         return val
     if key == "groups":
         items = [value] if isinstance(value, dict) else value
@@ -239,7 +253,7 @@ def _value(key, value):
 
 def _validate(action, args):
     present = args.keys()
-    if len(SCOPES & present) > 1 or len(BACKGROUNDS & present) > 1:
+    if len(SCOPES & present) > 1 or len((BACKGROUNDS | {"background_mode"}) & present) > 1:
         raise ProtocolError("choose one foreground scope and one background scope")
     if action in {"compare_groups", "coexpress", "expand_candidate"} and not (SCOPES & present):
         raise ProtocolError("an explicit candidate or cell scope is required")
@@ -248,8 +262,17 @@ def _validate(action, args):
     if action == "coexpress":
         if "genes" not in args:
             raise ProtocolError("coexpress requires genes")
-        args.setdefault("logic", "AND")
+        if "min_detected" in args:
+            if "logic" in args:
+                raise ProtocolError("choose min_detected or logic")
+        else:
+            args.setdefault("logic", "AND")
         args.setdefault("threshold", 0.0)
+    if action == "apply_boundary":
+        if not {"candidate_id", "evidence_ids", "metric", "threshold", "reason"} <= present or len(args["evidence_ids"]) != 1:
+            raise ProtocolError("apply_boundary needs candidate_id, one expansion evidence_id, metric, threshold and reason")
+        if args["threshold"] > 1:
+            raise ProtocolError("boundary threshold must be between 0 and 1")
     if action == "get_evidence" and "evidence_ids" in args and "candidate_id" in args:
         raise ProtocolError("choose evidence_ids or candidate_id")
     if action == "propose_revision":
@@ -312,7 +335,10 @@ def _normalize(obj):
         elif key in EXPLANATIONS or (key == "reason" and key not in ALLOWED[action]):
             _merge(metadata, key, _string(val, key))
         elif key in ALLOWED[action] | BINDINGS:
-            _merge(args, key, _value(key, val))
+            if key == "background" and action == "expand_candidate" and val == "all":
+                _merge(args, key, "all")
+            else:
+                _merge(args, key, _value(key, val))
         else:
             raise ProtocolError(f"unsupported {action} parameter: {key}")
     _validate(action, args)

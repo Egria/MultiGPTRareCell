@@ -15,12 +15,11 @@ from contextlib import closing, contextmanager
 
 import yaml
 
-from .config import config, read_json, write_json
+from .config import ANNOTATED_MODES, MODES, config, read_json, write_json
 from .runtime import model_overrides, project_model
 
 KINDS = {"pipeline", "prepare", "annotate", "discover", "resume", "evaluate", "demo", "inspect"}
 ACTIVE = {"queued", "running", "stopping"}
-MODES = {"A0", "A1", "A2", "A3"}
 
 
 @contextmanager
@@ -100,13 +99,15 @@ def submit(root, project, form):
         for field, section in (("model", "provider"), ("annotation_model", "annotation")):
             if form.get(field):
                 override[section] = {"model": form[field]}
+        if kind in {"discover", "pipeline"}:
+            override["mode"] = mode
         cfg = config(spec.get("config"), override)
         if kind in {"pipeline", "discover"} and not cfg["provider"].get("model"):
             raise ValueError("请填写发现模型，或选择包含 provider.model 的配置文件")
-        needs_annotation = kind == "annotate" or (kind == "pipeline" and mode in {"A1", "A3"} and not spec.get("annotations"))
+        needs_annotation = kind == "annotate" or (kind == "pipeline" and mode in ANNOTATED_MODES and not spec.get("annotations"))
         if needs_annotation and (not cfg["annotation"].get("model") or not cfg["annotation"].get("enabled")):
             raise ValueError("请启用注释并指定 annotation.model，或选择已有注释目录")
-        if kind == "discover" and mode in {"A1", "A3"} and not spec.get("annotations"):
+        if kind == "discover" and mode in ANNOTATED_MODES and not spec.get("annotations"):
             raise ValueError("该实验臂需要已有注释目录")
     else:
         cfg = None
@@ -160,11 +161,11 @@ def steps(root, task):
         return
     if kind == "prepare" or (kind == "pipeline" and "snapshot" not in spec):
         yield ["prepare", "--dataset", spec["dataset"], "--out", snapshot] + cfg
-    if kind == "annotate" or (kind == "pipeline" and mode in {"A1", "A3"} and "annotations" not in spec):
+    if kind == "annotate" or (kind == "pipeline" and mode in ANNOTATED_MODES and "annotations" not in spec):
         yield ["annotate", "--snapshot", snapshot, "--out", annotations] + cfg
     if kind in {"discover", "pipeline"}:
         args = ["discover", "--snapshot", snapshot, "--mode", mode, "--policy", "live", "--run", run]
-        if mode in {"A1", "A3"}:
+        if mode in ANNOTATED_MODES:
             args += ["--annotations", annotations]
         yield args + cfg
     if kind == "resume":

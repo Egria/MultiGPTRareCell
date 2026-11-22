@@ -72,7 +72,8 @@ def _row_units(block):
 class Science:
     """Read only declared matrix/manifest fields. Never open evaluation or annotation data."""
 
-    def __init__(self, snapshot: Path, cfg: dict):
+    def __init__(self, snapshot: Path, cfg: dict, *, adaptive=False):
+        self.adaptive = adaptive
         self.snapshot = Path(snapshot)
         self.config = SearchConfig(**cfg.get("search", {}))
         manifest = json.loads((self.snapshot / "manifest.json").read_text(encoding="utf-8"))
@@ -108,6 +109,8 @@ class Science:
             "compare_groups": {"members", "background", "genes", "layer"},
             "expand_candidate": {"members", "background", "layer"},
         }
+        if self.adaptive:
+            allowed["coexpress"].add("min_detected")
         if action not in allowed or set(args) - allowed[action]:
             raise ValueError("unknown action or scientific parameter")
         if args.get("layer", "log1p") != "log1p":
@@ -116,7 +119,7 @@ class Science:
         group = self._indices(members)
         if action == "coexpress":
             genes = _canonical_set(args.get("genes"), self.gene_index, "gene")
-            return self._coexpress(group, genes, args.get("logic", "AND"), args.get("threshold", 0))
+            return self._coexpress(group, genes, args.get("logic", "AND"), args.get("threshold", 0), args.get("min_detected"))
         background = None
         if "background" in args:
             background = _canonical_set(args["background"], self.cell_index, "cell")
@@ -153,11 +156,16 @@ class Science:
         for start in range(0, n, step):
             yield slice(start, min(n, start + step))
 
-    def _coexpress(self, group, genes, logic, threshold):
+    def _coexpress(self, group, genes, logic, threshold, min_detected=None):
         if logic not in ("AND", "OR"):
             raise ValueError("logic requires AND or OR")
         if isinstance(threshold, bool) or not isinstance(threshold, Real) or not math.isfinite(threshold) or threshold < 0:
             raise ValueError("threshold requires a finite nonnegative number")
+        required = len(genes) if logic == "AND" else 1
+        if min_detected is not None:
+            if type(min_detected) is not int or not 1 <= min_detected <= len(genes):
+                raise ValueError("min_detected must be within the number of distinct resolved genes")
+            required = min_detected
         cols = [self.gene_index[g] for g in genes]
         detected = np.zeros(len(genes), dtype=np.int64)
         hits = []
@@ -167,14 +175,17 @@ class Science:
             block.eliminate_zeros()
             detected += np.bincount(block.indices, minlength=len(genes))
             counts = np.diff(block.indptr)
-            selected = counts == len(genes) if logic == "AND" else counts > 0
+            selected = counts >= required
             hits.extend(self.cells[group[part][selected]].tolist())
         summary = {"n_query": len(group), "n_matching": len(hits), "fraction": len(hits) / len(group),
                    "logic": logic, "threshold": threshold, "layer": "log1p"}
+        if min_detected is not None:
+            summary.update(logic="k_of_m", min_detected=required)
         return {"status": "ok", "purpose": "exploration", "matched_members": hits, "summary": summary,
                 "gene_counts": dict(zip(genes, detected.tolist())),
                 "selection_history": {"members": self.cells[group].tolist(), "genes": genes,
-                                      "logic": logic, "threshold": threshold, "layer": "log1p"}}
+                                      "logic": summary["logic"], "threshold": threshold, "layer": "log1p",
+                                      **({"min_detected": required} if min_detected is not None else {})}}
 
     def _moments(self, indices, cols):
         n_genes = self.data.shape[1] if cols is None else len(cols)
@@ -320,5 +331,23 @@ class Science:
         result["status"] = "incomplete" if len(ranked) > len(returned) else "expanded" if added else "no_expansion"
         result["summary"].update(n_added=len(added), n_passing=len(ranked),
                                  signature_genes=[r["gene_id"] for r in signature])
+        if self.adaptive:
+            valid = self.rna_valid & np.isfinite(structure)
+            # Floating-point dot products can exceed 1 by an ulp. Every
+            # reported component must be a valid threshold for apply_boundary.
+            for component in (scores, expression, structure, pos_score):
+                if component is not None:
+                    np.clip(component, 0.0, 1.0, out=component)
+            ordered = _rank(np.flatnonzero(valid), scores, self.barcodes, self.cells)
+            result["ranking"] = [{"cell_id": str(self.cells[i]), "score": float(scores[i]),
+                                  "expression": float(expression[i]), "structure": float(structure[i]),
+                                  "positive_expression": float(pos_score[i]) if pos_score is not None else None}
+                                 for i in ordered]
+            gaps = scores[ordered[:-1]] - scores[ordered[1:]]
+            largest = np.argsort(-gaps, kind="stable")[:5]
+            result["summary"].update(n_scored=len(ordered), n_unscored=len(self.cells)-len(ordered),
+                                     rank_gaps=[{"after_rank": int(i+1), "upper": float(scores[ordered[i]]),
+                                                 "lower": float(scores[ordered[i+1]])} for i in largest if gaps[i] > 1e-12],
+                                     positive_genes=[r["gene_id"] for r in signature if r["direction"] == "up"])
         history.update(added_members=added, n_passing=len(ranked), status=result["status"])
         return result

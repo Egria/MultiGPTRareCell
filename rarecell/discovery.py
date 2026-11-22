@@ -2,9 +2,9 @@
 import csv
 from pathlib import Path
 
-from . import __version__
+from . import __version__, adaptive
 from .base_evidence import FrozenSeurat, annotation_parents, prepared_page
-from .config import contract, fingerprint, json_bytes, read_json, read_lines
+from .config import ADAPTIVE_MODE, ANNOTATED_MODES, contract, fingerprint, json_bytes, read_json, read_lines
 from .protocol import resolve_genes
 from .science import METHOD_VERSION, Science
 from .state import State
@@ -16,7 +16,7 @@ CATALOGUE = {
     "get_evidence": "candidate_id or evidence_ids, offset, limit. A single evidence_id pages frozen HVG or Seurat Wilcoxon marker tables in every mode, or active-query results where enabled. A candidate pages its exact cell IDs.",
     "compare_groups": "candidate_id or members, optional background_id or background, optional genes. Optional evidence_ids cite the reason for this query.",
     "coexpress": "candidate_id, members, or explicit scope=all; genes; optional AND/OR logic and threshold. Optional evidence_ids cite the reason for this query.",
-    "expand_candidate": "candidate_id, optional explicit background_id or background. Searches all cells. Optional evidence_ids cite the reason for this query. no_expansion means no cells were added.",
+    "expand_candidate": "candidate_id. Searches all cells; omitting background or scalar background=all uses local contrast. Use background_mode=complement for all nonmembers, or background_id/explicit background IDs. Optional evidence_ids cite the query. no_expansion means no additions.",
     "propose_revision": "Atomic groups [{candidate_ids and/or members, optional proposed_label/status}], parents, reason and evidence_ids. Parents are superseded. Use multiple groups for split/reassignment.",
     "submit": "Optional candidate_ids to select instead of current proposals; reason and evidence_ids. Unclaimed cells get an unresolved baseline assignment.",
 }
@@ -27,6 +27,12 @@ GOAL = (
     "Report concise reasons with evidence IDs. An expansion is a proposal, not an accepted group. Use propose_revision or submit to select it. "
     "Labels may cross candidate boundaries. Check competing explanations. Submit early when evidence is sufficient."
 )
+
+
+def prompt_version(mode):
+    if mode == ADAPTIVE_MODE:
+        return "discovery/adaptive-1"
+    return "discovery/1.3" if mode in {"A2", "A3"} else PROMPT_VERSION
 
 
 def rows(path):
@@ -59,8 +65,11 @@ class Controller:
         self.barcodes = {r["cell_id"]: (r.get("barcode") or r["cell_id"], r["cell_id"]) for r in cell_rows}
         self.cell_set = set(self.cells)
         self.genes = rows(self.snapshot / "genes.tsv")
-        self.active = mode in {"A2", "A3"}
-        self.labeled = mode in {"A1", "A3"}
+        self.adaptive = mode == ADAPTIVE_MODE
+        self.active = self.adaptive or mode in {"A2", "A3"}
+        self.labeled = mode in ANNOTATED_MODES
+        self.goal = GOAL + adaptive.GOAL if self.adaptive else GOAL
+        self.prompt = prompt_version(mode)
         self.budget = cfg["budget"]
         self.annotations = list(annotations) if self.labeled else []
         self.science = None
@@ -87,7 +96,9 @@ class Controller:
         return self.state.evidence({
             "object": obj, "kind": kind, "parent_ids": sorted(set(parents)), "source_family": family,
             "cell_set_hash": members_hash, "data_version": self.version, "method_version": method or ("LLMRareCell/" + __version__),
-            "config_version": self.snapshot_hash, "prompt_version": prompt or PROMPT_VERSION,
+            # Frozen measurements keep their historical identity across experiment arms.
+            "config_version": self.snapshot_hash, "prompt_version": prompt or (
+                self.prompt if family == "discovery_agent" else PROMPT_VERSION),
             "selection_history": history or [], "artifact_refs": refs, "summary": summary,
             "purpose": purpose or ("exploration" if kind == "observation" else "related_check"),
         })
@@ -147,7 +158,7 @@ class Controller:
                 row = dict(ann, evidence_id=eid, id=aid)
                 self.state.put("Annotation", aid, row)
                 self.labels.setdefault(c["id"], {})[eid] = row
-            self.state.put("Task", "discovery", {"id": "discovery", "goal": GOAL, "mode": self.mode})
+            self.state.put("Task", "discovery", {"id": "discovery", "goal": self.goal, "mode": self.mode})
             self.state.set_meta("initialized", True)
             self.state.event("initialized", {"mode": self.mode, "candidates": len(self.candidates)})
 
@@ -179,6 +190,12 @@ class Controller:
         card = {"id": c["id"], "n": len(c["members"]), "sources": compact(c["sources"], 2),
                 "evidence_ids": c["evidence_ids"], "markers": compact(c.get("markers", []), 3),
                 "parents": c["parents"], "status": c["status"]}
+        if self.adaptive:
+            card["global_abundance"] = adaptive.abundance(len(c["members"]), len(self.cells))
+            if "biological_rarity" in c:
+                card["biological_rarity"] = c["biological_rarity"]
+            if "boundary_rule" in c:
+                card["boundary_rule"] = c["boundary_rule"]
         card["selected"] = c["id"] in self.state.get_meta("selected", [])
         if c.get("structure"):
             card["structure"] = {view: {k: v for k, v in stats.items()
@@ -206,12 +223,17 @@ class Controller:
     def context(self, turn):
         s = self.state
         actions = {k: v for k, v in CATALOGUE.items() if self.active or k not in SCIENTIFIC}
+        if self.adaptive:
+            actions.update(adaptive.TOOLS)
+            actions["get_evidence"] += " For a single expansion evidence_id, page the ranking, optionally sorted by metric."
+            actions["coexpress"] += " Alternatively specify min_detected=k of the distinct genes, with optional expression threshold."
+            actions["propose_revision"] += " Optional group biological_rarity (yes/no/uncertain) and rarity_reason record context-specific interpretation. Use matched_evidence_id in a group for all exact hits of one measured coexpress query. Each group can subtract exclude_candidate_ids from its union (e.g. remove a rare candidate from a broad group)."
         recent = s.get_meta("receipts", [])
         queries = s.all("CanonicalQuery")
         usage = s.usage()
         stalled_turns = s.get_meta("stall", 0)
         stalls_left = self.budget["stall_turns"] - stalled_turns
-        ctx = {"contract": contract(), "goal": GOAL, "mode": self.mode, "actions": actions,
+        ctx = {"contract": contract(), "goal": self.goal, "mode": self.mode, "actions": actions,
                "bindings": {"run_id": s.get_meta("run_id"), "task_id": "discovery",
                             "data_version": self.version, "contract_version": contract()["version"]},
                "species": self.manifest.get("species"), "tissue": self.manifest.get("tissue"),
@@ -223,7 +245,7 @@ class Controller:
                              "lineage_max_depth": self.budget["max_expansion_depth"]},
                "current_candidates": [], "recent_receipts": [], "prior_queries": [],
                "selected_ids": s.get_meta("selected", [])[:25]}
-        ctx["prompt_version"] = PROMPT_VERSION
+        ctx["prompt_version"] = self.prompt
         ctx["turn_instruction"] = (
             "Inspect the candidate cards and the most recent results. Choose an action that resolves a specific membership question. "
             "Previously viewed pages are available by ID. Repeating a request yields no new evidence. "
@@ -248,6 +270,12 @@ class Controller:
                                   if not depths.get(seed["candidate_id"]) and seed["candidate_id"] not in selected})
                 if pending:
                     ctx["pending_seeds"] = {"count": len(pending), "candidate_ids": pending[:3]}
+        if self.adaptive:
+            ctx["rarity_search"] = {"population_n": len(self.cells), "minimum_nonempty_pct": 100 / len(self.cells),
+                                  "resolvable_global_bands_pct": [p for p in (5, 1, 0.1) if p * len(self.cells) >= 100]}
+            pending = sorted({r["candidate_id"] for r in s.all("Seed")} - set(s.get_meta("selected", []))
+                             - {r for r, depth in s.get_meta("depths", {}).items() if depth})
+            ctx["pending_seeds"] = {"count": len(pending), "candidate_ids": pending[:5]}
         if not self.active:
             ctx["mode_constraint"] = "Choose or combine complete precomputed candidate sets. No new scientific queries."
         # Reserve the entire contract, catalogue and budgets in every turn.
@@ -304,21 +332,44 @@ class Controller:
         all_scope = args.get("scope") == "all"
         members = sorted(self.cells) if all_scope else self.resolve_members(args)
         bound = {"members": members}
-        if "background_id" in args or "background" in args:
+        # Scalar "all" in an expansion is the deployed agent's shorthand for
+        # dataset-wide retrieval. An explicit list always retains exact ID semantics.
+        background = args.get("background")
+        search_all = action == "expand_candidate" and background == "all" and "all" not in self.cell_set
+        if action == "expand_candidate" and args.get("background_mode") == "complement":
+            complement = sorted(self.cell_set.difference(members))
+            if not complement:
+                raise ValueError("Complement reference is empty")
+            bound["background"] = complement
+        elif background == "all" and not search_all:
+            bound["background"] = ["all"]
+        elif "background_id" in args or ("background" in args and not search_all):
             bound["background"] = self.resolve_members(args, "background_id", "background")
-            if set(members).intersection(bound["background"]):
-                raise ValueError("Reference background intersects foreground")
         elif action == "compare_groups":
             complement = sorted(self.cell_set.difference(members))
             if complement:
                 bound["background"] = complement
+        if "background" in bound and set(members).intersection(bound["background"]):
+            raise ValueError("Reference background intersects foreground")
         if "genes" in args:
             bound["genes"] = sorted(set(resolve_genes(args["genes"], self.genes, species=self.manifest.get("species"))))
         if action == "coexpress":
-            bound.update(logic=args.get("logic", "AND"), threshold=float(args.get("threshold", 0)))
+            bound["threshold"] = float(args.get("threshold", 0))
+            if "min_detected" in args:
+                if not self.adaptive or not 1 <= args["min_detected"] <= len(bound["genes"]):
+                    raise ValueError("min_detected requires A3_adaptive and 1..number of distinct resolved genes")
+                k = args["min_detected"]
+                if k == len(bound["genes"]) or k == 1:
+                    bound["logic"] = "AND" if k == len(bound["genes"]) else "OR"
+                else:
+                    bound["min_detected"] = k
+            else:
+                bound["logic"] = args.get("logic", "AND")
         canonical = {"action": action, "args": bound, "data_version": self.version,
                      "transform_version": self.snapshot_hash, "method_version": [__version__, METHOD_VERSION],
                      "parameters": self.cfg["search"], "layer": "log1p"}
+        if self.adaptive and action == "expand_candidate":
+            canonical["method_version"].append("ranked-expansion/1")
         signature = fingerprint(canonical)
         c = self.candidate(args["candidate_id"]) if "candidate_id" in args else None
         depths = self.state.get_meta("depths", {})
@@ -330,13 +381,17 @@ class Controller:
                 raise ValueError("Expansion depth exhausted for this lineage")
         def compute():
             if self.science is None:
-                self.science = Science(self.snapshot, self.cfg)
+                self.science = Science(self.snapshot, self.cfg, adaptive=self.adaptive)
             return self.science.execute(action, bound)
         result, key = self.state.query(canonical, self.budget["max_new_queries"], compute)
         ref = self.state.result_ref(key)
         try:
             with self.state.transaction():
-                return self._register_result(action, args, bound, c, signature, result, key, ref)
+                response = self._register_result(action, args, bound, c, signature, result, key, ref)
+                if action == "expand_candidate":
+                    response.update(anchor_id=c["id"], search_scope="all",
+                                    background_rule=result["selection_history"]["background_rule"])
+                return response
         except BaseException:
             # A failed DB commit or a failed compound edit must also discard the
             # uncommitted in-memory search/revision index for this live controller.
@@ -419,7 +474,7 @@ class Controller:
             stack.extend(self.by_set.get(current["set_hash"], ()))
         return roots
 
-    def make_revision(self, members, parents, label, status, evidence_ids, kind, basis):
+    def make_revision(self, members, parents, label, status, evidence_ids, kind, basis, biological_rarity=None):
         if not members or not set(members) <= self.cell_set:
             raise ValueError("Revision contains empty or unknown membership")
         members = sorted(set(members))
@@ -444,6 +499,8 @@ class Controller:
         if not roots:
             raise ValueError("Revision requires traceable parent candidates")
         descriptor = [sh, parents, label, status, sorted(set(evidence_ids)), kind, basis]
+        if biological_rarity:
+            descriptor.append(biological_rarity)
         cid = "R" + fingerprint(descriptor)[:24]
         if cid in self.candidates:
             return self.candidate(cid)
@@ -454,14 +511,20 @@ class Controller:
             for parent in parents:
                 evidence_ids.update(self.candidate(parent)["evidence_ids"])
                 evidence_ids.update(self.current_label(parent).get("evidence_ids", []))
+            interpretation_summary = {"reason": basis, "proposed_label": label, "status": status, "size": len(members)}
+            if biological_rarity:
+                interpretation_summary["biological_rarity"] = biological_rarity
             interpretation = self.evidence(cid, "interpretation", evidence_ids, "discovery_agent",
-                                           sh, {"reason": basis, "proposed_label": label,
-                                                "status": status, "size": len(members)}, [],
+                                           sh, interpretation_summary, [],
                                            history=[{"parent_candidates": parents}])
             evidence_ids.add(interpretation)
         record = {"id": cid, "members": members, "set_hash": sh, "parents": parents, "roots": sorted(roots),
                   "initial": False, "sources": [{"kind": kind}], "evidence_ids": sorted(set(evidence_ids)),
                   "proposed_label": label, "status": status, "markers": []}
+        if biological_rarity:
+            record["biological_rarity"] = biological_rarity
+        if kind == "boundary":
+            record["boundary_rule"] = basis
         self.save_candidate(record)
         return record
 
@@ -488,26 +551,49 @@ class Controller:
                 raise ValueError("Revisions require parent candidates and registered evidence")
             chosen = []
             occupied = set()
+            measured_evidence = set()
             for group in args["groups"]:
                 refs = [self.candidate(cid) for cid in group.get("candidate_ids", [])]
                 member_set = {m for c in refs for m in c["members"]}
                 explicit = set(group.get("members", []))
                 if explicit and not self.active and not self.by_set.get(fingerprint(sorted(explicit))):
                     raise ValueError("Passive mode can select or combine only precomputed member sets")
+                rarity = None
+                if "biological_rarity" in group or "rarity_reason" in group:
+                    if not self.adaptive:
+                        raise ValueError("biological rarity metadata requires A3_adaptive")
+                    rarity = {"assessment": group.get("biological_rarity", "uncertain"),
+                              "reason": group.get("rarity_reason", reason)}
+                matched = group.get("matched_evidence_id")
+                if matched:
+                    if not self.adaptive:
+                        raise ValueError("matched_evidence_id requires A3_adaptive")
+                    measured = adaptive.coexpression_members(self, matched)
+                    member_set.update(measured)
+                    measured_evidence.add(matched)
                 member_set |= explicit
+                exclusions = group.get("exclude_candidate_ids", [])
+                if exclusions and not self.adaptive:
+                    raise ValueError("exclude_candidate_ids requires A3_adaptive")
+                for excluded in exclusions:
+                    other = self.candidate(excluded)
+                    member_set.difference_update(other["members"])
                 if occupied.intersection(member_set):
                     raise ValueError("New groups in a single revision overlap")
                 occupied.update(member_set)
-                inherited = set(parents) | {c["id"] for c in refs}
+                inherited = set(parents) | {c["id"] for c in refs} | set(exclusions)
                 chosen.append(self.make_revision(member_set, inherited, group.get("proposed_label", "unknown"),
-                                                 group.get("status", "provisional"), evidence_ids, "revision", reason)["id"])
+                                                 group.get("status", "provisional"), evidence_ids + ([matched] if matched else []),
+                                                 "revision", reason, biological_rarity=rarity)["id"])
             selected.difference_update(parents)
             selected.update(chosen)
-            evidence_ids = list(evidence_ids) + [eid for cid in chosen for eid in self.candidate(cid)["evidence_ids"]]
+            evidence_ids = list(evidence_ids) + sorted(measured_evidence) + [eid for cid in chosen for eid in self.candidate(cid)["evidence_ids"]]
         decision = {"action": action, "reason": reason, "evidence_ids": sorted(set(evidence_ids)),
                     "selected": sorted(selected), "message_id": message_id, "args_hash": fingerprint(args)}
         if action == "submit":
             decision["status"] = args.get("status", "final")
+            if self.adaptive:
+                decision["assignment_preview"] = adaptive.preview(self, {"candidate_ids": sorted(selected)})
             if evidence_ids:
                 submitted = sorted(selected)
                 interpretation = self.evidence("submitted_groups", "interpretation", evidence_ids, "discovery_agent",
@@ -527,6 +613,10 @@ class Controller:
                 "candidate_ids": sorted(selected)[:15]}
 
     def read_tool(self, action, args):
+        if "metric" in args:
+            ids = args.get("evidence_ids", [])
+            if not self.adaptive or len(ids) != 1 or not any(r["evidence_id"] == ids[0] for r in self.state.all("Investigation")):
+                raise ValueError("metric requires one A3_adaptive expansion evidence_id")
         offset = args.get("offset", 0)
         limit = min(args.get("limit", 8), 25)
         if action == "list_candidates":
@@ -555,6 +645,15 @@ class Controller:
                     data = self.state.read_artifact(ref)
                     history = data.get("selection_history", {})
                     sections = {}
+                    if "ranking" in data:
+                        ranked = data["ranking"]
+                        if "metric" in args:
+                            metric = args["metric"]
+                            ranked = sorted((r for r in ranked if r[metric] is not None),
+                                            key=lambda r: (-round(r[metric], 12), self.barcodes[r["cell_id"]]))
+                        sections["ranking"] = ranked
+                    elif "metric" in args:
+                        raise ValueError("metric requires adaptive expansion ranking evidence")
                     for field in ("matched_members", "statistics", "scores"):
                         if field in data:
                             sections[field] = data[field]
@@ -589,11 +688,15 @@ class Controller:
                 raise ValueError("Conflicting explicit " + key)
         if action in SCIENTIFIC:
             return self.scientific(action, args)
+        if action == "preview_submission" and self.adaptive:
+            return adaptive.preview(self, args)
         if action in {"list_candidates", "get_evidence"}:
             return self.read_tool(action, args)
-        if action in {"propose_revision", "submit"}:
+        if action in {"propose_revision", "submit"} or (self.adaptive and action == "apply_boundary"):
             try:
                 with self.state.transaction():
+                    if action == "apply_boundary":
+                        return adaptive.apply_boundary(self, args)
                     return self.decide(action, args, message_id)
             except BaseException:
                 self._load_candidates()

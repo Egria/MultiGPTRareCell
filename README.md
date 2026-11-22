@@ -27,6 +27,23 @@ rarecell doctor --config configs/real_provider.yaml
 
 doctor 区分本地导入/版本检查和网络调用。上面的 Python 安装足以运行 core demo。真实 A3 还需要 R、固定作者包和已部署模型。R 的私有环境安装命令、精确 commit、R/Seurat 配对和 API 方言见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 
+## A3_adaptive：由模型选择稀有群成员边界
+
+在 GUI「新建任务」的实验臂选择 **A3_adaptive · 模型选择稀有群边界**。已经完成准备和 OntoAnno 注释的任务可以选「从快照发现」，填写旧任务的 `snapshot`、`annotations` 和配置文件，再创建新任务。在 DCC 仓库根目录，命令行与 Slurm 的 `discover` 使用相同参数。例如，将变量指向已有任务，再运行：
+
+```bash
+old="$PWD/work/tasks/748f3370e00f46e887876123b1341af6"
+.venv/bin/rarecell discover --mode A3_adaptive --policy live \
+  --snapshot "$old/snapshot" --annotations "$old/annotations" --config "$old/settings.yaml" \
+  --run "$PWD/work/adaptive-01"
+```
+
+A3_adaptive 复用 A3 的快照和注释。每次扩展先按已有数值规则给出参考提案，同时保存全体可评分细胞的排名、分数间隙、正向基因和不可评分人数。Discovery Agent 可以读取阈下分数，选择综合分、表达分或仅正向表达分以及该候选自己的阈值；也可以用 k-of-m 共检出规则提出一个精确成员集。重选同一份排序的切点复用原数值证据。暂定群可作为独立分群提交。模型在提交前可预览与大群的争抢，按成员集合做差；提交决策会保存实际认领计数。
+
+稀有度报告提供全局分母和可选的参考候选分母。≤5%、≤1%、≤0.1% 用作调查方向。同一候选只标记能满足的最小丰度档。模型可以单独记录带理由的生物学稀有性判断，包括身份未知的暂定群。选择依赖的共表达、相同 RNA 上的多个视图和同一数值观察的再次读取均应保留其证据来源。
+
+A3 仍可用作原数值边界的对照。两个主动版本均修复了单细胞扩展时模型写 `background: "all"` 的情况。各实验臂用新的运行目录。历史运行可以直接查看诊断；运行中或暂停的旧版检查点应使用原代码版本恢复。动作和参数见 [PROTOCOL.md](PROTOCOL.md)。
+
 ## 网页任务管理
 
 从安装了当前仓库的 Python 环境启动控制台。之前安装过初版 wheel 的环境可用 `python -m pip install -e .` 更新。首次尝试可以点「运行离线示例」，这会运行真实的 core demo 并生成可下载的 partition 和评估文件。

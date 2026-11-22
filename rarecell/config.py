@@ -8,6 +8,10 @@ from pathlib import Path
 
 import yaml
 
+ADAPTIVE_MODE = "A3_adaptive"
+MODES = ("A0", "A1", "A2", "A3", ADAPTIVE_MODE)
+ANNOTATED_MODES = {"A1", "A3", ADAPTIVE_MODE}
+
 RESOURCES = Path(__file__).parent / "resources"
 
 
@@ -56,8 +60,8 @@ def config(path=None, override=None):
     user = yaml.safe_load(Path(path).read_text()) if path else {}
     combined = merge_config(merge_config(base, user or {}), override or {})
     validate_settings(combined)
-    if combined["mode"] not in ("A0", "A1", "A2", "A3"):
-        raise ValueError("mode must be A0, A1, A2 or A3")
+    if combined["mode"] not in MODES:
+        raise ValueError("mode must be one of " + ", ".join(MODES))
     if any(type(v) is not int or v < 0 for v in combined["budget"].values()):
         raise ValueError("budgets must be nonnegative integers")
     if combined["budget"]["stall_turns"] < 1 or combined["budget"]["max_actions_per_turn"] < 1:

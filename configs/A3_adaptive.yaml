@@ -1,0 +1,7 @@
+# Override the model IDs with actual deployments before live discovery.
+mode: A3_adaptive
+annotation:
+  enabled: true
+  model: null
+provider:
+  model: null
