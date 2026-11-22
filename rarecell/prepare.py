@@ -271,6 +271,8 @@ def build(dataset, out, cfg, work):
                 z = projection(ds.x,name,cfg,path)
             done.append(name)
             stages[name]={"status":"ok","shape":list(z.shape)}
+            if name == "V_HVG" and ds.info["layer"] == "linear_expression":
+                stages[name]["selection_method"] = "dispersion"
         except FAILURES as exc:
             stages[name] = blocked(exc)
             continue

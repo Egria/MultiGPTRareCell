@@ -84,3 +84,5 @@
 `select_boundary(candidate_id=..., reason=...)` 替换同一种子的工作边界，保留其他互不重叠的草案。跨群重叠可用 `propose_revision` 分配成员。模型可以用 `submit` 提交当前选择，用显式候选列表指定最终选择，或用空列表放弃全部候选。同一种子的互斥边界只能选一个，除非先修订为互不重叠的群。
 
 停滞时，只要已有提案或工作草案，且原轮数和 token 预算允许，就保留一次只接受 `select_boundary`、`propose_revision` 和 `submit` 的收尾轮。如果该轮没有提交，或在停滞时预算已经用尽，控制器只发布已选的非空草案。此时 `submitted=true`、`submission_status=provisional`、`submission_source=controller_stall`，运行状态为 `partial / stalled_provisional`。没有已选草案时保留未提交状态。服务连接失败按既有规则记录和恢复。模型明确提交的结果标记 `submission_source=agent`。
+
+在 A3_adaptive 中，触及已报告 token 或轮数上限、或受限运行缺失 token 用量时，即使上一轮有实质进展，也会暂定提交已经选定的非空草案。结果保留原始停止原因，标记 `submission_source=controller_budget` 和 `submission_status=provisional`。到达上限后的收尾不调用模型，未选候选不自动加入。模型在接近用量上限时可主动提交；单次调用的实际用量由服务端在返回后报告。

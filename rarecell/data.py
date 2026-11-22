@@ -118,8 +118,8 @@ def read_dataset(path, target_sum=10000.0):
     spec = yaml.safe_load(path.read_text(encoding="utf8"))
     if not isinstance(spec, dict) or set(spec) - SCHEMA or SCHEMA - {"allowed_metadata"} - set(spec):
         raise ValueError("unexpected or missing dataset.yaml keys")
-    if spec["orientation"] != "cells_by_genes" or spec["layer"] not in {"counts", "log1p_normalized"}:
-        raise ValueError("expected cells_by_genes and counts or log1p_normalized")
+    if spec["orientation"] != "cells_by_genes" or spec["layer"] not in {"counts", "linear_expression", "log1p_normalized"}:
+        raise ValueError("expected cells_by_genes and counts, linear_expression or log1p_normalized")
     if not all(isinstance(spec[key], str) and spec[key].strip() for key in ("species", "tissue")):
         raise ValueError("species and tissue must be nonempty text")
     allowed = spec.get("allowed_metadata", [])
@@ -148,9 +148,8 @@ def read_dataset(path, target_sum=10000.0):
     totals = np.asarray(x.sum(axis=1)).ravel()
     if not np.all(np.isfinite(totals)):
         raise ValueError("expression totals overflow float64")
-    raw = None
-    if spec["layer"] == "counts":
-        raw = a
+    raw = a if spec["layer"] == "counts" else None
+    if spec["layer"] in {"counts", "linear_expression"}:
         # Divide by the row total first; multiplying very small libraries by
         # an explicit inverse can overflow before the product is formed.
         x.data /= np.repeat(totals, np.diff(x.indptr))

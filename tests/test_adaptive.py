@@ -259,3 +259,40 @@ def test_review_options_preserve_unrelated_selections_and_revise_held_wider(tmp_
         assert unrelated in revised["candidate_ids"] and small not in revised["candidate_ids"]
         assert len(revised["candidate_ids"]) == 2
         assert ctrl.state.usage()["new_queries"] == 1
+
+
+@pytest.mark.parametrize("ending,has_draft", [
+    ("max_reported_tokens", True), ("max_agent_turns", True),
+    ("token_usage_unreported", True), ("max_reported_tokens", False),
+])
+def test_budget_stop_after_progress(tmp_path, three_views, ending, has_draft):
+    cfg = config(override={"mode": ADAPTIVE_MODE, "budget": {
+        "max_reported_tokens": 20, "max_agent_turns": 2 if ending == "max_agent_turns" else 5}})
+    ctrl = Controller(three_views, tmp_path / "run", tmp_path / "cache", cfg, ADAPTIVE_MODE)
+    with closing(ctrl.state):
+        ctrl.initialize()
+        ctrl.state.set_meta("run_id", "pilot")
+        seed = "H235dc8d4ae01746f2bfffbb0"
+        def saved(turn, action, tokens):
+            mid = "pilot:T%04d" % turn
+            ctrl.state.put("Message", mid, dict(message_id=mid, complete=True, raw=json.dumps(action),
+                                                usage={"total_tokens": tokens}))
+        saved(1, {"action": "expand_candidate", "candidate_id": seed}, 11)
+        assert explore(ctrl, "live", pause_after=1) == ("partial", "paused")
+        ctx = ctrl.context(2)
+        assert ctx["remaining"]["reported_tokens"] == 9 and "last turn" in ctx["turn_instruction"]
+        eid = ctrl.state.get_meta("receipts")[0]["evidence_id"]
+        command = ({"action": "apply_boundary", "candidate_id": seed, "evidence_ids": [eid],
+                    "threshold": 0.82, "metric": "score", "reason": "Measured core."}
+                   if has_draft else {"action": "list_candidates"})
+        saved(2, command, None if ending == "token_usage_unreported" else 12)
+        assert explore(ctrl, "live") == ("partial", ending)
+        assert ctrl.state.get_meta("finished_turn") == 2
+        assert ctrl.state.get_meta("stall") == 0
+        assert not ctrl.state.all("ProviderDispatch")
+        assert bool(ctrl.state.get_meta("submitted")) == has_draft
+        if has_draft:
+            assert ctrl.state.get_meta("submission_source") == "controller_budget"
+            assert ctrl.state.get_meta("submission_status") == "provisional"
+            assert ctrl.state.get_meta("closeout_trigger") == ending
+            assert len(ctrl.state.get_meta("selected")) == 1

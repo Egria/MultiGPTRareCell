@@ -35,7 +35,7 @@ GOAL = (
 
 def prompt_version(mode):
     if mode == ADAPTIVE_MODE:
-        return "discovery/adaptive-3"
+        return "discovery/adaptive-4"
     return "discovery/1.4"
 
 
@@ -315,6 +315,15 @@ class Controller:
                     "You may revise or select_boundary before submitting in this message. If there is no submission, "
                     "the controller publishes a nonempty saved selection as provisional. Unselected suggestions stay on file."
                 )
+        if self.adaptive and self.budget.get("max_reported_tokens"):
+            consumed = [m["usage"].get("total_tokens") for m in s.all("Message")]
+            if all(n is not None for n in consumed):
+                left = self.budget["max_reported_tokens"] - sum(consumed)
+                ctx["remaining"]["reported_tokens"] = max(0, left)
+                if consumed and left <= consumed[-1]:
+                    ctx["turn_instruction"] += (
+                        " The remaining token budget is at most the cost of your last turn. "
+                        "Submit your best supported selection in this response if possible.")
         if not self.active:
             ctx["mode_constraint"] = "Choose or combine complete precomputed candidate sets. No new scientific queries."
         # Reserve the entire contract, catalogue and budgets in every turn.

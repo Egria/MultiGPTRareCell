@@ -189,14 +189,15 @@ def run_r(mode, work, cfg, *args):
 
 
 def seurat_pca(ds, cfg, work, dest, output):
-    if ds.raw is None:
+    if ds.raw is None and ds.info["layer"] != "linear_expression":
         raise ValueError("Seurat VST requires raw counts; input declares log1p_normalized")
-    active = np.flatnonzero(np.diff(ds.raw.indptr))
-    if min(len(active), ds.raw.shape[1]) < 3:
+    matrix = ds.raw if ds.raw is not None else ds.x
+    active = np.flatnonzero(np.diff(matrix.indptr))
+    if min(len(active), matrix.shape[1]) < 3:
         raise ValueError("Seurat PCA requires at least three informative cells and genes")
-    io.mmwrite(str(work/"counts.mtx"), ds.raw[active].T.tocoo())
+    io.mmwrite(str(work/"expression.mtx"), matrix[active].T.tocoo())
     run_r("pca", work, cfg, cfg["n_features"], cfg["n_pcs"], cfg["seed"], cfg["target_sum"],
-          cfg["scale_max_bytes"])
+          cfg["scale_max_bytes"], ds.info["layer"])
     pca = np.loadtxt(work/"pca.tsv", ndmin=2)
     if pca.shape[0] != len(active) or not np.isfinite(pca).all():
         raise ValueError("Seurat returned invalid PCA rows")

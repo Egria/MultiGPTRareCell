@@ -54,3 +54,5 @@ python -m rarecell.benchmark_views --dataset data/pbmc_tcr/dataset.yaml \
 | 1019 | 0 / 0 / 0 | 0.091 | 0.091 | 160/160 | 0.902 | 0.850 |
 
 三次均进入分布。稀有群 F1 的均值为 0.182、中位数为 0、样本标准差为 0.315。整体 ARI 均值为 0.913，NMI 均值为 0.860。种子 1009 时，提交集合从初始单例扩展到 3 个真成员。其余两次提交的全体分配沿用两个常见群的未决回退，稀有群未得到一对一匹配。全部查询由显式脚本策略提出；这些结果描述合成表达、数值工具和冻结评价的行为。真实 LLM 自主发现的表现仍需独立运行。
+
+独立目标参考可用 `cell_id, target_id, reference_kind, state` 四列 TSV，每个目标与参考来源必须覆盖冻结分区中的每个细胞一次。对每个目标单独在 positive/negative 细胞上选 F1 最大的最终群和各基线群，unknown/disputed 排除，零阳性时 F1 留空。目标可重叠，每个结果保留其分母。metrics.json 以 `reference_profile=target_membership` 标识该评估，ARI/NMI 留空。
