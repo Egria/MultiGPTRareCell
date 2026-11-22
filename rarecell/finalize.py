@@ -19,8 +19,7 @@ def jsonlines(path, records):
     atomic(path, b"".join(json_bytes(row) + b"\n" for row in records))
 
 
-def assignments(ctrl):
-    selected = ctrl.state.get_meta("selected", [])
+def membership_claims(ctrl, selected):
     claims = defaultdict(set)
     for cid in selected:
         c = ctrl.candidate(cid)
@@ -28,6 +27,11 @@ def assignments(ctrl):
             raise ValueError("Selected candidate version failed " + cid)
         for cell in c["members"]:
             claims[cell].add(cid)
+    return claims
+
+
+def assignments(ctrl):
+    claims = membership_claims(ctrl, ctrl.state.get_meta("selected", []))
     baselines = rows(ctrl.snapshot / "baselines.tsv")
     recipes = {(b["view"], b["resolution"]) for b in baselines}
     priority = ["V_HVG", "V_LINEAR", "V_GINI", "V_TENSOR2"]

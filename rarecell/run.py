@@ -13,8 +13,8 @@ import yaml
 
 from . import __version__, providers
 from .annotation import verify_annotation
-from .config import RESOURCES, atomic, contract, fingerprint, hash_file, read_json, validate_settings, write_json
-from .discovery import Controller, PROMPT_VERSION, SCIENTIFIC
+from .config import ANNOTATED_MODES, MODES, RESOURCES, atomic, contract, fingerprint, hash_file, read_json, validate_settings, write_json
+from .discovery import Controller, SCIENTIFIC, prompt_version
 from .finalize import export
 from .prepare import verify_snapshot
 from .protocol import VERSION as PROTOCOL_VERSION, parse_message
@@ -23,7 +23,7 @@ from .protocol import VERSION as PROTOCOL_VERSION, parse_message
 def code_fingerprint():
     module = Path(__file__).parent
     files = ("discovery.py", "run.py", "protocol.py", "science.py", "state.py", "providers.py",
-             "config.py", "base_evidence.py", "finalize.py", "annotation.py")
+             "config.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py")
     return fingerprint({name: hash_file(module / name) for name in files})
 
 
@@ -38,12 +38,12 @@ def new_spec(snapshot, run, cache, annotations, cfg, mode, policy, replication_i
         raise ValueError("The matched fixed-policy control uses A3 with shared annotations")
     if policy == "scripted_demo" and cfg["provider"]["kind"] != "scripted_demo":
         raise ValueError("Scripted messages require an explicit demo configuration")
-    if mode not in {"A0", "A1", "A2", "A3"}:
+    if mode not in MODES:
         raise ValueError("Unknown discovery mode")
     snapshot, run, cache = map(lambda p: Path(p).resolve(), (snapshot, run, cache))
     if not disjoint(snapshot, run) or not disjoint(cache, run) or not disjoint(snapshot, cache):
         raise ValueError("Use separate snapshot, run and cache directories")
-    if mode in ("A1", "A3"):
+    if mode in ANNOTATED_MODES:
         annotations = Path(annotations or run.parent / "annotation").resolve()
         if any(not disjoint(annotations, x) for x in (snapshot, run, cache)):
             raise ValueError("Use a separate annotation directory")
@@ -51,7 +51,7 @@ def new_spec(snapshot, run, cache, annotations, cfg, mode, policy, replication_i
         annotations = None
     return {"snapshot": str(snapshot), "cache": str(cache), "annotations": str(annotations) if annotations else None,
             "mode": mode, "policy": policy, "run_id": uuid.uuid4().hex, "replication_id": replication_id,
-            "software": __version__, "code_sha256": code_fingerprint(), "prompt_version": PROMPT_VERSION, "cfg_hash": fingerprint(cfg), "contract_hash": fingerprint(contract())}
+            "software": __version__, "code_sha256": code_fingerprint(), "prompt_version": prompt_version(mode), "cfg_hash": fingerprint(cfg), "contract_hash": fingerprint(contract())}
 
 
 def fixed_priority(ctrl, c):
@@ -176,7 +176,7 @@ def process_message(ctrl, message, turn):
             logical = fingerprint([command.get("action"), command.get("args"), result.get("query_key"),
                                    result.get("evidence_id"), result.get("candidate_ids"), result.get("candidate_id")])
             changed = False
-            if "error" not in result:
+            if "error" not in result and result.get("status") != "over_limit":
                 if command.get("action") == "propose_revision":
                     # Restating a rationale does not change the measured evidence,
                     # member assignments, labels or statuses.
@@ -186,7 +186,9 @@ def process_message(ctrl, message, turn):
                         observations = sorted(e for e in c["evidence_ids"] if s.get("Evidence", e)["kind"] == "observation")
                         projection.add(fingerprint([c["set_hash"], c["proposed_label"], c["status"], observations]))
                     logical = fingerprint(["selected", sorted(projection)])
-                elif command.get("action") in {"get_evidence", "list_candidates"}:
+                elif command.get("action") == "apply_boundary":
+                    logical = fingerprint(["boundary", result["evidence_id"], result["membership_hash"]])
+                elif command.get("action") in {"get_evidence", "list_candidates", "preview_submission"}:
                     # Reading rows is distinct from computing their underlying observation.
                     # Equal pages also stay equal when expressed with different paging arguments.
                     page = {k: v for k, v in result.items() if k not in {"offset", "limit"}}
@@ -255,7 +257,7 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
             return previous
         retain_freeze(run, frozen)
     ann, astatus, annotation_detail = [], "disabled_by_mode", ""
-    if spec["mode"] in {"A1", "A3"}:
+    if spec["mode"] in ANNOTATED_MODES:
         try:
             if not cfg["annotation"]["enabled"] or not spec["annotations"]:
                 raise ValueError("Labeled mode requires an enabled, verified OntoAnno directory")

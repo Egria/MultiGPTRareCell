@@ -61,3 +61,11 @@
 相同原始消息及完成标志的本地解析结果存在 ParsedMessage 中。再次出现时复用解析结果，执行前仍检查当前精确 ID、实体版本、模式、谱系和预算。明确截断的远端答复不会产生可执行动作，服务报告的相应用量保留。
 
 真实模型也会将操作放入单层 action 对象，如 `{"action":{"type":"expand_candidate","candidate_id":"H017"}}`。仅在 action 这个确定的容器内，type/name 映射到动作选择符。内外参数同样经过实体、冲突与范围检查；工具产物里的结构不会被提取为命令。
+
+## A3_adaptive
+
+- `expand_candidate` 总是在全体细胞中搜索。省略参照或使用 `background_mode: "local"` 会构造多视图局部参照。`background_mode: "complement"` 明确使用全体非成员作参照。兼容模型以标量 `background: "all"` 表达全局搜索的写法；如果数据中确有名为 `all` 的细胞，它仍是精确的细胞 ID。显式数组始终逐项解析 ID，未知项整项拒绝。回执记录 anchor_id、search_scope 和实际 background_rule。
+- 自适应臂返回常规扩展提案，同时保存全体可评分细胞（含种子）的完整排序、各分量以及分数间隙。使用 `get_evidence(evidence_ids=[E], metric="positive_expression", offset=0, limit=10)` 可查看另一个排序；默认按综合分。`score`、`expression`、`positive_expression` 对应综合分、正负 marker 合并表达分和仅正向 marker 表达分。无有效结构或签名时回执说明原因。正向分不可用的细胞不进入该分量的排序。
+- `apply_boundary(candidate_id=H, evidence_ids=[E], metric=..., threshold=..., reason=...)` 使用原始锚点 H 对应的扩展观测 E，保留锚点原成员，并加入所选分量达到阈值的所有可评分细胞。阈值在 [0,1] 内，由模型决定；其他分量没有隐含下限。超出配置的 max_cells 新增数时返回 over_limit 和完整命中数，模型可以修订规则。成功的提案为 provisional，需另行选择。复用分数不会新建独立观察或再耗扩展深度。
+- `coexpress(scope="all", genes=[...], min_detected=k, threshold=t)` 检索在至少 k 个基因上 log1p 表达严格大于 t 的细胞。k 的范围为去重并解析后的 1 到基因数；k 与 AND/OR 二选一。阈值默认 0。可在 `propose_revision.groups` 中以 `matched_evidence_id` 引用某次共检出的全部成员；可通过 `exclude_candidate_ids` 从成员并集中减掉已存在的候选，再执行原子修订。
+- `preview_submission(candidate_ids=[...], candidate_id=H, reference_id=R)` 预览拟提交选择。candidate_id 可填一个未被选中的待查假设，以判断其细胞会进入哪个类别（独立归属、被其他候选认领、冲突或回退）；reference_id 指定参考候选。两个字段均可省略。局部占比以候选与参考集合交集大小除以参考集合大小。实际 submit 按相同成员认领规则记录结果。每个修订群可选填 biological_rarity（yes/no/uncertain）和 rarity_reason，作为模型解释关联到该成员版本。

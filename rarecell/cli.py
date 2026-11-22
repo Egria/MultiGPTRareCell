@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from . import annotation, providers
-from .config import config, merge_config, read_json, write_json
+from .config import ANNOTATED_MODES, MODES, config, merge_config, read_json, write_json
 from .runtime import checkout, load_keys, model_overrides, project_model, rscript_command, save_project_model
 from .prepare import prepare, verify_snapshot
 from .run import discover, resume
@@ -92,7 +92,7 @@ def parser():
     d.add_argument("--run", type=Path, required=True)
     d.add_argument("--cache", type=Path)
     d.add_argument("--annotations", type=Path)
-    d.add_argument("--mode", choices=["A0", "A1", "A2", "A3"])
+    d.add_argument("--mode", choices=MODES)
     d.add_argument("--policy", choices=["live", "fixed"], default="live")
     d.add_argument("--replication-id")
     d.add_argument("--pause-after", type=int, help="checkpoint after this completed turn")
@@ -112,7 +112,7 @@ def parser():
     ab.add_argument("--out", type=Path, required=True)
     ab.add_argument("--annotations", type=Path)
     ab.add_argument("--replication-prefix", help="assign each arm a planned ID PREFIX-ARM")
-    ab.add_argument("--arms", nargs="+", choices=["A0", "A1", "A2", "A3", "fixed"], default=["A0", "A1", "A2", "A3", "fixed"])
+    ab.add_argument("--arms", nargs="+", choices=[*MODES, "fixed"], default=["A0", "A1", "A2", "A3", "fixed"])
     return p
 
 
@@ -150,7 +150,7 @@ def dispatch(a, default_model=""):
         if any((a.out / arm).exists() for arm in arms):
             raise ValueError("Use a fresh ablation output or resume each existing arm")
         sidecar = a.annotations or a.out / "annotation"
-        if any(arm in {"A1", "A3", "fixed"} for arm in arms) and not a.annotations:
+        if any(arm in ANNOTATED_MODES or arm == "fixed" for arm in arms) and not a.annotations:
             annotation.annotate(a.snapshot, sidecar, cfg)
         reports = {}
         for arm in arms:

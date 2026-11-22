@@ -105,7 +105,7 @@ def turn_detail(db, number):
         raise KeyError("该轮次没有记录")
     commands = []
     if msg:
-        for version in (VERSION, "protocol/1"):
+        for version in (VERSION, "soft-protocol-1.1", "protocol/1"):
             key = fingerprint([version, msg["raw"], msg.get("complete", True)])
             saved = record(db, "ParsedMessage", key)
             if saved:
