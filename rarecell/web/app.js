@@ -211,7 +211,9 @@ function updateForm() {
     el.hidden = !show;
     el.querySelectorAll("input,select").forEach((n) => (n.disabled = !show));
   }
-  field("dataset-field", kind === "prepare" || (full && $("start").value === "dataset"), true);
+  const needsDataset = kind === "prepare" || (full && $("start").value === "dataset");
+  field("dataset-field", needsDataset, true);
+  field("imported-field", needsDataset && $("imported-view").options.length > 1);
   field(
     "snapshot-field",
     ["annotate", "discover"].includes(kind) || (full && $("start").value === "snapshot"),
@@ -241,8 +243,50 @@ function updateForm() {
   $("form-hint").textContent = hints[kind];
   $("enqueue").textContent = kind === "inspect" ? "查看诊断" : "加入队列";
 }
+const imported = $("imported-view");
+let autoGt = "";
+function clearAutoGt() {
+  if (autoGt && form.elements.gt.value === autoGt) form.elements.gt.value = "";
+  autoGt = "";
+}
+imported.onchange = () => {
+  clearAutoGt();
+  if (imported.value) {
+    form.elements.dataset.value = imported.value;
+    autoGt = imported.selectedOptions[0].dataset.gt;
+    form.elements.gt.value = autoGt;
+  }
+};
+form.elements.dataset.addEventListener("input", () => {
+  imported.value = "";
+  clearAutoGt();
+});
+$("start").addEventListener("change", () => {
+  if ($("start").value === "snapshot") {
+    imported.value = "";
+    clearAutoGt();
+  }
+});
+async function loadImported() {
+  try {
+    const views = await api("/api/datasets");
+    const options = [new Option("选择已导入的 view，或手动填写路径", "")];
+    for (const view of views) {
+      const option = new Option(view.label + (view.gt ? " · 含评估 GT" : " · 仅表达"), view.dataset);
+      option.dataset.gt = view.gt;
+      options.push(option);
+    }
+    imported.replaceChildren(...options);
+    updateForm();
+  } catch (err) {
+    message("form-error", err.message);
+  }
+}
 function openForm(kind = "pipeline", preset = {}) {
   form.reset();
+  imported.replaceChildren();
+  autoGt = "";
+  loadImported();
   $("kind").value = kind;
   for (const [k, v] of Object.entries(preset)) if (v && form.elements[k]) form.elements[k].value = v;
   message("form-error");

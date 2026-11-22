@@ -21,9 +21,23 @@ from .dashboard_diagnostics import diagnostics
 from .dashboard_transcript import transcript
 from .dashboard_reload import serve as serve
 from .runtime import project_model, save_project_model
+from .single_agent_data import COPIED_OUT, RELEASE_OUT
 
 WEB = Path(__file__).with_name("web")
 ASSETS = {"/": "index.html", "/app.css": "app.css", "/app.js": "app.js", "/diagnostics.js": "diagnostics.js"}
+
+
+def imported_views(project):
+    choices = []
+    for root, verified in ((COPIED_OUT, False), (RELEASE_OUT, True)):
+        for path in sorted((project / root).glob("*/*/input/dataset.yaml")):
+            folder = path.parent.parent
+            if folder.name.startswith(".") or folder.parent.name.startswith(".") or not path.is_file():
+                continue
+            gt = folder / "evaluation_fixture/gt.tsv"
+            choices.append({"label": f"{folder.parent.name} / {folder.name}", "dataset": str(path),
+                            "gt": str(gt) if verified and gt.is_file() else ""})
+    return choices
 
 
 def artifacts(root, task):
@@ -151,6 +165,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("请提交模型 ID")
             save_project_model(self.server.project, body["model"])
             return self.reply({"model": body["model"]})
+        if method == "GET" and path == "/api/datasets":
+            return self.reply(imported_views(self.server.project))
         if path == "/api/tasks":
             if method == "GET":
                 return self.reply({"tasks": jobs.list_tasks(root), "host": socket.gethostname(),

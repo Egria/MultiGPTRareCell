@@ -4,23 +4,30 @@
 
 ## Single-agent 基准数据
 
-九个真实基准的来源、下载包目录、DCC 在线组装和 GUI 字段见[数据使用说明](SINGLE_AGENT_DATASETS.md)。PBMC-TCR 默认导入原来的五个 MAIT 丰度 view，CellSIUS 默认导入六个主条件。
+已有旧版 `data/airway`、`data/cellsius` 等目录时，在仓库根目录安装当前代码后直接导入。下面只转换 CellSIUS 的一个真实 view，可从 GUI「新建任务 → 已导入的数据集与 view」选择。转换和「准备快照」均可离线执行。
+
+```bash
+.venv/bin/python -m pip install --no-deps -e .
+.venv/bin/rarecell-import --data-root ../data --view V001 cellsius
+.venv/bin/rarecell ui --workspace work/tasks --port 8787
+```
+
+新环境先按下节安装依赖。旧数据适配、GT 导入、其余数据集和 Windows 访问 DCC GUI 的步骤见[数据使用说明](SINGLE_AGENT_DATASETS.md)。
 
 ## 安装与第一次运行
 
-适用于 Linux CPU 和 Slurm 计算节点。已验证 Python 3.9.25 和 3.12.14。项目在独立目录安装，不接管原有 LLMRareCell 项目。解压后执行以下命令。虚拟环境名称可自行更改。
+适用于 Linux CPU 和 Slurm 计算节点。已验证 Python 3.9.25 和 3.12.14。项目在独立目录安装，不接管原有 LLMRareCell 项目。在仓库根目录执行以下命令。虚拟环境名称可自行更改。
 
 ```bash
-cd LLMRareCell_V1
 python3.9 -m venv .venv
 source .venv/bin/activate
-python -m pip install '.[test]'
+python -m pip install -e '.[test]'
 rarecell demo --mode core --out work/demo_core --seed 1009
 cat work/demo_core/run/usage.json
 cat work/demo_core/evaluation/targets.tsv
 ```
 
-也可直接从 ZIP 中的 wheel 安装，运行 `python -m pip install dist/llm_rarecell-1.0.0-1-py3-none-any.whl`。该方式同样需要锁定的核心依赖。
+仓库的 `dist/` 保存初版 wheel。使用当前导入器及 GUI 时请按上面命令从 checkout 安装。
 
 core demo 使用真实的稀疏归一化、全基因线性与二阶 sketch、Python igraph Leiden、表达检索和隔离评估。脚本策略先列出候选，再按固定优先级对至多两个初始候选请求全局扩展，并提交通过阈值的提案。命令主动暂停一次，再从 SQLite 恢复。输入含 160 个细胞、96 个基因。Seurat 和 OntoAnno 在该模式明确关闭。每次 demo 使用新的空目录。
 

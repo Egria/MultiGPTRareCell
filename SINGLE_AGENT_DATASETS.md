@@ -1,6 +1,66 @@
 # 在 DCC 使用 single-agent 的基准数据
 
-## 导入以前的运行数据
+## 已经拷好了 data 目录
+
+`rarecell-import` 直接读取旧版的 `data/<dataset>/input.json`、`views.tsv` 和选定 view 的矩阵、细胞及基因表。可以先在有数据的 DCC 计算节点只导入一个较小的阳性条件。已有环境只需更新可编辑安装，转换全程离线。
+
+```bash
+cd /hpc/group/jilab/xn24/MultiGPTRareCell
+.venv/bin/python -m pip install --no-deps -e .
+DATA=/hpc/group/jilab/xn24/data
+.venv/bin/rarecell-import --data-root "$DATA" --list cellsius pbmc_tcr
+.venv/bin/rarecell-import --data-root "$DATA" --view V001 cellsius
+```
+
+`--list` 的四列依次是数据集名、view ID、角色、细胞数。最后一条命令打印可粘贴到 GUI 的清单绝对路径。V001 有 202 个细胞。重新打开「新建任务」，在「已导入的数据集与 view」里选择 `cellsius / V001 · 仅表达`，配置文件填自己的 `real.yaml`。只验证输入时选择「准备快照」。跑真实发现时选择「完整发现流程」、`A3_adaptive` 和已经配置的全局模型。只有表达数据时，真值字段留空。
+
+| 拷贝中的布局 | 转换方法 |
+|---|---|
+| `airway`、`baron`、`pbmc68k`、`cellsius_spheroid` | 使用根目录 counts 和各 view 的行索引。Airway 使用主 raw track。 |
+| `pbmc_tcr/views/view0…view4` | 按旧 view 的行索引选择矩阵行，并逐行比对原 cell_id。 |
+| `cellsius/views/V000…V005` | 各自读取 view 中的 counts 和 cells，共用根目录的 genes。 |
+| `villani`、`human_pgc`、`gse156490` | 分别读取 TPM 或作者提供的分数表达，保留精度并标作 `linear_expression`。 |
+| `hao`、`mmochi`、`larry` | 支持表达输入。前两者为人血液 counts，LARRY 为小鼠培养细胞的归一化表达。MMoCHi 可用 `--all-views` 或指定单个 view。 |
+| `spheroid/` | 含 labels、10x 和 h5ad 的独立重建产物。同级已有 `cellsius_spheroid/` 时导入后者。命令别名 `spheroid` 也指向后者。仅有独立产物时见下方 `SPHEROID_EXPORT`。 |
+
+批量准备最初的九个基准可以使用下列命令。大数据集在有足够内存和磁盘的计算节点上转换。每个共享稀疏矩阵在单次导入该数据集时只加载一次，选定 view 分别占用输出空间。转换阶段不调用模型。
+
+```bash
+.venv/bin/rarecell-import --data-root "$DATA" \
+    pbmc_tcr cellsius cellsius_spheroid villani baron gse156490 human_pgc airway pbmc68k
+```
+
+默认输出在 `work/copied-inputs/<dataset>/<view>/input/`，包括 `dataset.yaml`、`expression.npz`、`cells.tsv` 和 `genes.tsv`。同级 `import.json` 记录源文件和导出文件的 SHA256。可在同一输出目录增补 view。重新导入时检查旧导出，发现内容不一致会给出错误，改用新的 `--out` 即可保留两个版本。GUI 自动列出两个默认导出目录里的 view，自定义输出路径可手动粘贴。
+
+### 有旧 benchmark 时启用评估
+
+如果旧工程仍在 DCC，将 `--benchmark-root` 指向包含多个数据集子目录的 **benchmark 目录本身**。可先运行 `ls "$BENCH/cellsius/release.lock.json"` 确认位置。导入会按旧锁里的逻辑路径核对 RNA 与参考，然后为该数据集的各主 view 生成带 GT 的独立导出。
+
+```bash
+BENCH=/hpc/group/jilab/xn24/LLMRareCell/benchmark
+.venv/bin/rarecell-import --data-root "$DATA" --benchmark-root "$BENCH" cellsius
+```
+
+从 GUI 的「已导入的数据集与 view」选择同名的「含评估 GT」项，数据清单和同一 view 的 `evaluation_fixture/gt.tsv` 一起填入。已完成的发现也可以在「评估结果」中指定原 run 和匹配的 GT。这个冻结参考导出入口支持下表中的九个基准。独立 `spheroid/labels.tsv` 采用源数据的标识，其导入映射走下方 standalone 流程。
+
+### 在本地浏览器打开 DCC 的 GUI
+
+已有同一计算节点的 8787 转发和 GUI 时，保留当前连接，安装新版后重新打开「新建任务」即可。首次从没有热更新功能的版本升级时，在原节点重新启动 GUI，保留 SSH 转发。在新的连接中，可按 [Duke 的配置](https://oit-rc.pages.oit.duke.edu/rcsupportdocs/dcc/vscode/) 将 `dcc-cpu` 加入本机的 SSH 配置，然后在 Windows PowerShell 执行：
+
+```powershell
+ssh -o ExitOnForwardFailure=yes -L 127.0.0.1:8787:127.0.0.1:8787 dcc-cpu
+```
+
+在这条连接打开的 DCC shell 中运行：
+
+```bash
+cd /hpc/group/jilab/xn24/MultiGPTRareCell
+.venv/bin/rarecell ui --workspace "$PWD/work/tasks" --port 8787
+```
+
+保持 SSH 窗口开启，把终端打印的完整 `http://127.0.0.1:8787/#…` 链接复制到本机浏览器。SSH 目标和 GUI 进程必须在同一台机器上。已用 VS Code Remote SSH 连接该计算节点时，也可在 Ports 面板转发 8787。如果代码和数据都在自己的 Linux 或 WSL2 环境，按 README 安装依赖，将 `--data-root` 改成本机目录，在同一 Linux 环境启动 GUI 并打开其本机链接即可。
+
+## 导入完整的冻结工程
 
 从 MultiGPTRareCell 根目录执行。默认读取旁边的 LLMRareCell 工程，检查旧 release.lock.json 中每个被使用文件的 SHA256，核对矩阵行、源视图 cell_id 顺序及参考覆盖，再为每个 view 写一对 GUI 路径。已有完整导出会校验后复用。各数据集独立处理，某个失败时会继续处理其余数据集并返回非零退出码。
 
