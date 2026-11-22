@@ -156,7 +156,7 @@ class Controller:
                     raise ValueError("Annotation membership mismatch for " + c["id"])
                 aid = "A" + fingerprint(ann)
                 projection = {k: ann[k] for k in ("label", "ontology_id", "resolution", "partition_id",
-                                                  "marker_hash", "model", "cache_key") if k in ann}
+                                                  "marker_hash", "model", "cache_key", "marker_source", "n_background") if k in ann}
                 eid = self.evidence(aid, "interpretation", annotation_parents(ann, c), "input_expression",
                                     c["set_hash"], projection, [ref], history=ann.get("selection_history"),
                                     method=ann.get("author_commit"), prompt=ann.get("prompt_version"))
@@ -185,7 +185,7 @@ class Controller:
         labels = sorted({item["label"] for item in items.values()})
         sources = []
         for eid, record in sorted(items.items()):
-            summary = {k: record[k] for k in ("label", "partition_id", "resolution", "ontology_id") if k in record}
+            summary = {k: record[k] for k in ("label", "partition_id", "resolution", "ontology_id", "marker_source") if k in record}
             sources.append(dict(summary, evidence_id=eid))
         return {"label": labels[0] if len(labels) == 1 else "unknown", "labels": labels,
                 "evidence_ids": sorted(items), "sources": sources}

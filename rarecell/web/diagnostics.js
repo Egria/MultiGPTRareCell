@@ -60,7 +60,7 @@ function showOverview(data) {
       data.trace.stall + " / " + (data.stall_limit ?? "—") : null]
   ]));
   const usage = diagFacts([
-    ["注释模型", data.annotation_model], ["已注释分组", a.annotated],
+    ["注释模型", data.annotation_model], ["已注释条目", a.annotated], ["其中单细胞注释", a.annotated_singletons], ["群注释阶段", a.partition_issue],
     ["新完成 / 缓存注释批次", a.newly_completed_batches != null ? a.newly_completed_batches + " / " + (a.cached_batches ?? "—") : null],
     ["注释 API 次数 / 费用（USD）", a.annotated != null ?
       (a.provider_calls_observed_at_wire ?? "未采集") + " / " + (a.annotation_cost_usd ?? "未采集") : null],

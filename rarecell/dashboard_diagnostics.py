@@ -174,6 +174,6 @@ def diagnostics(root, task, page=None, turn=None):
             "pending_seeds": seeds, "annotation_model": (ann.get("settings") or {}).get("model"),
             "stall_limit": (cfg.get("budget") or {}).get("stall_turns"),
             "usage": fields(usage, "turns provider_dispatches protocol_errors action_errors new_queries compute_executions"),
-            "prepare": fields(manifest, "status stages"), "annotation": fields(ann, "status detail annotated "
+            "prepare": fields(manifest, "status stages"), "annotation": fields(ann, "status detail annotated annotated_singletons partition_issue "
                 "newly_completed_batches cached_batches errors skipped annotation_cost_usd provider_calls_observed_at_wire"),
             "evaluation": scores}

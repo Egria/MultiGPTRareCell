@@ -4,6 +4,7 @@ import math
 from collections import defaultdict
 
 from .config import fingerprint
+from .singleton_markers import SOURCE as SINGLETON_CONTRAST
 
 
 HVG = "seurat_vst_features"
@@ -128,6 +129,11 @@ def annotation_parents(ann, candidate):
         # Direct callers can register a plain interpretation in unit-level
         # controller scenarios. The CLI accepts only verified OntoAnno rows.
         return candidate["evidence_ids"]
+    if ann.get("marker_source") == SINGLETON_CONTRAST:
+        if (len(candidate["members"]) != 1 or fingerprint(candidate["marker_background"]) != ann["background_hash"]
+                or fingerprint(ann["markers"]) != ann["marker_hash"]):
+            raise ValueError("Annotation has no matching frozen singleton contrast")
+        return [candidate["evidence_ids"][0]]
     matches = {item["evidence_id"] for item in candidate.get("seurat_markers", [])
                if item["marker_hash"] == ann.get("marker_hash")
                and item["partition_id"] == ann.get("partition_id")
