@@ -41,7 +41,37 @@ BENCH=/hpc/group/jilab/xn24/LLMRareCell/benchmark
 .venv/bin/rarecell-import --data-root "$DATA" --benchmark-root "$BENCH" cellsius
 ```
 
-从 GUI 的「已导入的数据集与 view」选择同名的「含评估 GT」项，数据清单和同一 view 的 `evaluation_fixture/gt.tsv` 一起填入。已完成的发现也可以在「评估结果」中指定原 run 和匹配的 GT。这个冻结参考导出入口支持下表中的九个基准。独立 `spheroid/labels.tsv` 采用源数据的标识，其导入映射走下方 standalone 流程。
+从 GUI 的「已导入的数据集与 view」选择同名的「含评估 GT」项，数据清单和同一 view 的 `evaluation_fixture/gt.tsv` 一起填入。已完成的发现也可以在「评估结果」中指定原 run 和匹配的 GT。冻结参考导出支持本页列出的全部 12 个基准。独立 `spheroid/labels.tsv` 采用源数据的标识，其导入映射走下方 standalone 流程。
+
+### 一次转换 DCC 的全部表达和评估文件
+
+在 MultiGPTRareCell 根目录运行下列脚本。它默认从相邻的 `../data/` 读取 RNA，从 `../LLMRareCell/benchmark/` 读取标签和冻结校验值，遍历 12 个基准在 `views.tsv` 中发布的所有 view。MMoCHi 包含 40 个额外 view，PBMC-TCR 保留五档丰度，CellSIUS 保留六个条件。给定的两份 DCC 目录清单共对应 61 个 view。`data/spheroid` 是独立源包，规范化入口为 `cellsius_spheroid`。
+
+```bash
+cd /hpc/group/jilab/xn24/MultiGPTRareCell
+bash scripts/convert_benchmarks.sh
+```
+
+在登录节点可将转换直接提交到计算节点。下方是一个初始资源申请，耗时和实际峰值内存随节点和文件系统而变。Slurm 标准输出每行是一对可用的清单及默认 GT 绝对路径，标准错误包含逐数据集进度及失败原因。
+
+```bash
+cd /hpc/group/jilab/xn24/MultiGPTRareCell
+mkdir -p work
+sbatch --cpus-per-task=2 --mem=64G --time=06:00:00 \
+  --output="$PWD/work/import-%j.tsv" --error="$PWD/work/import-%j.log" scripts/convert_benchmarks.sh
+```
+
+也可指定子集、其他目录或 Python 解释器，例如 `DATA_ROOT=/path/to/data BENCHMARK_ROOT=/path/to/benchmark bash scripts/convert_benchmarks.sh hao larry`。默认使用项目的 `.venv/bin/python`，可用 `RARECELL_PYTHON` 覆盖。命令行等价入口是 `rarecell-import --data-root ../data --benchmark-root ../LLMRareCell/benchmark --all-views all`。全程离线，各个数据集独立发布，中途遇到文件缺失或哈希冲突会继续处理其余数据集并返回非零状态。原冻结版本和视图集合完全相同的导出会经过校验后复用。已有不同源版本或不同视图集合时可用 `DATASET_OUT` 指定新目录，GUI 中手动粘贴打印的路径。
+
+| 基准 | GUI 默认 GT | 同一 view 的其他可评分文件 |
+|---|---|---|
+| Hao | 作者 L2 分区，和原稀有目标的来源层级一致 | `labels_l1.tsv`、`labels_l3.tsv`，以及 `targets.tsv` 中分开记录的 source membership 和 ADT protein surrogate |
+| LARRY | pDC、Ccr7_DC、Eos 的逐细胞 source membership，按每个目标报告最佳最终群 F1 | 原始终末标签只覆盖部分细胞。此导出评价目标恢复；轨迹、克隆命运概率及终末子集 ARI 属于旧项目的其他指标。 |
+| MMoCHi | 作者细标签分区 | `targets.tsv` 按目标以及 source membership、FACS sort 分别评分。两类记录来自同一分选设计。 |
+| PBMC-TCR、portable spheroid | 每目标的四态 membership | unknown/disputed 在各目标评分时排除。 |
+| 其余基准 | 原作者完整 fine 分区 | 一对一匹配给出 ARI、NMI 及各类 F1。 |
+
+在 GUI「已导入的数据集与 view」中选择「含评估 GT」可填入默认文件，Hao、MMoCHi 还列出额外评分选项。命令行也可为同一个 run 更换 `rarecell evaluate --gt` 的文件，每种口径使用独立的 `--out`。这些标签、蛋白证据和目标名称均放在 `evaluation_fixture/` 中；`input/` 只包含表达矩阵、cell_id、基因表和清单。
 
 ### 在本地浏览器打开 DCC 的 GUI
 

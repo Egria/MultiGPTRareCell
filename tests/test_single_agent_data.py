@@ -96,3 +96,87 @@ def test_locked_release_with_separate_roots(tmp_path):
     assert "private" not in (out / "villani/V000/input/cells.tsv").read_text()
     (data / "genes.tsv").write_text("other contents")
     assert main(args) == 1
+
+
+def old_reference(root, name):
+    data = legacy_tree(root, name)
+    matrix = "expression_normalized.npz" if name == "larry" else "counts.npz"
+    (data / "expression_tpm.npz").rename(data / matrix)
+    (data / "input.json").write_text(json.dumps(
+        {"is_raw_count": name != "larry", "matrix": matrix, "orientation": "cells_by_genes"}))
+    bench = root / "benchmark" / name
+    view = bench / "views/V000"
+    view.mkdir(parents=True)
+    (view / "cells.tsv").write_bytes((data / "views/V000/cells.tsv").read_bytes())
+    (bench / "manifest.json").write_text('{"gt_release_id":"test"}')
+    levels = {"hao": ["l1", "l2", "l3"], "larry": ["terminal"], "mmochi": ["fine"]}[name]
+    with (bench / "labels_source.tsv").open("w") as f:
+        f.write("view_id\tcell_id\tlevel_id\toriginal_name\n")
+        for level in levels:
+            for cell in (["c0"] if name == "larry" else ["c2", "c0"]):
+                f.write(f"V000\t{cell}\t{level}\t{level}-{cell}\n")
+    kinds = ["source_membership"]
+    if name == "hao":
+        kinds.append("protein_surrogate")
+    if name == "mmochi":
+        kinds.append("facs_sort")
+    with (bench / "membership.tsv").open("w") as f:
+        f.write("view_id\tcell_id\ttarget_id\treference_kind\tstate\n")
+        for kind in kinds:
+            f.write(f"V000\tc2\tR\t{kind}\tpositive\n")
+            state = "unknown" if kind == "protein_surrogate" else "negative"
+            f.write(f"V000\tc0\tR\t{kind}\t{state}\n")
+    (bench / "targets.tsv").write_text("target_id\treference_kind\n" + "".join(f"R\t{k}\n" for k in kinds))
+    hashes = {str(prefix / p.relative_to(src.parent)): hash_file(p)
+              for prefix, src in ((Path("data"), data), (Path("benchmark"), bench))
+              for p in src.rglob("*") if p.is_file()}
+    (bench / "release.lock.json").write_text(json.dumps({"artifacts": hashes}))
+    return data, bench
+
+
+def test_batch_scoring_profiles_and_retry(tmp_path):
+    from rarecell.evaluation import _target_reference, _target_scores
+
+    for name in ("larry", "hao", "mmochi"):
+        old_reference(tmp_path, name)
+    out = tmp_path / "work/single-agent-datasets"
+    args = ["--data-root", str(tmp_path / "source"), "--benchmark-root", str(tmp_path / "benchmark"),
+            "--out", str(out), "--all-views"]
+    assert main(args + ["all"]) == 1  # nine missing releases, available ones still published
+    assert main(args + ["mmochi", "hao", "larry"]) == 0
+    for name in ("larry", "hao", "mmochi"):
+        d = out / name / "V000"
+        assert read_dataset(d / "input").cell_ids == ["c0", "c2"]
+        ref = d / "evaluation_fixture"
+        if name == "larry":
+            refs = _target_reference(ref / "gt.tsv")
+            assert refs["R", "source_membership"]["c2"] == "positive"
+        else:
+            refs = _target_reference(ref / "targets.tsv")
+            assert len(refs) == 2
+            primary = (ref / "gt.tsv").read_text()
+            assert ("l2-c0" if name == "hao" else "fine-c0") in primary
+        scores = _target_scores(refs, {"c0": "X", "c2": "Y"})
+        assert scores["macro_f1"] == 1
+        if name == "hao":
+            assert refs["R", "protein_surrogate"]["c0"] == "unknown"
+            assert (ref / "labels_l3.tsv").is_file() and (ref / "labels_l1.tsv").is_file()
+    choices = [r for r in imported_views(tmp_path) if r["label"] == "hao / V000"]
+    assert len(choices) == 4 and len({r["dataset"] for r in choices}) == 1
+
+
+def test_incomplete_membership_is_not_published(tmp_path):
+    from rarecell.single_agent_data import write_references
+    import pytest
+
+    d = tmp_path / "V000"
+    d.mkdir()
+    f = tmp_path / "membership.tsv"
+    header = "view_id\tcell_id\ttarget_id\treference_kind\tstate\n"
+    rec = "V000\tc0\tR\tfacs_sort\tunknown\n"
+    for contents, error in [(rec, "Incomplete"), (rec + rec, "Duplicate"),
+                            (rec.replace("unknown", "unscored"), "Invalid")]:
+        f.write_text(header + contents)
+        with pytest.raises(ValueError, match=error):
+            write_references(tmp_path, {"V000": {"c0": 0, "c1": 1}}, f,
+                             {"membership": "gt.tsv"}, membership=True)

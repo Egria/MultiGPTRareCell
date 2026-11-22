@@ -252,7 +252,7 @@ function clearAutoGt() {
 imported.onchange = () => {
   clearAutoGt();
   if (imported.value) {
-    form.elements.dataset.value = imported.value;
+    form.elements.dataset.value = imported.selectedOptions[0].dataset.manifest;
     autoGt = imported.selectedOptions[0].dataset.gt;
     form.elements.gt.value = autoGt;
   }
@@ -272,7 +272,9 @@ async function loadImported() {
     const views = await api("/api/datasets");
     const options = [new Option("选择已导入的 view，或手动填写路径", "")];
     for (const view of views) {
-      const option = new Option(view.label + (view.gt ? " · 含评估 GT" : " · 仅表达"), view.dataset);
+      const title = view.profile || (view.gt ? "含评估 GT" : "仅表达");
+      const option = new Option(view.label + " · " + title, view.profile ? view.gt : view.dataset);
+      option.dataset.manifest = view.dataset;
       option.dataset.gt = view.gt;
       options.push(option);
     }

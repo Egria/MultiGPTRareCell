@@ -1,6 +1,7 @@
 """Import single-agent RNA views from a copied data tree or a frozen benchmark release."""
 import argparse
 import csv
+from contextlib import ExitStack
 import os
 from functools import cached_property
 from pathlib import Path
@@ -25,11 +26,10 @@ DATASETS = {
     "human_pgc": ("human", "gastrula", "linear_expression"),
     "airway": ("mouse", "tracheal epithelium", "counts"),
     "pbmc68k": ("human", "peripheral blood", "counts"),
+    "hao": ("human", "peripheral blood", "counts"),
+    "larry": ("mouse", "cultured hematopoietic progenitors", "linear_expression"),
+    "mmochi": ("human", "peripheral blood", "counts"),
 }
-# These three legacy suites have additional evaluation axes outside the current scorer.
-INPUT_DATASETS = {**DATASETS, "hao": ("human", "peripheral blood", "counts"),
-                  "larry": ("mouse", "cultured hematopoietic progenitors", "linear_expression"),
-                  "mmochi": ("human", "peripheral blood", "counts")}
 INPUT_FILES = ("dataset.yaml", "cells.tsv", "genes.tsv", "expression.npz")
 COPIED_OUT = Path("work/copied-inputs")
 RELEASE_OUT = Path("work/single-agent-datasets")
@@ -71,7 +71,7 @@ class ExpressionSource:
 
     def __init__(self, data, name, verified):
         self.data, self.name, self.verified = data, name, verified
-        self.species, self.tissue, self.layer = INPUT_DATASETS[name]
+        self.species, self.tissue, self.layer = DATASETS[name]
         self.spec = read_json(verified(data / "input.json"))
         if self.spec["is_raw_count"] is not (self.layer == "counts"):
             raise ValueError(f"Assay disagrees with registered expression layer in {data}")
@@ -176,11 +176,68 @@ def copied_inputs(data, out, name, views=None, all_views=False):
         yield dest / "input/dataset.yaml"
 
 
+def write_references(stage, axes, path, outputs, *, membership=False, expected_pairs=None, mait=False):
+    """Read a large legacy table once and route its rows to all requested views."""
+    fields = ["cell_id", "target_id", "reference_kind", "state"] if membership else ["cell_id", "label"]
+    coverage = {v: {} for v in axes}
+    positive_mait = dict.fromkeys(axes, 0)
+    with ExitStack() as stack:
+        writers = {}
+        for v in axes:
+            directory = stage / v / "evaluation_fixture"
+            directory.mkdir(exist_ok=True)
+            for profile, filename in outputs.items():
+                stream = stack.enter_context((directory / filename).open("w", encoding="utf8", newline=""))
+                writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
+                writer.writerow(fields)
+                writers[v, profile] = writer
+
+        for r in rows(path):
+            v = r["view_id"]
+            if v not in axes:
+                continue
+            profile = "membership" if membership else r["level_id"]
+            if profile not in outputs:
+                continue
+            cell = r["cell_id"]
+            axis = axes[v]
+            if cell not in axis:
+                raise ValueError(f"Reference cell outside RNA view {v}: {cell}")
+            if membership:
+                target, kind, state = r["target_id"], r["reference_kind"], r["state"]
+                key = (target, kind)
+                if not target or not kind or state not in {"positive", "negative", "unknown", "disputed"}:
+                    raise ValueError(f"Invalid target membership in {v}")
+                record = [cell, target, kind, state]
+                if mait and target == "MAIT" and state == "positive":
+                    positive_mait[v] += 1
+            else:
+                key = profile
+                if not r["original_name"]:
+                    raise ValueError(f"Empty label in {v}/{profile}")
+                record = [cell, r["original_name"]]
+            seen = coverage[v]
+            if key not in seen:
+                seen[key] = bytearray(len(axis))
+            idx = axis[cell]
+            if seen[key][idx]:
+                raise ValueError(f"Duplicate ground truth for {cell} in {v}/{key}")
+            seen[key][idx] = 1
+            writers[v, profile].writerow(record)
+
+    for v, seen in coverage.items():
+        required = expected_pairs if membership else set(outputs)
+        if not seen or (required is not None and seen.keys() != required) or any(0 in mask for mask in seen.values()):
+            raise ValueError(f"Incomplete ground truth in {v}: {path.name}")
+        if mait and v in MAIT_SIZES and positive_mait[v] != MAIT_SIZES[v]:
+            raise ValueError(f"MAIT count differs from frozen recipe in {v}")
+
+
 def export_release(project, out, name, all_views=False, *, data_root=None, benchmark_root=None):
     name = ALIASES.get(name, name)
     out = Path(out).resolve()
     if name not in DATASETS:
-        raise ValueError(f"Frozen GT export is supported for {', '.join(DATASETS)}; use --data-root alone for {name}")
+        raise ValueError(f"Unknown dataset {name}")
     data = (Path(data_root) if data_root else Path(project) / "data") / name
     bench = (Path(benchmark_root) if benchmark_root else Path(project) / "benchmark") / name
     lockfile = bench / "release.lock.json"
@@ -205,16 +262,27 @@ def export_release(project, out, name, all_views=False, *, data_root=None, bench
     manifest = read_json(verified(bench / "manifest.json"))
     identity = {"format_version": 1, "dataset": name, "release": manifest["gt_release_id"],
                 "source_lock_sha256": hash_file(lockfile), "views": views}
-    scoped = name == "pbmc_tcr" or (name == "cellsius_spheroid" and
+    scoped = name in {"larry", "pbmc_tcr"} or (name == "cellsius_spheroid" and
             read_json(verified(bench / "source_lock.json")).get("evaluation_profile") == "spheroid_cp_target_f1_v1")
-    ref = verified(bench / ("membership.tsv" if scoped else "labels_source.tsv"))
+    label_files = {} if scoped else {"fine": "gt.tsv"}
+    if name == "hao":
+        label_files = {"l1": "labels_l1.tsv", "l2": "gt.tsv", "l3": "labels_l3.tsv"}
+    membership_file = "gt.tsv" if scoped else "targets.tsv" if name in {"hao", "mmochi"} else None
+    labels = verified(bench / "labels_source.tsv") if label_files else None
+    memberships = verified(bench / "membership.tsv") if membership_file else None
+    pairs = None
+    if name in {"hao", "larry", "mmochi"}:
+        pairs = {(r["target_id"], r["reference_kind"]) for r in rows(verified(bench / "targets.tsv"))}
+        if not pairs:
+            raise ValueError(f"Empty target registry for {name}")
     dest = out / name
     if dest.exists():
         saved = read_json(dest / "export.json")
         if saved["source"] != identity:
             raise ValueError(f"Different release or view selection already at {dest}; choose another --out")
-        required = {f"{v}/{item}" for v in views for item in
-                    ("input/dataset.yaml", "input/cells.tsv", "input/genes.tsv", "input/expression.npz", "evaluation_fixture/gt.tsv")}
+        references = [*label_files.values(), *([membership_file] if membership_file else [])]
+        required = {f"{v}/evaluation_fixture/{f}" for v in views for f in references}
+        required.update(f"{v}/input/{f}" for v in views for f in INPUT_FILES)
         if set(saved["files"]) != required:
             raise ValueError(f"Incomplete export inventory at {dest}")
         for v in views:
@@ -226,39 +294,20 @@ def export_release(project, out, name, all_views=False, *, data_root=None, bench
                 raise ValueError(f"Changed exported file: {dest / rel}")
         return dest
 
-    fields = ["cell_id", "target_id", "reference_kind", "state"] if scoped else ["cell_id", "label"]
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out, prefix="." + name + "-") as tmp:
         stage = Path(tmp) / name
+        axes = {}
         for v in views:
             cells = source.write(v, stage / v / "input")
             if cells != ids(verified(bench / "views" / v / "cells.tsv"), "cell_id"):
                 raise ValueError(f"Benchmark cell list differs in {v}")
-            fixture = stage / v / "evaluation_fixture"
-            fixture.mkdir()
-            truth = []
-            for r in rows(ref):
-                if r["view_id"] != v:
-                    continue
-                if scoped:
-                    truth.append({k: r[k] for k in fields})
-                elif r["level_id"] == "fine":
-                    truth.append({"cell_id": r["cell_id"], "label": r["original_name"]})
-            cell_set = set(cells)
-            if {r["cell_id"] for r in truth} != cell_set:
-                raise ValueError(f"Incomplete ground truth in {v}")
-            if scoped:
-                targets = {(r["target_id"], r["reference_kind"]) for r in truth}
-                if len(truth) != len(cells) * len(targets) or len({tuple(r[k] for k in fields[:3]) for r in truth}) != len(truth):
-                    raise ValueError(f"Incomplete target memberships in {v}")
-                if any(r["state"] not in {"positive","negative","unknown","disputed"} for r in truth):
-                    raise ValueError(f"Unknown reference state in {v}")
-                if name == "pbmc_tcr" and v in MAIT_SIZES:
-                    if sum(r["target_id"] == "MAIT" and r["state"] == "positive" for r in truth) != MAIT_SIZES[v]:
-                        raise ValueError(f"MAIT count differs from frozen recipe in {v}")
-            elif len(truth) != len(cells) or any(not r["label"] for r in truth):
-                raise ValueError(f"Missing or duplicate fine labels in {v}")
-            write_tsv(fixture / "gt.tsv", fields, truth)
+            axes[v] = {cell: i for i, cell in enumerate(cells)}
+        if labels:
+            write_references(stage, axes, labels, label_files)
+        if memberships:
+            write_references(stage, axes, memberships, {"membership": membership_file},
+                             membership=True, expected_pairs=pairs, mait=name == "pbmc_tcr")
         files = {str(path.relative_to(stage)): hash_file(path) for path in sorted(stage.rglob("*")) if path.is_file()}
         write_json(stage / "export.json", {"source": identity, "files": files})
         os.rename(stage, dest)
@@ -276,7 +325,7 @@ def main(argv=None):
     selection.add_argument("--all-views", action="store_true", help="Include optional prepared views")
     selection.add_argument("--view", action="append", help="Import just this view (repeatable, expression-only mode)")
     parser.add_argument("--list", action="store_true", help="List view IDs, roles and cell counts without reading matrices")
-    parser.add_argument("datasets", nargs="+", choices=sorted(set(INPUT_DATASETS) | set(ALIASES)))
+    parser.add_argument("datasets", nargs="+", choices=sorted(set(DATASETS) | set(ALIASES) | {"all"}))
     args = parser.parse_args(argv)
     locked = args.project is not None or args.benchmark_root is not None
     if args.project and args.benchmark_root:
@@ -287,7 +336,10 @@ def main(argv=None):
     bench_root = (args.benchmark_root or args.project / "benchmark").resolve() if locked else None
     out = (args.out or (RELEASE_OUT if locked else COPIED_OUT)).resolve()
     failed = False
-    for name in dict.fromkeys(ALIASES.get(n, n) for n in args.datasets):
+    if "all" in args.datasets and len(args.datasets) != 1:
+        parser.error("Use all by itself or specify individual dataset names")
+    names = DATASETS if args.datasets == ["all"] else dict.fromkeys(ALIASES.get(n, n) for n in args.datasets)
+    for name in names:
         try:
             if args.list:
                 entries, sizes = view_sizes(data_root / name, lambda path: path)
@@ -299,6 +351,7 @@ def main(argv=None):
                 if root and (out.is_relative_to(root) or (root / name).is_relative_to(out / name)):
                     raise ValueError("Choose an output directory separate from the source data and benchmark")
             if locked:
+                print(f"Verifying and exporting {name} ...", file=sys.stderr, flush=True)
                 dest = export_release(None, out, name, args.all_views, data_root=data_root, benchmark_root=bench_root)
                 for v in read_json(dest / "export.json")["source"]["views"]:
                     print(f"{dest/v/'input/dataset.yaml'}\t{dest/v/'evaluation_fixture/gt.tsv'}", flush=True)
