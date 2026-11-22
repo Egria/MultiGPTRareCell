@@ -16,6 +16,19 @@ def checkout(directory):
     return None
 
 
+# The credentials file may also be sourced by an interactive shell. Its
+# literal PATH (e.g. "$PATH:...") cannot replace the initialized module paths.
+_RUNTIME_ENV = {"PATH", "LD_LIBRARY_PATH", "LD_PRELOAD", "R_HOME", "RHOME",
+                "R_LIBS", "R_LIBS_USER", "R_LIBS_SITE", "RARECELL_MODULE_RSCRIPT"}
+
+
+def rscript_command(settings):
+    configured = settings.get("rscript", "Rscript")
+    if configured == "Rscript":
+        return os.environ.get("RARECELL_MODULE_RSCRIPT") or configured
+    return configured
+
+
 def load_keys(path):
     if not path.exists():
         return
@@ -26,6 +39,8 @@ def load_keys(path):
             continue
         match = re.fullmatch(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
         if match:
+            if match[1] in _RUNTIME_ENV:
+                continue
             try:
                 # Parse only the assignment value. Quotes and inline comments are
                 # supported, without evaluating shell commands from a key file.

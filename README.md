@@ -54,7 +54,7 @@ ssh -L 8787:127.0.0.1:8787 dcc-cpu
 
 在 DCC 登录或计算节点从 checkout 运行 `rarecell` 时，启动器自动执行 `module load R/4.3.1-rhel8`，并将 `R_LIBS_USER` 指向仓库同级的 `r-libs/MultiGPTRareCell/4.3.1-rhel8`。其他安装位置可用 `RARECELL_R_MODULE` 和 `RARECELL_R_LIBS_USER` 指定；将前者设为空字符串可使用自己已加载的 R 环境。在其他主机默认沿用当前 R 环境。
 
-将已有的 `.api_keys` 放在仓库根目录，每行使用 `NAME=value` 或 `export NAME="value"`。支持引号、空行和注释，值按字面量读取。官方 OpenAI 接口默认使用 `OPENAI_API_KEY`。文件存在时其中的值覆盖同名环境变量；没有文件时沿用现有环境。密钥由启动进程传给子进程。更新密钥后重新启动 GUI，新提交的批处理作业会在计算节点重新读取文件。可以用 `chmod 600 .api_keys` 限制文件访问。
+将已有的 `.api_keys` 放在仓库根目录，每行使用 `NAME=value` 或 `export NAME="value"`。支持引号、空行和注释，值按字面量读取。官方 OpenAI 接口默认使用 `OPENAI_API_KEY`。文件中的凭据覆盖同名凭据环境变量。启动器保留模块设置的 PATH、动态库路径和 R 库路径。DCC 上的 doctor、GUI 工作进程与批处理使用模块解析出的同一个 Rscript；显式填写的 prepare.rscript 或 annotation.rscript 优先。用 `rarecell doctor --config real.yaml` 查看两个组件各自的 `rscript` 字段。密钥由启动进程传给子进程。更新密钥后重新启动 GUI，新提交的批处理作业会在计算节点重新读取文件。可以用 `chmod 600 .api_keys` 限制文件访问。
 
 在仓库根目录执行以下命令。网页与命令行均可设置同一份全局模型。
 

@@ -10,13 +10,14 @@ from pathlib import Path
 
 from . import annotation, providers
 from .config import config, merge_config, read_json, write_json
-from .runtime import checkout, load_keys, model_overrides, project_model, save_project_model
+from .runtime import checkout, load_keys, model_overrides, project_model, rscript_command, save_project_model
 from .prepare import prepare, verify_snapshot
 from .run import discover, resume
 
 
 def doctor(cfg):
-    r = shutil.which(cfg["prepare"].get("rscript", "Rscript"))
+    command = rscript_command(cfg["prepare"])
+    r = shutil.which(command)
     probe = {"status": "blocked", "detail": "Rscript not found"}
     if r:
         expr = ('cat(as.character(getRversion()),as.character(packageVersion("Seurat")),'
@@ -31,6 +32,7 @@ def doctor(cfg):
                      "Validated pairing requires Seurat 5.3.0 and SeuratObject 5.2.0"}
         except (OSError, subprocess.TimeoutExpired) as exc:
             probe = {"status": "blocked", "detail": str(exc)}
+    probe["rscript"] = r or command
     return {"python": platform.python_version(), "packages": {p: importlib.metadata.version(p) for p in
              ("numpy", "scipy", "scikit-learn", "igraph", "PyYAML")}, "Seurat": probe,
             "discovery_provider": providers.diagnose(cfg), "OntoAnno": annotation.diagnose(cfg)}

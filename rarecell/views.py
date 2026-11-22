@@ -14,6 +14,7 @@ from sklearn.preprocessing import normalize
 from sklearn.random_projection import SparseRandomProjection
 
 from .data import write_tsv
+from .runtime import rscript_command
 
 
 def projection(x, name, cfg, dest):
@@ -175,9 +176,10 @@ def python_graph(nbrs, cfg, dest):
 
 
 def run_r(mode, work, cfg, *args):
-    r = shutil.which(cfg["rscript"])
+    command = rscript_command(cfg)
+    r = shutil.which(command)
     if not r:
-        raise RuntimeError("Rscript unavailable; install Seurat 5.3.0 and leidenbase")
+        raise RuntimeError(f"Rscript executable not found: {command}")
     script = Path(__file__).resolve().parent / "r" / "seurat.R"
     command = [r, "--vanilla", str(script), mode, str(work), *map(str, args)]
     # R process sees its own configured environment, independent of discovery-provider secrets.
