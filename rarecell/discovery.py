@@ -31,7 +31,7 @@ GOAL = (
 
 def prompt_version(mode):
     if mode == ADAPTIVE_MODE:
-        return "discovery/adaptive-1"
+        return "discovery/adaptive-2"
     return "discovery/1.3" if mode in {"A2", "A3"} else PROMPT_VERSION
 
 
@@ -220,6 +220,14 @@ class Controller:
     def ordered(self):
         return sorted(self.candidates.values(), key=self.priority)
 
+    def stall_review(self):
+        if not self.adaptive:
+            return False
+        if self.state.get_meta("closing_turn") is not None:
+            return True
+        return self.state.get_meta("stall", 0) >= self.budget["stall_turns"] and (
+            bool(self.state.get_meta("selected", [])) or any(not c["initial"] for c in self.candidates.values()))
+
     def context(self, turn):
         s = self.state
         actions = {k: v for k, v in CATALOGUE.items() if self.active or k not in SCIENTIFIC}
@@ -232,7 +240,7 @@ class Controller:
         queries = s.all("CanonicalQuery")
         usage = s.usage()
         stalled_turns = s.get_meta("stall", 0)
-        stalls_left = self.budget["stall_turns"] - stalled_turns
+        stalls_left = max(0, self.budget["stall_turns"] - stalled_turns)
         ctx = {"contract": contract(), "goal": self.goal, "mode": self.mode, "actions": actions,
                "bindings": {"run_id": s.get_meta("run_id"), "task_id": "discovery",
                             "data_version": self.version, "contract_version": contract()["version"]},
@@ -276,6 +284,22 @@ class Controller:
             pending = sorted({r["candidate_id"] for r in s.all("Seed")} - set(s.get_meta("selected", []))
                              - {r for r, depth in s.get_meta("depths", {}).items() if depth})
             ctx["pending_seeds"] = {"count": len(pending), "candidate_ids": pending[:5]}
+            if stalls_left == 1 and stalled_turns and not self.stall_review():
+                ctx["turn_instruction"] = (
+                    "A repeat will end exploration. Compare the held boundary options and their additional cells "
+                    "in boundary_reviews. Submit the better-supported selection now, or take a distinct action."
+                )
+            ctx["boundary_reviews"] = []
+            ctx["recent_evidence_pages"] = s.get_meta("evidence_pages", [])[-5:]
+            if self.stall_review():
+                ctx["actions"] = {k: actions[k] for k in ("select_boundary", "propose_revision", "submit")}
+                ctx["turn_instruction"] = (
+                    "Final decision after stalled exploration. Compare the requested and wider candidates in "
+                    "boundary_reviews. Submit candidate_ids and explain the margin and global fit, or submit the "
+                    "working selection by omitting candidate_ids. An explicit empty list declines all groups. "
+                    "You may revise or select_boundary before submitting in this message. If there is no submission, "
+                    "the controller publishes a nonempty saved selection as provisional. Unselected suggestions stay on file."
+                )
         if not self.active:
             ctx["mode_constraint"] = "Choose or combine complete precomputed candidate sets. No new scientific queries."
         # Reserve the entire contract, catalogue and budgets in every turn.
@@ -288,6 +312,12 @@ class Controller:
                 ctx[key].pop()
                 return False
             return True
+        if self.adaptive:
+            reviews = s.all("BoundaryReview")
+            ctx["boundary_review_count"] = len(reviews)
+            for review in reversed(reviews[-5:]):
+                if not append_if_fits("boundary_reviews", adaptive.review_card(self, review)):
+                    break
         hvg = s.get_meta("global_hvg")
         if hvg:
             ctx["global_feature_selection"] = []
@@ -536,12 +566,17 @@ class Controller:
                 raise ValueError("Unknown evidence ID " + eid) from None
         return ids
 
-    def decide(self, action, args, message_id):
+    def decide(self, action, args, message_id, *, source="agent"):
         selected = set(self.state.get_meta("selected", []))
         evidence_ids = self.checked_evidence(args.get("evidence_ids", []))
         reason = args.get("reason", "Submit current provisional assignment")
         if action == "submit":
             selected = set(args.get("candidate_ids", selected))
+            if self.adaptive:
+                anchors = [self.candidate(cid)["parents"][0] for cid in selected
+                           if self.candidate(cid).get("boundary_rule")]
+                if len(anchors) != len(set(anchors)):
+                    raise ValueError("Choose one boundary per anchor or revise the alternatives into disjoint groups")
             for cid in selected:
                 evidence_ids = evidence_ids + self.candidate(cid)["evidence_ids"]
                 evidence_ids = evidence_ids + self.current_label(cid).get("evidence_ids", [])
@@ -552,8 +587,10 @@ class Controller:
             chosen = []
             occupied = set()
             measured_evidence = set()
+            revision_inputs = set(parents)
             for group in args["groups"]:
                 refs = [self.candidate(cid) for cid in group.get("candidate_ids", [])]
+                revision_inputs.update(c["id"] for c in refs)
                 member_set = {m for c in refs for m in c["members"]}
                 explicit = set(group.get("members", []))
                 if explicit and not self.active and not self.by_set.get(fingerprint(sorted(explicit))):
@@ -585,6 +622,13 @@ class Controller:
                 chosen.append(self.make_revision(member_set, inherited, group.get("proposed_label", "unknown"),
                                                  group.get("status", "provisional"), evidence_ids + ([matched] if matched else []),
                                                  "revision", reason, biological_rarity=rarity)["id"])
+            if self.adaptive:
+                # Revising from a held alternative also supersedes the old working
+                # boundary of that anchor. An exclusion alone leaves its draft intact.
+                anchors = {self.candidate(i)["parents"][0] for i in revision_inputs
+                           if self.candidate(i).get("boundary_rule")}
+                selected = {i for i in selected if not (self.candidate(i).get("boundary_rule") and
+                                                        self.candidate(i)["parents"][0] in anchors)}
             selected.difference_update(parents)
             selected.update(chosen)
             evidence_ids = list(evidence_ids) + sorted(measured_evidence) + [eid for cid in chosen for eid in self.candidate(cid)["evidence_ids"]]
@@ -594,7 +638,9 @@ class Controller:
             decision["status"] = args.get("status", "final")
             if self.adaptive:
                 decision["assignment_preview"] = adaptive.preview(self, {"candidate_ids": sorted(selected)})
-            if evidence_ids:
+                decision["source"] = source
+                self.state.set_meta("submission_source", source)
+            if evidence_ids and source == "agent":
                 submitted = sorted(selected)
                 interpretation = self.evidence("submitted_groups", "interpretation", evidence_ids, "discovery_agent",
                                                fingerprint(sorted({m for cid in submitted
@@ -624,8 +670,16 @@ class Controller:
             return {"total": len(ordered), "offset": offset, "candidates": [self.card(c) for c in ordered[offset:offset+limit]]}
         if "candidate_id" in args:
             c = self.candidate(args["candidate_id"])
-            return {"candidate": self.card(c), "offset": offset, "total": len(c["members"]),
-                    "members": c["members"][offset:offset+limit], "markers": compact(c.get("markers", [])[offset:offset+limit], limit)}
+            page = {"candidate": self.card(c), "offset": offset, "total": len(c["members"]),
+                    "members": c["members"][offset:offset+limit],
+                    "markers": compact(c.get("markers", [])[offset:offset+limit], limit)}
+            if self.adaptive:
+                reviews = [r for r in self.state.all("BoundaryReview")
+                           if c["id"] in (r["anchor_id"], r["requested"]["candidate_id"], r.get("wider", {}).get("candidate_id"))]
+                if reviews:
+                    page["boundary_review_count"] = len(reviews)
+                    page["boundary_reviews"] = [adaptive.review_card(self, r) for r in reversed(reviews[-3:])]
+            return page
         ids = args.get("evidence_ids")
         if ids and len(ids) == 1:
             card = self.state.get("Evidence", self.checked_evidence(ids)[0])
@@ -692,11 +746,13 @@ class Controller:
             return adaptive.preview(self, args)
         if action in {"list_candidates", "get_evidence"}:
             return self.read_tool(action, args)
-        if action in {"propose_revision", "submit"} or (self.adaptive and action == "apply_boundary"):
+        if action in {"propose_revision", "submit"} or (self.adaptive and action in {"apply_boundary", "select_boundary"}):
             try:
                 with self.state.transaction():
                     if action == "apply_boundary":
                         return adaptive.apply_boundary(self, args)
+                    if action == "select_boundary":
+                        return adaptive.select_boundary(self, args)
                     return self.decide(action, args, message_id)
             except BaseException:
                 self._load_candidates()

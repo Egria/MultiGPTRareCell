@@ -140,6 +140,8 @@ def export(ctrl, status, detail, policy, annotation_status):
                "fallback_view_resolution": list(base) if base else None,
                "replication_id": s.get_meta("replication_id"), "run_id": s.get_meta("run_id"),
                "resumable": detail in ("paused", "provider_blocked", "annotation_blocked", "unknown_execution", "temporary_failure", "incomplete")}
+    if ctrl.adaptive:
+        summary["submission_source"] = s.get_meta("submission_source")
     write_json(run / "run_summary.json", summary)
     files = ["run_summary.json", "usage.json", "manifest.json", "config_resolved.yaml", "project_contract.yaml",
              "partition.tsv", "groups.tsv", "conflicts.jsonl", "candidate_tasks.tsv", "candidate_members.tsv", "candidates.jsonl", "seeds.tsv",

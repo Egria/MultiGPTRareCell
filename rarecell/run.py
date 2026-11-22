@@ -152,6 +152,7 @@ def process_message(ctrl, message, turn):
     limit = ctrl.budget["max_actions_per_turn"]
     if len(parsed) > limit:
         parsed = parsed[:limit] + [{"error": "Remaining batch actions exceed max_actions_per_turn"}]
+    decision_only = ctrl.stall_review()
     receipts = []
     progress = False
     for index, command in enumerate(parsed):
@@ -169,6 +170,8 @@ def process_message(ctrl, message, turn):
                 result = {"error": "Run already submitted; subsequent action blocked", "status": "blocked"}
             else:
                 try:
+                    if decision_only and command.get("action") not in {"submit", "select_boundary", "propose_revision"}:
+                        raise ValueError("Closing review accepts select_boundary, propose_revision and submit")
                     result = ctrl.execute(command, mid)
                 except (ValueError, KeyError) as exc:
                     result = {"error": str(exc)[:500], "status": "needs_clarification" if "error" in command else "blocked",
@@ -186,6 +189,8 @@ def process_message(ctrl, message, turn):
                         observations = sorted(e for e in c["evidence_ids"] if s.get("Evidence", e)["kind"] == "observation")
                         projection.add(fingerprint([c["set_hash"], c["proposed_label"], c["status"], observations]))
                     logical = fingerprint(["selected", sorted(projection)])
+                elif command.get("action") == "select_boundary":
+                    logical = fingerprint(["draft_choice", result["selected_ids"]])
                 elif command.get("action") == "apply_boundary":
                     logical = fingerprint(["boundary", result["evidence_id"], result["membership_hash"]])
                 elif command.get("action") in {"get_evidence", "list_candidates", "preview_submission"}:
@@ -197,6 +202,12 @@ def process_message(ctrl, message, turn):
                     logical = fingerprint(["query", result["query_key"]])
                 changed = lookup(s, "Progress", logical) is None
             with s.transaction():
+                if ctrl.adaptive and command.get("action") == "get_evidence" and "sections" in result:
+                    args = command["args"]
+                    entry = {"evidence_id": result["evidence_id"], "metric": args.get("metric", "default"),
+                             "offset": result["offset"], "limit": result["limit"]}
+                    pages = s.get_meta("evidence_pages", [])
+                    s.set_meta("evidence_pages", ([p for p in pages if p != entry] + [entry])[-5:])
                 if changed:
                     s.put("Progress", logical, {"id": logical})
                 if "error" in result:
@@ -234,6 +245,66 @@ def retain_freeze(run, frozen):
             except OSError:
                 shutil.copyfile(src, dst)
         stage.rename(archive)
+
+
+def explore(ctrl, policy, pause_after=None, retry_unknown=False):
+    """Run bounded discovery turns and publish a saved draft on a terminal stall."""
+    s = ctrl.state
+    status, detail = "partial", "max_agent_turns"
+    for turn in range(s.get_meta("finished_turn", 0) + 1, ctrl.budget["max_agent_turns"] + 1):
+        if ctrl.stall_review():
+            closing_turn = s.get_meta("closing_turn", turn)
+            if turn > closing_turn:
+                detail = "stalled"
+                break
+            s.set_meta("closing_turn", closing_turn)
+        # A fresh invocation reconstructs context or replays a persisted full message.
+        cap = ctrl.budget.get("max_reported_tokens", 0)
+        if cap and policy == "live":
+            token_counts = [m["usage"].get("total_tokens") for m in s.all("Message")]
+            if any(n is None for n in token_counts) or sum(token_counts) >= cap:
+                detail = "token_usage_unreported" if any(n is None for n in token_counts) else "max_reported_tokens"
+                break
+        try:
+            message = obtain(ctrl, policy, turn, retry_unknown)
+        except providers.ProviderError as exc:
+            detail = "provider_blocked" if exc.status == "blocked" else exc.status
+            s.set_meta("current_issue", str(exc))
+            s.event(detail, {"reason": str(exc), "turn": turn})
+            break
+        except ValueError as exc:
+            detail = "context_blocked"
+            s.set_meta("current_issue", str(exc))
+            s.event(detail, {"reason": str(exc), "turn": turn})
+            break
+        closing = ctrl.stall_review()
+        process_message(ctrl, message, turn)
+        if s.get_meta("submitted", False):
+            status, detail = "complete", "submitted"
+            break
+        if closing:
+            detail = "stalled"
+            break
+        if s.get_meta("stall", 0) >= ctrl.budget["stall_turns"]:
+            if not ctrl.stall_review() or turn == ctrl.budget["max_agent_turns"]:
+                detail = "stalled"
+                break
+        if pause_after is not None and turn >= pause_after:
+            detail = "paused"
+            break
+    # A stalled run may use one remaining turn to choose among held hypotheses.
+    # The controller can publish only the actual saved selection when that turn
+    # produces no submission, or when the call/token budget precludes the turn.
+    terminal_stall = detail == "stalled" or (
+        ctrl.stall_review() and detail in {"max_agent_turns", "max_reported_tokens", "token_usage_unreported"})
+    if ctrl.adaptive and terminal_stall and s.get_meta("selected", []) and not s.get_meta("submitted", False):
+        with s.transaction():
+            outcome = ctrl.decide("submit", {"status": "provisional", "reason":
+                "Publish the saved working selection after stalled exploration."}, None, source="controller_stall")
+            s.event("provisional_submission", {"decision_id": outcome["decision_id"], "trigger": detail})
+    if s.get_meta("submission_source") == "controller_stall":
+        return "partial", "stalled_provisional"
+    return status, detail
 
 
 def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=False):
@@ -296,39 +367,12 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
             s.set_meta("current_issue", annotation_detail)
             detail = "annotation_blocked"
             s.event(detail, {"reason": annotation_detail})
+        elif s.get_meta("submission_source") == "controller_stall":
+            status, detail = "partial", "stalled_provisional"
         elif s.get_meta("submitted", False):
             status, detail = "complete", "submitted"
         else:
-            for turn in range(s.get_meta("finished_turn", 0) + 1, ctrl.budget["max_agent_turns"] + 1):
-                # A fresh invocation reconstructs context or replays a persisted full message.
-                cap = ctrl.budget.get("max_reported_tokens", 0)
-                if cap and spec["policy"] == "live":
-                    token_counts = [m["usage"].get("total_tokens") for m in s.all("Message")]
-                    if any(n is None for n in token_counts) or sum(token_counts) >= cap:
-                        detail = "token_usage_unreported" if any(n is None for n in token_counts) else "max_reported_tokens"
-                        break
-                try:
-                    message = obtain(ctrl, spec["policy"], turn, retry_unknown)
-                except providers.ProviderError as exc:
-                    detail = "provider_blocked" if exc.status == "blocked" else exc.status
-                    s.set_meta("current_issue", str(exc))
-                    s.event(detail, {"reason": str(exc), "turn": turn})
-                    break
-                except ValueError as exc:
-                    detail = "context_blocked"
-                    s.set_meta("current_issue", str(exc))
-                    s.event(detail, {"reason": str(exc), "turn": turn})
-                    break
-                process_message(ctrl, message, turn)
-                if s.get_meta("submitted", False):
-                    status, detail = "complete", "submitted"
-                    break
-                if s.get_meta("stall", 0) >= ctrl.budget["stall_turns"]:
-                    detail = "stalled"
-                    break
-                if pause_after is not None and turn >= pause_after:
-                    detail = "paused"
-                    break
+            status, detail = explore(ctrl, spec["policy"], pause_after, retry_unknown)
         if detail == "submitted":
             exhausted = ctrl.active and s.usage()["new_queries"] >= ctrl.budget["max_new_queries"]
             checked = {r["candidate_id"] for r in s.all("Investigation")}

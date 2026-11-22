@@ -129,9 +129,11 @@ def discovery_blocks(run, checkpoint):
                 yield block("已保存决策", decision)
     for event in events:
         yield block("运行事件", event)
+        if event["type"] == "provisional_submission" and event.get("decision_id") in decisions:
+            yield block("停滞时保存的暂定提交", decisions[event["decision_id"]])
     summary = optional_json(run / "run_summary.json")
     if summary:
-        yield block("发现结果", fields(summary, "status detail issue submitted submission_status n_groups n_pending_seeds"))
+        yield block("发现结果", fields(summary, "status detail issue submitted submission_status submission_source n_groups n_pending_seeds"))
 
 
 def transcript(root, task, previous=None):
