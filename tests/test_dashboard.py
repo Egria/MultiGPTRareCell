@@ -109,6 +109,11 @@ def test_http_restart_cancel_and_download(tmp_path):
             turn = json.loads(call(diag_path + "/turn/1"))
             assert turn["commands"][0]["action"] == "list_candidates" and turn["message"]["raw"]
             assert turn["receipts"][0]["result"]["candidates"]
+            with pytest.raises(error.HTTPError) as private:
+                call(diag_path + "/transcript", key=False)
+            assert private.value.code == 401
+            text = call(diag_path + "/transcript").decode()
+            assert "T0001" in text and "策略原始输出" in text and "已保存决策" in text and "submit" in text
             linked = json.loads(call("/api/tasks", {"kind":"inspect", "run":data["run_path"]}))["id"]
             assert jobs.get_task(root, linked)["status"] == "linked"
             assert json.loads(call("/api/tasks", {"kind":"inspect", "run":data["run_path"]}))["id"] == linked
@@ -184,9 +189,51 @@ def test_diagnostics_keep_recorded_rejections_pages_and_fallback(tmp_path, monke
     rejected = first[0]["actions"][0]
     assert rejected["action"] is None and not rejected["changed"] and "unknown_option" in rejected["error"]
     assert diagnostics(queue, task, turn=1)["message"]["raw"] == raw
+    from rarecell.dashboard_transcript import transcript
+    tag, body = transcript(queue, task)
+    assert body.count("── T".encode()) == 13 and b"T0013" in body and b"unknown_option" in body
+    assert transcript(queue, task, tag) == (tag, None)
     with jobs.database(queue) as db:
         assert db.execute("SELECT COUNT(*) FROM tasks WHERE status='queued'").fetchone()[0] == 0
     (run / "state.sqlite").rename(run / "saved.sqlite")
     archived = diagnostics(queue, task)
     assert not archived["trace"].get("turns") and archived["summary"]["detail"] == "stalled"
     assert not (run / "state.sqlite").exists()
+
+
+def test_transcript_of_pending_and_retried_dispatch(tmp_path):
+    from rarecell.dashboard_transcript import transcript
+    from rarecell.state import State
+
+    root, run = tmp_path / "queue", tmp_path / "run"
+    jobs.initialize(root)
+    run.mkdir()
+    mid = "run1:T0001"
+    (run / "checkpoint.json").write_text(json.dumps({"run_id": "run1", "policy": "live",
+                                                    "annotations": str(tmp_path / "labels")}))
+    tid = jobs.submit(root, tmp_path, {"kind": "inspect", "run": str(run)})
+    task = jobs.get_task(root, tid)
+    db = State(run, tmp_path / "cache")
+    try:
+        db.set_meta("run_id", "run1")
+        context_ref = db.artifact({"candidate_id": "Hx", "turn_instruction": "inspect"})
+        attempt = mid + "/api/1"
+        db.put("ProviderDispatch", attempt, {"id": attempt, "message_id": mid, "context_ref": context_ref})
+        tag, body = transcript(root, task)
+        assert b"T0001" in body and b"turn_instruction" in body and "尚无已保存的回复".encode() in body
+        db.put("ProviderFailure", attempt, {"id": attempt, "status": "temporary_failure", "detail": "HTTP 503"})
+        second = mid + "/api/2"
+        db.put("ProviderDispatch", second, {"id": second, "message_id": mid, "context_ref": context_ref})
+        db.put("Message", mid, {"message_id": mid, "raw": "response text", "complete": True,
+                                "usage": {"total_tokens": 53}})
+        new_tag, body = transcript(root, task, tag)
+        assert tag != new_tag and all(item in body for item in [b"/api/1", b"/api/2", b"HTTP 503", b"response text", b"total_tokens"])
+        batch = tmp_path / "labels" / "batches" / ("f" * 64)
+        batch.mkdir(parents=True)
+        (batch / "request.json").write_text('{"groups":[{"candidate_id":"H-ann"}]}')
+        (batch / "response.json").write_text('{"raw_response":"recorded annotation","prompt":"original prompt","rows":[]}')
+        (batch / "response.json.failure.json").write_text('{"reason":"former failure"}')
+        _, body = transcript(root, task, new_tag)
+        assert all(item in body for item in [b"recorded annotation", b"original prompt", b"H-ann", b"former failure"])
+    finally:
+        db.close()

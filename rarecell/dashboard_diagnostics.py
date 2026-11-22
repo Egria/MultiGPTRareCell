@@ -53,13 +53,17 @@ def meta(db, key, default=None):
     return json.loads(row[0]) if row else default
 
 
-def turn_page(db, page):
+def turn_count(db):
     finished = meta(db, "finished_turn", 0)
     run_id = meta(db, "run_id")
     pending_id = f"{run_id}:T{finished+1:04d}"
     pending = db.execute("SELECT 1 FROM record WHERE (kind='Message' AND id=?) OR "
                          "(kind='ProviderDispatch' AND id=?)", (pending_id, pending_id + "/api/1")).fetchone()
-    total = finished + int(bool(pending))
+    return finished + int(bool(pending))
+
+
+def turn_page(db, page):
+    total = turn_count(db)
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(page or pages, pages)
     first = (page - 1) * PAGE_SIZE + 1
@@ -94,8 +98,10 @@ def turn_page(db, page):
 def turn_detail(db, number):
     mid = f"{meta(db, 'run_id')}:T{number:04d}"
     msg = record(db, "Message", mid)
-    attempts = [record(db, "ProviderFailure", mid + f"/api/{i}") for i in (1, 2)]
-    if not msg and not record(db, "ProviderDispatch", mid + "/api/1"):
+    dispatches = [record(db, "ProviderDispatch", mid + f"/api/{i}") for i in (1, 2)]
+    dispatches = [item for item in dispatches if item]
+    failures = [record(db, "ProviderFailure", item["id"]) for item in dispatches]
+    if not msg and not dispatches:
         raise KeyError("该轮次没有记录")
     commands = []
     if msg:
@@ -108,16 +114,25 @@ def turn_detail(db, number):
     receipts = {}
     for key, body in db.execute("SELECT id,body FROM record WHERE kind='Receipt' AND id>=? AND id<?",
                                 (mid + "/", mid + "0")):
-        receipts[int(key.rsplit("/", 1)[1])] = json.loads(body)["result"]
-    return {"message": fields(msg, "raw complete usage"), "commands": commands,
-            "receipts": [dict(index=i, result=receipts[i]) for i in sorted(receipts)],
-            "failures": [fields(a, "status detail") for a in attempts if a]}
+        receipts[int(key.rsplit("/", 1)[1])] = fields(json.loads(body), "result progress metadata")
+    return {"message": fields(msg, "message_id raw complete usage"), "commands": commands,
+            "receipts": [dict(index=i, **receipts[i]) for i in sorted(receipts)],
+            "dispatches": dispatches, "failures": [fields(a, "id status detail") for a in failures if a]}
 
 
-def diagnostics(root, task, page=None, turn=None):
+def task_locations(root, task):
     run = jobs.run_path(root, task)
     dest = root / task["id"]
     base = dest / "demo" if task["kind"] == "demo" else dest
+    checkpoint = optional_json(run / "checkpoint.json") if run else {}
+    spec = task["spec"]
+    ann_dir = Path(spec.get("annotations") or checkpoint.get("annotations") or
+                   base / ("annotation" if task["kind"] == "demo" else "annotations"))
+    return run, base, checkpoint, ann_dir
+
+
+def diagnostics(root, task, page=None, turn=None):
+    run, base, checkpoint, ann_dir = task_locations(root, task)
     db_path = run / "state.sqlite" if run else None
     trace = {}
     if db_path and db_path.is_file():
@@ -133,13 +148,9 @@ def diagnostics(root, task, page=None, turn=None):
                 raise ValueError(trace["notice"]) from exc
     elif turn is not None:
         raise KeyError("逐轮状态库尚不可用")
-    checkpoint = optional_json(run / "checkpoint.json") if run else {}
-    spec = task["spec"]
-    snapshot = Path(spec.get("snapshot") or checkpoint.get("snapshot") or base / "snapshot")
-    ann_dir = Path(spec.get("annotations") or checkpoint.get("annotations") or
-                   base / ("annotation" if task["kind"] == "demo" else "annotations"))
+    snapshot = Path(task["spec"].get("snapshot") or checkpoint.get("snapshot") or base / "snapshot")
     summary = optional_json(run / "run_summary.json") if run else {}
-    config_path = run / "config_resolved.yaml" if run else dest / "settings.yaml"
+    config_path = run / "config_resolved.yaml" if run else root / task["id"] / "settings.yaml"
     cfg = (yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}) if config_path.is_file() else {}
     manifest = optional_json(run / "manifest.json") if run else {}
     manifest = manifest or optional_json(snapshot / "manifest.json")

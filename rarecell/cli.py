@@ -123,7 +123,7 @@ def dispatch(a, default_model=""):
             save_project_model(Path.cwd(), a.value)
         return {"model": project_model(Path.cwd())}
     if cmd == "ui":
-        from .dashboard import serve
+        from .dashboard_reload import serve
         return serve(a.workspace, a.port)
     if cmd == "resume":
         return resume(a.run, a.retry_unknown)

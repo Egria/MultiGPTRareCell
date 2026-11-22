@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-ui-revision="__UI_REVISION__">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
@@ -206,6 +206,16 @@
           <button id="diag-refresh" class="secondary">刷新诊断</button>
         </div></div>
         <div id="diag-overview"></div>
+        <section aria-labelledby="transcript-title">
+          <div class="transcript-tools">
+            <h3 id="transcript-title">完整 LLM 行为记录</h3>
+            <button class="secondary" id="transcript-copy" disabled>复制全文</button>
+            <button class="secondary" id="transcript-save" disabled>下载 TXT</button>
+            <button class="secondary" id="transcript-print" disabled>打印</button>
+          </div>
+          <p id="transcript-status" role="status" class="sub"></p>
+          <pre id="transcript" tabindex="0" aria-labelledby="transcript-title"></pre>
+        </section>
         <section aria-labelledby="trace-title">
           <h3 id="trace-title">逐轮动作与回执</h3>
           <div id="diag-turns"></div>

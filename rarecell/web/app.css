@@ -694,3 +694,19 @@ dd {
 }
 #diagnostics dl { margin-bottom: 12px; }
 #diag-pager { justify-content: center; padding: 12px 0; }
+
+.transcript-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.transcript-tools h3 { margin-right: auto; }
+#transcript { max-height: 50vh; white-space: pre-wrap; overflow-wrap: anywhere; overflow: auto; }
+@media print {
+  body:has(#diagnostics[open]) > :not(#diagnostics),
+  #diagnostics .dialog-head, #diagnostics .dialog-foot, #diagnostics .diag-toolbar,
+  #diag-overview, #diagnostics section[aria-labelledby="trace-title"],
+  #transcript-status, .transcript-tools button { display: none !important; }
+  html, body:has(#diagnostics[open]), #diagnostics[open], #diagnostics .detail-body, #transcript {
+    position: static; display: block; width: auto; height: auto; max-height: none; max-width: none;
+    overflow: visible; margin: 0; padding: 0; box-shadow: none; border: 0;
+  }
+  #diagnostics::backdrop { background: transparent; }
+  #transcript { color: black; background: white; font: 9pt/1.4 monospace; white-space: pre-wrap; }
+}
