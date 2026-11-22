@@ -333,6 +333,11 @@ class Science:
                                  signature_genes=[r["gene_id"] for r in signature])
         if self.adaptive:
             valid = self.rna_valid & np.isfinite(structure)
+            # Floating-point dot products can exceed 1 by an ulp. Every
+            # reported component must be a valid threshold for apply_boundary.
+            for component in (scores, expression, structure, pos_score):
+                if component is not None:
+                    np.clip(component, 0.0, 1.0, out=component)
             ordered = _rank(np.flatnonzero(valid), scores, self.barcodes, self.cells)
             result["ranking"] = [{"cell_id": str(self.cells[i]), "score": float(scores[i]),
                                   "expression": float(expression[i]), "structure": float(structure[i]),

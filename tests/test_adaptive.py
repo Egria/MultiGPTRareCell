@@ -120,6 +120,9 @@ def test_minimal_sparse_adaptive_seed_to_final_partition(tmp_path):
         expansion = ctrl.state.get("Receipt","run:T0001/0")["result"]
         assert expansion["added_count"] == 2 and len(ctrl.candidate(expansion["candidate_id"])["members"]) == 3
         ev = expansion["evidence_id"]
+        ranked = act(ctrl, "get_evidence", evidence_ids=[ev])["sections"]["ranking"]["rows"]
+        assert all(0 <= row[metric] <= 1 for row in ranked
+                   for metric in ("score", "expression", "positive_expression") if row[metric] is not None)
         gap = expansion["summary"]["rank_gaps"][0]
         cutoff = (gap["upper"] + gap["lower"]) / 2
         args = dict(candidate_id=seed, metric="score", threshold=cutoff, evidence_ids=[ev], reason="Use largest rank gap")
