@@ -251,3 +251,10 @@ def test_duplicate_integer_entries_preserve_counts_and_reject_overflow(tmp_path)
     write([2**63, 2**63, 1], np.uint64)
     with pytest.raises(ValueError, match="storage range"):
         read_dataset(path)
+
+
+def test_fractional_linear_assay_is_normalised_without_count_layer(tmp_path):
+    values = np.array([[0.1, 0.3], [0., 0.]])
+    ds = read_dataset(fixture(tmp_path / "linear", values, spec={"layer": "linear_expression"}))
+    assert ds.raw is None
+    np.testing.assert_allclose(ds.x.toarray(), [[np.log1p(2500), np.log1p(7500)], [0., 0.]])

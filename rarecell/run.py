@@ -261,7 +261,9 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
             s.set_meta("closing_turn", closing_turn)
         # A fresh invocation reconstructs context or replays a persisted full message.
         cap = ctrl.budget.get("max_reported_tokens", 0)
-        if cap and policy == "live":
+        # Budget gates the next dispatch. A reply checkpointed before an
+        # interruption is already paid for and must still be applied.
+        if cap and policy == "live" and lookup(s, "Message", "%s:T%04d" % (s.get_meta("run_id"), turn)) is None:
             token_counts = [m["usage"].get("total_tokens") for m in s.all("Message")]
             if any(n is None for n in token_counts) or sum(token_counts) >= cap:
                 detail = "token_usage_unreported" if any(n is None for n in token_counts) else "max_reported_tokens"
@@ -298,13 +300,18 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
     # produces no submission, or when the call/token budget precludes the turn.
     terminal_stall = detail == "stalled" or (
         ctrl.stall_review() and detail in {"max_agent_turns", "max_reported_tokens", "token_usage_unreported"})
-    if ctrl.adaptive and terminal_stall and s.get_meta("selected", []) and not s.get_meta("submitted", False):
+    budget_stop = detail in {"max_agent_turns", "max_reported_tokens", "token_usage_unreported"}
+    if ctrl.adaptive and (terminal_stall or budget_stop) and s.get_meta("selected", []) and not s.get_meta("submitted", False):
+        source = "controller_stall" if terminal_stall else "controller_budget"
         with s.transaction():
             outcome = ctrl.decide("submit", {"status": "provisional", "reason":
-                "Publish the saved working selection after stalled exploration."}, None, source="controller_stall")
+                "Publish the saved working selection after " + detail + "."}, None, source=source)
+            s.set_meta("closeout_trigger", detail)
             s.event("provisional_submission", {"decision_id": outcome["decision_id"], "trigger": detail})
     if s.get_meta("submission_source") == "controller_stall":
         return "partial", "stalled_provisional"
+    if s.get_meta("submission_source") == "controller_budget":
+        return "partial", detail
     return status, detail
 
 
@@ -370,6 +377,8 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
             s.event(detail, {"reason": annotation_detail})
         elif s.get_meta("submission_source") == "controller_stall":
             status, detail = "partial", "stalled_provisional"
+        elif s.get_meta("submission_source") == "controller_budget":
+            status, detail = "partial", s.get_meta("closeout_trigger")
         elif s.get_meta("submitted", False):
             status, detail = "complete", "submitted"
         else:

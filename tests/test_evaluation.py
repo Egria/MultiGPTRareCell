@@ -165,3 +165,37 @@ def test_sparse_matching_matches_dense_reference():
                            for b, nb in pred_sizes.items()] for a, na in target_sizes.items()])
         i, j = linear_sum_assignment(exact, maximize=True)
         assert score["macro_f1"] == pytest.approx(exact[i, j].sum() / len(target_sizes))
+
+
+def test_target_references_score_only_callable_members(tmp_path):
+    from rarecell.evaluation import _target_reference, _target_scores
+    fields = ["cell_id", "target_id", "reference_kind", "state"]
+    path = tmp_path / "gt.tsv"
+    path.write_text("\t".join(fields) + "\n" +
+                    "\n".join(f"{cell}\tMAIT\tVJ\t{state}" for cell, state in zip("abcde",
+                    ["positive", "positive", "negative", "unknown", "disputed"])) + "\n")
+    target = _target_reference(path)
+    scores = _target_scores(target, dict(zip("abcde", "xxzxx")))
+    row = scores["per_target"][0]
+    assert (row["tp"], row["fp"], row["fn"], row["n_callable"], row["f1"]) == (2, 0, 0, 3, 1)
+    assert scores["ari"] is None and row["n_unknown"] == row["n_disputed"] == 1
+    with pytest.raises(ValueError, match="Cell IDs"):
+        _target_scores(target, {"a": "x"})
+    target["MAIT", "VJ"]["a"] = target["MAIT", "VJ"]["b"] = "unknown"
+    assert _target_scores(target, dict(zip("abcde", "xxzxx")))["per_target"][0]["f1"] is None
+
+
+def test_target_input_through_frozen_evaluator(tmp_path):
+    run, _ = scoring_fixture(tmp_path)
+    gt = tmp_path / "targets-source.tsv"
+    with (run / "partition.tsv").open() as f:
+        cells = [r["cell_id"] for r in csv.DictReader(f, delimiter="\t")]
+    rows = [{"cell_id": c, "target_id": "CP", "reference_kind": "source_membership",
+             "state": "positive" if i >= 8 else "unknown" if i == 0 else "negative"} for i, c in enumerate(cells)]
+    write_tsv(gt, rows, list(rows[0]))
+    metrics = evaluate(run, gt, tmp_path / "evaluation")
+    assert metrics["reference_profile"] == "target_membership"
+    final = metrics["submitted_partition"]["per_target"][0]
+    assert final["f1"] == 1 and final["n_callable"] == 9
+    assert metrics["baselines"][0]["per_target"] == [final]
+    assert evaluate(run, gt, tmp_path / "evaluation") == metrics

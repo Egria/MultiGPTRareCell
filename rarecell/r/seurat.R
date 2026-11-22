@@ -10,12 +10,18 @@ emit <- function(x, filename, cols=FALSE) {
   write.table(x, file=path(filename), row.names=FALSE, col.names=cols, quote=FALSE, sep="\t")
 }
 if (mode == "pca") {
-  counts <- as(readMM(path("counts.mtx")), "CsparseMatrix")
-  rownames(counts) <- paste0("G", seq_len(nrow(counts)))
-  colnames(counts) <- paste0("C", seq_len(ncol(counts)))
-  obj <- CreateSeuratObject(counts, min.cells=0, min.features=0)
-  obj <- NormalizeData(obj, scale.factor=as.numeric(args[6]), verbose=FALSE)
-  obj <- FindVariableFeatures(obj, selection.method="vst",
+  expr <- as(readMM(path("expression.mtx")), "CsparseMatrix")
+  rownames(expr) <- paste0("G", seq_len(nrow(expr)))
+  colnames(expr) <- paste0("C", seq_len(ncol(expr)))
+  if (args[[8]] == "linear_expression") {
+    obj <- CreateSeuratObject(CreateAssay5Object(data=expr), assay="RNA")
+    selection <- "dispersion"
+  } else {
+    obj <- CreateSeuratObject(expr, min.cells=0, min.features=0)
+    obj <- NormalizeData(obj, scale.factor=as.numeric(args[6]), verbose=FALSE)
+    selection <- "vst"
+  }
+  obj <- FindVariableFeatures(obj, selection.method=selection,
     nfeatures=min(as.integer(args[3]), nrow(obj)), verbose=FALSE)
   genes <- VariableFeatures(obj)
   # Counts of zero/constant genes can yield uninformative features. RunPCA
@@ -31,7 +37,7 @@ if (mode == "pca") {
   # errors when checking NULL for either of these optional transformations.
   obj <- RunPCA(obj, features=names(var_ok)[var_ok], npcs=pcs, seed.use=as.integer(args[5]),
                 scale=FALSE, shift=FALSE, verbose=FALSE)
-  emit(Embeddings(obj, "pca")[colnames(counts), , drop=FALSE], "pca.tsv")
+  emit(Embeddings(obj, "pca")[colnames(expr), , drop=FALSE], "pca.tsv")
   emit(sub("^G", "", genes), "hvg_indices.tsv")
   loadings <- Loadings(obj[["pca"]])
   emit(data.frame(gene_index=as.integer(sub("^G","",rownames(loadings))),loadings),

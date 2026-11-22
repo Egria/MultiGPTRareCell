@@ -2,6 +2,8 @@
 
 输入是非负有限的 CSR。以稳定 cell_id 和 gene_id 排序后处理，原始行列与 manifest 在排序时同步。counts 的行按原总量缩放到 10000 再取 log1p，全零行保留。已归一化输入必须声明 log1p_normalized；直接使用该层。Seurat VST 分支要求实际 counts。
 
+公开基准的非整数线性表达（Villani TPM、Human PGC、GSE156490）可声明为 `linear_expression`。按行总量归一化并取 log1p，Seurat 在 data 层执行 dispersion 筛选，prepare manifest 和发现证据记录选择方法。导出的输入保留原值，此分支不生成 raw.npz。
+
 * V_LINEAR 使用整个 log1p 层做行 L2 归一化，scikit-learn SparseRandomProjection(density="auto")，默认 128 维，并按行 L2 归一化输出。
 * V_TENSOR2 对同一全基因单位向量运行 PolynomialCountSketch(degree=2,gamma=1,coef0=0)，默认 256 维，然后按行 L2 归一化。变换分块写入 cells × dimension 的磁盘数组。对非负单位输入，s、s²、αs+(1−α)s²（0≤α≤1）的精确排序相同；有限维近似、归一化、边权和随机性均可影响图。表示间一致仅表明同一数据的分析结果相近。
 * V_GINI 是本项目的稀疏选择器。n 个观测中将每个基因的非零值排序，赋以考虑前置零的秩 r；G=Σ(2r−n−1)x/[nΣx]。拟合变量为 log2(max(x)+0.1)，参考 GiniClust3 的两轮最大表达校正。把相同/邻近协变量归至最多 64 个分位箱（每箱目标至少 8 个基因；相同边界合并），对箱中位数插值；排除第一轮残差高于 75% 分位的基因后重新拟合，端点恒定外推。取可变基因中残差最高的前 n_features 个，平票按 gene_id。保留每个基因的 G、检出比例、拟合值和残差。本实现以稀疏闭式 Gini、分箱趋势、效应排序替代作者的 dense + ε、LOWESS 和残差正态尾概率。没有运行 GiniClust3 consensus。用稀疏隐式中心化、每个所选基因除以样本标准差的 ARPACK SVD 得到 PCA 得分，保留载荷和均值/尺度。
@@ -21,6 +23,6 @@ manifest.json 中 initial_evidence_hash 是全部已冻结科学文件的内容�
 
 ## 主 Agent 对预计算结果的读取
 
-每个实验组都登记相同的两种 Seurat 初始观察。全局 `global_feature_selection` 给出实际 VST 特征列表的 evidence_id；候选卡的 `seurat_wilcoxon` 列出该细胞集合在相应分辨率的实际正向 Wilcoxon marker 表及 evidence_id，和描述性均值差字段 `markers` 分开。小于 3 个成员或不足 3 个参考细胞时没有群体 DE 表。各组都能在 `get_evidence` 中传入单个 evidence_id、offset、limit 分页读取已冻结的基因、效应、检出率和 P 值；只读操作不产生科学查询。背景是所有非零输入细胞中该群之外的成员。每张表保留来源文件哈希、集合哈希和上游选择依赖。跨分辨率的完全相同对照及数值结果共用一项观察。OntoAnno 解释按 partition_id 和其输入 marker_hash 绑定到具体 DE 观察。
+每个实验组都登记相同的两种 Seurat 初始观察。全局 `global_feature_selection` 给出该输入对应的 VST 或 dispersion 特征列表的 evidence_id；候选卡的 `seurat_wilcoxon` 列出该细胞集合在相应分辨率的实际正向 Wilcoxon marker 表及 evidence_id，和描述性均值差字段 `markers` 分开。小于 3 个成员或不足 3 个参考细胞时没有群体 DE 表。各组都能在 `get_evidence` 中传入单个 evidence_id、offset、limit 分页读取已冻结的基因、效应、检出率和 P 值；只读操作不产生科学查询。背景是所有非零输入细胞中该群之外的成员。每张表保留来源文件哈希、集合哈希和上游选择依赖。跨分辨率的完全相同对照及数值结果共用一项观察。OntoAnno 解释按 partition_id 和其输入 marker_hash 绑定到具体 DE 观察。
 
 每个初始候选在每张可用 SNN 独立取得结构摘要，保存在 initial.jsonl 的 structure、候选证据和各实验组的候选卡中。以该视角 graph_rows 中实际存在的候选成员集合 S 计算：分子为从 S 出发、也终止于 S 的权重和；分母为从 S 出发的全部权重和。两项均排除自环。无向图内部边在分子和分母各算两次，向外的边在分母算一次。分母为零时 within_fraction 为 null。graph_coverage 是候选成员在该图有节点的比例，n_zero_degree 只计已表示且排除自环后度为零的节点。图未生成时使用 graph_unavailable。同一输入的多个视角可供比较，这些数值本身不增加独立验证次数。计算只发生在 prepare。

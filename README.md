@@ -2,6 +2,10 @@
 
 在完整稀疏 scRNA-seq 矩阵上发现稀有群体的成员。程序先冻结多视角聚类、差异表达、singleton 和 outlier 证据，再由一个 Discovery Agent 查询、扩展和修订候选。每个输入 cell_id 在最终 partition 中占一行。科学效果与工程验证的实际结果见 [VALIDATION_REPORT.md](VALIDATION_REPORT.md)。
 
+## Single-agent 基准数据
+
+九个真实基准的来源、下载包目录、DCC 在线组装和 GUI 字段见[数据使用说明](SINGLE_AGENT_DATASETS.md)。PBMC-TCR 默认导入原来的五个 MAIT 丰度 view，CellSIUS 默认导入六个主条件。
+
 ## 安装与第一次运行
 
 适用于 Linux CPU 和 Slurm 计算节点。已验证 Python 3.9.25 和 3.12.14。项目在独立目录安装，不接管原有 LLMRareCell 项目。解压后执行以下命令。虚拟环境名称可自行更改。

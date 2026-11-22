@@ -7,6 +7,7 @@ from .config import fingerprint
 
 
 HVG = "seurat_vst_features"
+DISPERSION = "seurat_dispersion_features"
 DE = "seurat_wilcoxon_markers"
 NUMERIC = ("avg_log2FC", "pct.1", "pct.2", "p_val", "p_val_adj")
 
@@ -43,13 +44,15 @@ class FrozenSeurat:
                              if r["zero_expression"] == "0")
         self.universe_size = len(informative)
         self.universe_hash = fingerprint(informative)
-        descriptor = {"statistic": HVG, "n_features": len(genes), "selection_method": "vst",
+        selection = stages["V_HVG"].get("selection_method", "vst")
+        statistic = DISPERSION if selection == "dispersion" else HVG
+        descriptor = {"statistic": statistic, "n_features": len(genes), "selection_method": selection,
                       "n_informative": self.universe_size, "source_sha256": files["seurat/hvg.tsv"],
                       "population_qc_sha256": files["cell_qc.tsv"]}
-        self.hvg = self.register(HVG, [], self.universe_hash, descriptor, genes,
+        self.hvg = self.register(statistic, [], self.universe_hash, descriptor, genes,
                                  "Seurat/5.3.0 FindVariableFeatures", "exploration")
         ctrl.state.set_meta("global_hvg", {"evidence_id": self.hvg, "n_features": len(genes),
-                                          "statistic": HVG, "first_features": genes[:3]})
+                                          "statistic": statistic, "first_features": genes[:3]})
         if stages.get("seurat_markers", {}).get("status") == "ok":
             self.index_file()
 
@@ -144,7 +147,7 @@ def prepared_page(state, card, offset, limit):
         raise ValueError("Prepared observation artifact mismatch")
     data = state.read_artifact(ref)
     name = binding["statistic"]
-    if data["statistic"] != name or name not in (DE, HVG):
+    if data["statistic"] != name or name not in (DE, HVG, DISPERSION):
         raise ValueError("Unknown prepared observation table")
     rows = data["rows"]
     return {"evidence_id": card["evidence_id"], "offset": offset, "limit": limit, "status": "ok",

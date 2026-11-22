@@ -193,14 +193,49 @@ def _best(gt, members, candidates):
     return best
 
 
-def evaluate(run: Path, gt: Path, out: Path):
-    run, gt, out = map(lambda p: Path(p).resolve(), (run, gt, out))
-    if _inside(gt, run) or _inside(out, run) or _inside(run, out):
-        raise ValueError("Ground truth and evaluation output must be outside the discovery run")
-    frozen, digest = _verified(run)
-    gt_hash = _sha(gt)
-    truth = read_truth(gt)
-    part = _indexed(_read(run / "partition.tsv", {"cell_id", "group_id", "status"}), "cell_id")
+def _target_reference(path):
+    targets = defaultdict(dict)
+    for row in _read(path, {"cell_id", "target_id", "reference_kind", "state"}):
+        target = targets[row["target_id"], row["reference_kind"]]
+        cell, state = row["cell_id"], row["state"]
+        if cell in target or state not in {"positive", "negative", "unknown", "disputed"}:
+            raise ValueError("Duplicate cell or invalid state in target membership reference")
+        target[cell] = state
+    if not targets:
+        raise ValueError("Empty target membership reference")
+    return targets
+
+
+def _target_scores(targets, predictions):
+    scores = []
+    groups = set(predictions.values())
+    for (target, kind), states in sorted(targets.items()):
+        if states.keys() != predictions.keys():
+            raise ValueError(f"Cell IDs differ for target {target}")
+        support = Counter(states.values())
+        positive = support["positive"]
+        sizes, hits = Counter(), Counter()
+        for cell, state in states.items():
+            if state in {"positive", "negative"}:
+                group = predictions[cell]
+                sizes[group] += 1
+                if state == "positive":
+                    hits[group] += 1
+        # Optimistic matching independently within each callable target endpoint.
+        group = min(hits, key=lambda g: (-hits[g] / (sizes[g] + positive), g), default=None)
+        tp, n = hits[group], sizes[group]
+        scores.append(dict(target=target, reference_kind=kind, group_id=group, n_target=positive,
+                           n_callable=positive + support["negative"], n_unknown=support["unknown"],
+                           n_disputed=support["disputed"], n_pred=n, tp=tp, fp=n-tp, fn=positive-tp,
+                           precision=tp/n if n else None, recall=tp/positive if positive else None,
+                           f1=2*tp/(n+positive) if positive else None))
+    defined = [r["f1"] for r in scores if r["f1"] is not None]
+    return dict(matching="best_group_per_target_on_callable_cells", per_target=scores, ari=None, nmi=None,
+                macro_f1=sum(defined)/len(defined) if defined else None, n_cells=len(predictions),
+                n_groups=len(groups), extra_groups=sorted(groups - {r["group_id"] for r in scores}))
+
+
+def _fine_evaluation(run, truth, part):
     final = _partition_scores(truth, {c: r["group_id"] for c, r in part.items()})
     meta, members = _candidates(run, truth)
     for cell, row in part.items():
@@ -243,13 +278,38 @@ def evaluate(run: Path, gt: Path, out: Path):
             revisions.append({"candidate_id": cid, "cell_id": cell, "target": truth[cell],
                               "operation": "add" if cell in members[cid] else "remove",
                               "submitted_candidate_for_cell": part[cell].get("candidate_id") == cid})
+    tables = {"candidate_diagnostics.tsv": (diagnostics, list(diagnostics[0])),
+              "new_members.tsv": (recovered, ["target", "cell_id", "initial_comparator", "final_group"]),
+              "revision_changes.tsv": (revisions, ["candidate_id", "cell_id", "target", "operation", "submitted_candidate_for_cell"])}
+    return final, tables, {"n_candidates": len(meta), "n_initial_candidates": len(initial_ids),
+                           "offline_single_candidate_diagnostics": diagnostics}
+
+
+def evaluate(run: Path, gt: Path, out: Path):
+    run, gt, out = map(lambda p: Path(p).resolve(), (run, gt, out))
+    if _inside(gt, run) or _inside(out, run) or _inside(run, out):
+        raise ValueError("Ground truth and evaluation output must be outside the discovery run")
+    frozen, digest = _verified(run)
+    gt_hash = _sha(gt)
+    part = _indexed(_read(run / "partition.tsv", {"cell_id", "group_id", "status"}), "cell_id")
+    with gt.open(encoding="utf8", newline="") as stream:
+        target_profile = {"target_id", "reference_kind", "state"} <= set(next(csv.reader(stream, delimiter="\t"), []))
+    if target_profile:
+        truth = _target_reference(gt)
+        scorer = _target_scores
+        final = scorer(truth, {c: row["group_id"] for c, row in part.items()})
+        extra_tables, extra_metrics = {}, {"reference_profile": "target_membership"}
+    else:
+        truth = read_truth(gt)
+        scorer = _partition_scores
+        final, extra_tables, extra_metrics = _fine_evaluation(run, truth, part)
     baseline_rows = defaultdict(dict)
     for row in _read(run / "artifacts/baselines.tsv", {"view", "resolution", "cell_id", "group_id"}):
         group = baseline_rows[row["view"], row["resolution"]]
         if row["cell_id"] in group:
             raise ValueError("Duplicate cell in baseline")
         group[row["cell_id"]] = row["group_id"]
-    baselines = [{"view": v, "resolution": r, **_partition_scores(truth, pred)}
+    baselines = [{"view": v, "resolution": r, **scorer(truth, pred)}
                  for (v, r), pred in sorted(baseline_rows.items())]
     status_counts = Counter(row["status"] for row in part.values())
     summary = {
@@ -258,11 +318,10 @@ def evaluate(run: Path, gt: Path, out: Path):
         "gt_sha256": gt_hash, "submitted_partition": final,
         "status_counts": dict(sorted(status_counts.items())),
         "unresolved_fraction": status_counts["unresolved"] / len(part),
-        "n_candidates": len(meta), "n_initial_candidates": len(initial_ids),
-        "offline_single_candidate_diagnostics": diagnostics, "baselines": baselines,
+        **extra_metrics, "baselines": baselines,
         "usage": _json(run / "usage.json"), "run_summary": _json(run / "run_summary.json"),
     }
-    tables = ["targets.tsv", "candidate_diagnostics.tsv", "new_members.tsv", "revision_changes.tsv", "metrics.json"]
+    tables = ["targets.tsv", *extra_tables, "metrics.json"]
     if any((out / name).resolve() == gt for name in tables):
         raise ValueError("Evaluation output would overwrite the GT table")
     run_snapshot = summary["run_summary"].get("snapshot_hash")
@@ -275,10 +334,8 @@ def evaluate(run: Path, gt: Path, out: Path):
     stage = Path(tempfile.mkdtemp(dir=out.parent, prefix=".evaluation-"))
     try:
         _table(stage / "targets.tsv", final["per_target"], list(final["per_target"][0]))
-        _table(stage / "candidate_diagnostics.tsv", diagnostics, list(diagnostics[0]))
-        _table(stage / "new_members.tsv", recovered, ["target", "cell_id", "initial_comparator", "final_group"])
-        _table(stage / "revision_changes.tsv", revisions,
-               ["candidate_id", "cell_id", "target", "operation", "submitted_candidate_for_cell"])
+        for filename, (rows, fields) in extra_tables.items():
+            _table(stage / filename, rows, fields)
         _json_write(stage / "metrics.json", summary)
         try:
             # Atomic installation also works over an empty directory on POSIX.
@@ -337,7 +394,8 @@ def aggregate(plan: Path, out: Path):
         for row in m["submitted_partition"]["per_target"]:
             values["target_f1/" + row["target"]] = row["f1"]
         for name, value in values.items():
-            bucket[arm, name].append(value)
+            if value is not None:
+                bucket[arm, name].append(value)
         records.append({"replication_id": rid, "arm": arm, "status": "scored",
                         "run_status": run_status, "run_id": run_id,
                         "recorded_replication_id": run_info.get("replication_id"),
