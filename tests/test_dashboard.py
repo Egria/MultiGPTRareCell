@@ -98,6 +98,25 @@ def test_http_restart_cancel_and_download(tmp_path):
                     break
                 time.sleep(.15)
             assert data["status"] == "succeeded", data["log"]
+            diag_path = "/api/tasks/" + tid + "/diagnostics"
+            with pytest.raises(error.HTTPError) as private:
+                call(diag_path + "/turn/1", key=False)
+            assert private.value.code == 401
+            diag = json.loads(call(diag_path))
+            assert diag["trace"]["turns"][0]["actions"][0]["action"] == "list_candidates"
+            assert diag["summary"]["submitted"] and diag["evaluation"]["targets"]
+            assert "raw" not in diag["trace"]["turns"][0]
+            turn = json.loads(call(diag_path + "/turn/1"))
+            assert turn["commands"][0]["action"] == "list_candidates" and turn["message"]["raw"]
+            assert turn["receipts"][0]["result"]["candidates"]
+            linked = json.loads(call("/api/tasks", {"kind":"inspect", "run":data["run_path"]}))["id"]
+            assert jobs.get_task(root, linked)["status"] == "linked"
+            assert json.loads(call("/api/tasks", {"kind":"inspect", "run":data["run_path"]}))["id"] == linked
+            linked_diag = json.loads(call("/api/tasks/" + linked + "/diagnostics"))
+            assert linked_diag["trace"] == diag["trace"]
+            assert linked_diag["evaluation"] == diag["evaluation"]
+            with pytest.raises(error.HTTPError):
+                call(diag_path + "/turn/999")
             assert jobs.get_task(root, old)["status"] == "interrupted"
             assert len(call("/api/tasks/" + tid + "/files/partition.tsv").splitlines()) == 161
             with pytest.raises(error.HTTPError):
@@ -136,3 +155,38 @@ def test_pipeline_reports_missing_live_credential_without_substitution(tmp_path,
     assert task["status"] == "partial" and task["detail"] == "provider_blocked"
     assert task["resumable"] and task["metrics"]["provider_dispatches"] == 0
     assert "manifest.json" in task["files"] and not (root / tid / "annotations").exists()
+
+
+def test_diagnostics_keep_recorded_rejections_pages_and_fallback(tmp_path, monkeypatch):
+    from rarecell.dashboard_diagnostics import diagnostics
+    from rarecell.evaluation import evaluate
+
+    queue, run = tmp_path / "tasks", tmp_path / "run"
+    jobs.initialize(queue)
+    dataset = generate(tmp_path / "fixture", 1009)
+    cfg = config(override={"mode": "A2", "prepare": {"views": ["V_LINEAR"], "graph_backend": "igraph"},
+                           "provider": {"kind": "scripted_demo"}, "budget": {"stall_turns": 13, "max_agent_turns": 16}})
+    snapshot = tmp_path / "snapshot"
+    prepare(dataset, snapshot, cfg)
+    raw = '{"action":"expand_candidate","unknown_option":1}'
+    monkeypatch.setattr("rarecell.run.offline_message", lambda *args: raw)
+    assert discover(snapshot, run, tmp_path / "cache", cfg, policy="scripted_demo")["detail"] == "stalled"
+    evaluate(run, tmp_path / "fixture/evaluation_fixture/gt.tsv", tmp_path / "evaluation")
+    tid = jobs.submit(queue, tmp_path, {"kind":"inspect", "run":str(run)})
+    task = jobs.get_task(queue, tid)
+    last = diagnostics(queue, task)
+    assert last["evaluation"]["source"] == "fallback"
+    assert last["evaluation"]["frozen"]["submitted"] is False
+    assert last["trace"]["stall"] == last["stall_limit"] == 13
+    assert last["trace"]["page"] == 2 and last["trace"]["turns"][0]["number"] == 13
+    first = diagnostics(queue, task, page=1)["trace"]["turns"]
+    assert [t["number"] for t in first] == list(range(1, 13))
+    rejected = first[0]["actions"][0]
+    assert rejected["action"] is None and not rejected["changed"] and "unknown_option" in rejected["error"]
+    assert diagnostics(queue, task, turn=1)["message"]["raw"] == raw
+    with jobs.database(queue) as db:
+        assert db.execute("SELECT COUNT(*) FROM tasks WHERE status='queued'").fetchone()[0] == 0
+    (run / "state.sqlite").rename(run / "saved.sqlite")
+    archived = diagnostics(queue, task)
+    assert not archived["trace"].get("turns") and archived["summary"]["detail"] == "stalled"
+    assert not (run / "state.sqlite").exists()

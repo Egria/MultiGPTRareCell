@@ -10,16 +10,17 @@ import socket
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import yaml
 
 from . import job_queue as jobs
 from .config import read_json
+from .dashboard_diagnostics import diagnostics
 from .runtime import project_model, save_project_model
 
 WEB = Path(__file__).with_name("web")
-ASSETS = {"/": "index.html", "/app.css": "app.css", "/app.js": "app.js"}
+ASSETS = {"/": "index.html", "/app.css": "app.css", "/app.js": "app.js", "/diagnostics.js": "diagnostics.js"}
 
 
 def artifacts(root, task):
@@ -59,7 +60,7 @@ def detail(root, task_id):
     task["models"] = {section: cfg.get(section, {}).get("model") for section in ("provider", "annotation")}
     task["run_path"] = str(run) if run and (run / "checkpoint.json").is_file() else None
     summary = read_json(outputs["run_summary.json"]) if "run_summary.json" in outputs else {}
-    task["resumable"] = (task["kind"] != "evaluate" and bool(task["run_path"]) and
+    task["resumable"] = (task["kind"] not in {"evaluate", "inspect"} and bool(task["run_path"]) and
                          task["status"] not in jobs.ACTIVE and summary.get("resumable", True))
     task["metrics"] = {key: summary[key] for key in ("n_cells", "n_candidates", "n_groups", "unresolved_cells")
                        if key in summary}
@@ -144,6 +145,13 @@ class Handler(BaseHTTPRequestHandler):
                                    "model": project_model(self.server.project)})
             task_id = jobs.submit(root, self.server.project, self.body())
             return self.reply({"id": task_id}, 201)
+        diag = re.fullmatch(r"/api/tasks/([0-9a-f]{32})/diagnostics(?:/turn/([1-9][0-9]{0,8}))?", path)
+        if method == "GET" and diag:
+            task = jobs.get_task(root, diag[1])
+            page = parse_qs(urlsplit(self.path).query).get("page", ["0"])[0]
+            if not re.fullmatch(r"[0-9]{1,9}", page):
+                raise ValueError("页码无效")
+            return self.reply(diagnostics(root, task, int(page), int(diag[2]) if diag[2] else None))
         m = re.fullmatch(r"/api/tasks/([0-9a-f]{32})(?:/(stop|files/([a-z_.]+)))?", path)
         if not m:
             return self.reply({"error": "地址不存在"}, 404)
