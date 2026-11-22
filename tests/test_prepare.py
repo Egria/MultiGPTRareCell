@@ -192,6 +192,11 @@ def test_all_four_real_seurat_partitions_markers(tmp_path):
     s=prepare(EXAMPLE,tmp_path/"production",cfg)
     m=verify_snapshot(s)
     assert m["status"]=="complete",m["stages"]
+    with (s / "seurat" / "versions.tsv").open() as stream:
+        versions = {row["package"]: row["version"] for row in csv.DictReader(stream, delimiter="\t")}
+    assert versions["irlba"]
+    pca = np.load(s / "views" / "V_HVG.npy")
+    assert pca.shape == (160, 8) and np.linalg.matrix_rank(pca) == 8
     marker=list(csv.DictReader((s/"seurat"/"markers.tsv").open(),delimiter="\t"))
     groups=list(csv.DictReader((s/"baselines.tsv").open(),delimiter="\t"))
     hvg={(r["resolution"],r["group_id"]) for r in groups if r["view"]=="V_HVG"}

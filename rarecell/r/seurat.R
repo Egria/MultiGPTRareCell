@@ -27,13 +27,16 @@ if (mode == "pca") {
   var_ok <- apply(LayerData(obj, layer="scale.data"), 1L, function(x) all(is.finite(x)) && sd(x)>0)
   pcs <- min(pcs, sum(var_ok)-1L)
   if (pcs < 1L) stop("insufficient variable HVGs after scaling")
-  obj <- RunPCA(obj, features=names(var_ok)[var_ok], npcs=pcs, seed.use=as.integer(args[5]), verbose=FALSE)
+  # ScaleData already prepared the matrix. irlba 2.4.1 on R 4.3.1
+  # errors when checking NULL for either of these optional transformations.
+  obj <- RunPCA(obj, features=names(var_ok)[var_ok], npcs=pcs, seed.use=as.integer(args[5]),
+                scale=FALSE, shift=FALSE, verbose=FALSE)
   emit(Embeddings(obj, "pca")[colnames(counts), , drop=FALSE], "pca.tsv")
   emit(sub("^G", "", genes), "hvg_indices.tsv")
   loadings <- Loadings(obj[["pca"]])
   emit(data.frame(gene_index=as.integer(sub("^G","",rownames(loadings))),loadings),
        "pca_loadings.tsv", TRUE)
-  packages <- c("Seurat","SeuratObject","Matrix","leidenbase","RANN")
+  packages <- c("Seurat","SeuratObject","Matrix","irlba","leidenbase","RANN")
   emit(data.frame(package=c("R",packages),version=c(as.character(getRversion()),
        vapply(packages,function(n) as.character(packageVersion(n)),""))),"versions.tsv", TRUE)
   saveRDS(obj, path("seurat.rds"), compress=FALSE)
