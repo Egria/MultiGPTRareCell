@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
-VERSION = "soft-protocol-1.4"
+VERSION = "soft-protocol-1.5"
 MAX_CHARS = 512_000
 MAX_ACTIONS = 128
 
@@ -34,6 +34,8 @@ def _alias_map(groups):
 
 
 ACTIONS = _alias_map({
+    "review_seed": ("assess_seed", "record_seed_review", "调查种子"),
+    "list_seed_reviews": ("list seed assessments",),
     "apply_boundary": (),
     "select_boundary": (),
     "preview_submission": (),
@@ -46,7 +48,12 @@ ACTIONS = _alias_map({
     "submit": ("submit result", "finalize", "提交", "提交结果"),
 })
 
+SEED_DISPOSITIONS = _alias_map({"follow_up": ("investigate", "followup", "深入"), "retain": ("keep", "保留"),
+                                "defer": ("uncertain", "待定"), "decline": ("reject", "exclude", "排除")})
+
 FIELDS = _alias_map({
+    "disposition": ("recommendation", "outcome", "结论"),
+    "seed_id": (),
     "metric": (), "matched_evidence_id": (), "min_detected": (), "exclude_candidate_ids": (), "reference_id": (),
     "background_mode": (), "biological_rarity": (), "rarity_reason": (),
     "action": ("operation", "tool", "动作", "操作"),
@@ -80,6 +87,8 @@ BINDINGS = {"run_id", "task_id", "data_version", "contract_version", "message_id
 SCOPES = {"candidate_id", "members", "scope"}
 BACKGROUNDS = {"background", "background_id"}
 ALLOWED = {
+    "review_seed": {"candidate_id", "disposition", "reason", "evidence_ids"},
+    "list_seed_reviews": {"offset", "limit"},
     "select_boundary": {"candidate_id", "reason"},
     "apply_boundary": {"candidate_id", "evidence_ids", "metric", "threshold", "reason"},
     "preview_submission": {"candidate_ids", "candidate_id", "reference_id"},
@@ -227,6 +236,8 @@ def _group(value):
 def _value(key, value):
     if key in {"genes", "members", "background", "evidence_ids", "candidate_ids", "parents"}:
         return _ids(value, key, allow_empty=key in {"evidence_ids", "candidate_ids", "parents"})
+    if key == "disposition":
+        return _choice(value, key, SEED_DISPOSITIONS)
     if key == "metric":
         return _choice(value, key, {_word(name): name for name in ("score", "expression", "positive_expression")})
     if key == "background_mode":
@@ -257,6 +268,8 @@ def _value(key, value):
 
 def _validate(action, args):
     present = args.keys()
+    if action == "review_seed" and not {"candidate_id", "disposition", "reason"} <= present:
+        raise ProtocolError("review_seed needs a seed candidate_id, disposition, and written reason")
     if len(SCOPES & present) > 1 or len((BACKGROUNDS | {"background_mode"}) & present) > 1:
         raise ProtocolError("choose one foreground scope and one background scope")
     if action in {"compare_groups", "coexpress", "expand_candidate"} and not (SCOPES & present):
@@ -333,6 +346,10 @@ def _normalize(obj):
             params.append((key, val))
     args = {}
     for key, val in params:
+        if action == "review_seed" and key == "seed_id":
+            key = "candidate_id"
+        if action == "review_seed" and key in {"explanation", "summary"} and not any(k == "reason" for k, _ in params):
+            key = "reason"
         if key == "metadata":
             if not isinstance(val, dict):
                 raise ProtocolError("metadata requires an object")
@@ -439,7 +456,7 @@ def _error(exc):
     return {"error": str(exc), "status": "needs_clarification"}
 
 
-def parse_message(raw, *, complete=True, origin="agent"):
+def parse_message(raw, *, complete=True, origin="agent", seed_batch=False):
     """Parse a completed, trusted-origin provider reply without executing it."""
     try:
         if origin != "agent" or complete is not True:
@@ -465,7 +482,8 @@ def parse_message(raw, *, complete=True, origin="agent"):
             # A wrapper can only contain the batch. Parameters on the wrapper
             # cannot silently be ignored or distributed across sibling actions.
             outer = _unique_pairs(node)
-            if len(outer) == 1 and FIELDS.get(_word(next(iter(outer)))) == "actions":
+            wrapper = _word(next(iter(outer))) if len(outer) == 1 else ""
+            if FIELDS.get(wrapper) == "actions" or (seed_batch and wrapper in {"reviews", "assessments"}):
                 node = next(iter(outer.values()))
                 if isinstance(node, _Pairs) or not isinstance(node, list):
                     raise ProtocolError("actions requires an array")
@@ -475,7 +493,13 @@ def parse_message(raw, *, complete=True, origin="agent"):
         result = []
         for item in batch:
             try:
-                parsed = _normalize(_materialize(item))
+                obj = _materialize(item)
+                if seed_batch and isinstance(obj, dict):
+                    fields = {FIELDS.get(_word(k)) for k in obj}
+                    if ("action" not in fields and "disposition" in fields
+                            and fields.intersection({"seed_id", "candidate_id"})):
+                        obj["action"] = "review_seed"
+                parsed = _normalize(obj)
                 if repaired:
                     parsed["metadata"]["format_repair"] = repaired
                 result.append(parsed)

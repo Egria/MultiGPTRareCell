@@ -54,7 +54,7 @@ def artifacts(root, task):
                  base / "snapshot": ["manifest.json"],
                  base / ("annotation" if task["kind"] == "demo" else "annotations"): ["annotation_status.json"]}
     if run:
-        locations[run] = ["run_summary.json", "usage.json", "partition.tsv", "groups.tsv"]
+        locations[run] = ["run_summary.json", "usage.json", "partition.tsv", "groups.tsv", "seed_reviews.tsv"]
     return {name: directory / name for directory, names in locations.items()
             for name in names if (directory / name).is_file()}
 

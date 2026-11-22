@@ -105,7 +105,8 @@ def turn_detail(db, number):
         raise KeyError("该轮次没有记录")
     commands = []
     if msg:
-        for version in (VERSION, "soft-protocol-1.2", "soft-protocol-1.1", "protocol/1"):
+        current = VERSION + ("/seed" if record(db, "SeedBatch", mid) else "")
+        for version in (current, "soft-protocol-1.4", "soft-protocol-1.2", "soft-protocol-1.1", "protocol/1"):
             key = fingerprint([version, msg["raw"], msg.get("complete", True)])
             saved = record(db, "ParsedMessage", key)
             if saved:
@@ -142,6 +143,10 @@ def diagnostics(root, task, page=None, turn=None):
                 if turn is not None:
                     return turn_detail(db, turn)
                 trace = turn_page(db, page)
+                if db.execute("SELECT 1 FROM record WHERE kind='SeedBatch' LIMIT 1").fetchone():
+                    counts = dict(db.execute("SELECT kind, count(*) FROM record WHERE kind IN "
+                                             "('Seed','SeedMeasurement','SeedAssessment') GROUP BY kind"))
+                    trace["seed_reviews"] = {"total": counts.get("Seed", 0), "written": counts.get("SeedAssessment", 0)}
         except sqlite3.DatabaseError as exc:
             trace = {"notice": "暂时无法读取逐轮记录，可刷新重试（%s）。" % exc}
             if turn is not None:
@@ -165,7 +170,7 @@ def diagnostics(root, task, page=None, turn=None):
     scores = evaluation((run.parent if inspected else base) / "evaluation" / "metrics.json",
                         run / "frozen.json" if inspected else None)
     return {"trace": trace, "summary": fields(summary, "status detail issue submitted submission_status submission_source n_cells n_candidates n_groups "
-                                           "unresolved_cells n_screened_seeds n_expanded_seeds n_controller_seed_followups closeout_trigger n_pending_seeds fallback_view_resolution annotation_status"),
+                                           "unresolved_cells n_screened_seeds n_expanded_seeds n_controller_seed_followups seed_review_coverage closeout_trigger n_pending_seeds fallback_view_resolution annotation_status"),
             "pending_seeds": seeds, "annotation_model": (ann.get("settings") or {}).get("model"),
             "stall_limit": (cfg.get("budget") or {}).get("stall_turns"),
             "usage": fields(usage, "turns provider_dispatches protocol_errors action_errors new_queries compute_executions"),

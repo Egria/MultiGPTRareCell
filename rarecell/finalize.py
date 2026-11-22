@@ -3,6 +3,7 @@ import csv
 import io
 from collections import defaultdict
 
+from . import exhaustive
 from .config import atomic, fingerprint, hash_file, json_bytes, write_json
 from .discovery import rows
 
@@ -152,10 +153,27 @@ def export(ctrl, status, detail, policy, annotation_status):
         summary["closeout_trigger"] = s.get_meta("closeout_trigger")
     if ctrl.adaptive or policy == "live":
         summary["submission_source"] = s.get_meta("submission_source")
+    if ctrl.exhaustive:
+        summary["seed_review_coverage"] = exhaustive.coverage(ctrl)
+        measurements = {r["candidate_id"]: r for r in s.all("SeedMeasurement")}
+        notes = {r["candidate_id"]: r for r in s.all("SeedAssessment")}
+        def review_rows():
+            for seed in seed_rows:
+                cid = seed["candidate_id"]
+                measurement, note = measurements.get(cid, {}), notes.get(cid, {})
+                yield {**seed, "measurement_status": measurement.get("status", "pending"),
+                       "query_key": measurement.get("query_key"), "evidence_id": measurement.get("evidence_id"),
+                       "measurement_error": measurement.get("error"), "proposal_id": measurement.get("proposal_id"),
+                       "message_id": note.get("message_id"), "disposition": note.get("disposition"),
+                       "reason": note.get("reason")}
+        tsv(run / "seed_reviews.tsv", ["seed_id", "cell_id", "candidate_id", "measurement_status", "query_key",
+            "evidence_id", "measurement_error", "proposal_id", "message_id", "disposition", "reason", "final_group"], review_rows())
     write_json(run / "run_summary.json", summary)
     files = ["run_summary.json", "usage.json", "manifest.json", "config_resolved.yaml", "project_contract.yaml",
              "partition.tsv", "groups.tsv", "conflicts.jsonl", "candidate_tasks.tsv", "candidate_members.tsv", "candidates.jsonl", "seeds.tsv",
              "annotations.tsv", "decisions.jsonl", "evidence.jsonl"]
+    if ctrl.exhaustive:
+        files.append("seed_reviews.tsv")
     files.extend(str(p.relative_to(run)) for p in sorted((run / "artifacts").glob("*")) if p.is_file())
     freeze = {"version": 1, "snapshot_hash": ctrl.snapshot_hash, "files": {name: hash_file(run / name) for name in files}}
     write_json(run / "frozen.json", freeze)

@@ -94,3 +94,20 @@
 对 live 主动臂，初筛按冻结的前三个 marker 比较基因 ID 和效应方向，优先较长的共享组合及较多提名视图。每个种子保存一个代表性同伴；可从证据 ID 引用原观察。该顺序只用于安排调查。同一 RNA 的多个视图仍共用证据来源。
 
 探索阶段整轮只请求 list_candidates、至少一次成功且本轮还有动作额度时，控制器可补查一个待查种子。补查使用标准 expand_candidate，受同一查询数、深度和缓存约束，不调用语言模型。budget.max_seed_followups 控制全程上限。开始计算前固定锚点，重启后复用同一计划。逐轮输出中的 controller_seed_review 标出来源。seeds.tsv 保留初筛、实际调查状态以及最终归属。
+
+
+### 强制逐种子调查
+
+GUI、命令行和事后注释核对的用法见 [强制逐种子明文调查](EXHAUSTIVE_SEED_REVIEW.md)。
+
+`exhaustive_seed_review` 适用于 live A2、A3 和 A3_adaptive。调查对象是冻结的独立种子。控制器为每个锚点执行一次标准扩展，保存查询、观测、状态及拟议成员版本。缓存复用保留出处。模型收到的每批种子带有观测结果、marker、相关种子及可用的注释。每个种子的回复格式为
+
+```json
+{"action":"review_seed","candidate_id":"<本批候选 ID>","disposition":"follow_up","reason":"<引用实际观察，说明解释和下一步>"}
+```
+
+支持数组或 reviews 数组包装。处置可选 follow_up、retain、defer、decline。可以用本批 seed_id 指定锚点。省略 evidence_ids 时，控制器绑定该锚点的扩展观测；明确给出的引用必须匹配。只展示、扩展或填写另一种子的判断均无法完成该项。明文建议属于模型解释，成员归属仍由后续修订和提交决定。正常调查可用 list_seed_reviews 分页回读全文。
+
+对 N 个种子，查询上限为原配置加 N，扩展深度上限增加一层。批量大小受 seed_review_batch_size、单轮动作数和上下文字节上限共同约束。模型可部分作答。后续批次优先展示尚未分配过的种子，再轮流重试缺失项。专项轮数最多 N + stall_turns；进入全部为重试项的批次后，连续 stall_turns 轮没有新增明文也会结束。暂停后按原批次和已付费的回复恢复。所有种子得到观测和明文后才开始原预算内的常规调查。没有种子时直接进入常规调查。
+
+未完成的调查会冻结已完成进度并列出缺项。未写完标记 seed_review_incomplete，数值查询实际失败标记 seed_measurement_blocked；全局 token 预算或服务端中断保留各自的原始原因。no_expansion、no_signature 等计算结果可由模型明确评估。数值查询失败即使有文字记录也无法满足完整提交条件。
