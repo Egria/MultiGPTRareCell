@@ -96,7 +96,9 @@ class Controller:
         return self.state.evidence({
             "object": obj, "kind": kind, "parent_ids": sorted(set(parents)), "source_family": family,
             "cell_set_hash": members_hash, "data_version": self.version, "method_version": method or ("LLMRareCell/" + __version__),
-            "config_version": self.snapshot_hash, "prompt_version": prompt or self.prompt,
+            # Frozen measurements keep their historical identity across experiment arms.
+            "config_version": self.snapshot_hash, "prompt_version": prompt or (
+                self.prompt if family == "discovery_agent" else PROMPT_VERSION),
             "selection_history": history or [], "artifact_refs": refs, "summary": summary,
             "purpose": purpose or ("exploration" if kind == "observation" else "related_check"),
         })

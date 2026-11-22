@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from rarecell.base_evidence import DE, HVG
-from rarecell.config import config, fingerprint
+from rarecell.config import ADAPTIVE_MODE, config, fingerprint
 from rarecell.discovery import Controller
 from rarecell.prepare import prepare
 
@@ -24,7 +24,7 @@ def test_shared_seurat_tables_and_annotation_dependencies(tmp_path):
     with (snapshot/"seurat"/"hvg.tsv").open() as f:
         hvgs = list(csv.DictReader(f, delimiter="\t"))
     results = []
-    for mode in ("A0","A1","A2","A3"):
+    for mode in ("A0","A1","A2","A3", ADAPTIVE_MODE):
         ctrl = Controller(snapshot, tmp_path/mode, tmp_path/"cache", cfg, mode)
         try:
             ctrl.initialize()
