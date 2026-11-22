@@ -35,6 +35,9 @@ function disclosure(label, content) {
 function showOverview(data) {
   const box = $("diag-overview"), s = data.summary, a = data.annotation, u = data.usage, scores = data.evaluation;
   box.replaceChildren();
+  const coverage = {...s.seed_review_coverage, ...data.trace.seed_reviews};
+  if (coverage.total != null) box.append(diagFacts([["逐种子明文评估", coverage.written + " / " + coverage.total],
+    ["测量成功且已评估", coverage.completed], ["测量受阻", coverage.measurement_blocked]]));
   if (s.detail) {
     const title = s.detail === "stalled" ? "发现已停滞（stalled）" : "发现结果 · " + s.detail;
     const note = element("div", undefined, s.submitted ? "diag-outcome" : "diag-outcome attention");

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from . import annotation, providers
-from .config import ANNOTATED_MODES, MODES, config, merge_config, read_json, write_json
+from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, config, merge_config, read_json, write_json
 from .runtime import checkout, load_keys, model_overrides, project_model, rscript_command, save_project_model
 from .prepare import prepare, verify_snapshot
 from .run import discover, resume
@@ -47,7 +47,7 @@ def demo(root, cfg, mode, seed):
     root.mkdir(exist_ok=True, parents=True)
     dataset = generate(root, seed)
     if mode == "core":
-        cfg = merge_config(cfg, {"mode": "A2", "prepare": {"seed": seed, "graph_backend": "igraph",
+        cfg = merge_config(cfg, {"mode": "A2", "exhaustive_seed_review": False, "prepare": {"seed": seed, "graph_backend": "igraph",
                             "views": ["V_LINEAR", "V_TENSOR2"]}, "annotation": {"enabled": False},
                             "provider": {"kind": "scripted_demo"}})
     else:
@@ -94,6 +94,8 @@ def parser():
     d.add_argument("--annotations", type=Path)
     d.add_argument("--mode", choices=MODES)
     d.add_argument("--policy", choices=["live", "fixed"], default="live")
+    d.add_argument("--exhaustive-seed-review", action=argparse.BooleanOptionalAction, default=None,
+                   help="measure every singleton seed and require an explicit model assessment before submission")
     d.add_argument("--replication-id")
     d.add_argument("--pause-after", type=int, help="checkpoint after this completed turn")
     resume_cmd = cmd("resume", False)
@@ -131,7 +133,10 @@ def dispatch(a, default_model=""):
         from .evaluation import evaluate
         metrics = evaluate(a.run, a.gt, a.out)
         return {"output": str(a.out), "freeze_sha256": metrics["freeze_sha256"], "submitted_partition": metrics["submitted_partition"]}
-    cfg = config(a.config, model_overrides(a.model or default_model))
+    overrides = model_overrides(a.model or default_model)
+    if cmd == "discover" and a.exhaustive_seed_review is not None:
+        overrides["exhaustive_seed_review"] = a.exhaustive_seed_review
+    cfg = config(a.config, overrides)
     if cmd == "doctor":
         return doctor(cfg)
     if cmd == "prepare":
@@ -154,7 +159,8 @@ def dispatch(a, default_model=""):
             annotation.annotate(a.snapshot, sidecar, cfg)
         reports = {}
         for arm in arms:
-            summary = discover(a.snapshot, a.out / arm, a.out / "query_cache", cfg,
+            arm_cfg = cfg if arm in ACTIVE_MODES else dict(cfg, exhaustive_seed_review=False)
+            summary = discover(a.snapshot, a.out / arm, a.out / "query_cache", arm_cfg,
                                mode="A3" if arm == "fixed" else arm, policy="fixed" if arm == "fixed" else "live",
                                annotations=sidecar, replication_id=(a.replication_prefix + "-" + arm) if a.replication_prefix else None)
             reports[arm] = {"status": summary["status"], "detail": summary["detail"],

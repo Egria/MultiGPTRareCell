@@ -11,9 +11,9 @@ from pathlib import Path
 
 import yaml
 
-from . import __version__, providers
+from . import __version__, exhaustive, providers
 from .annotation import verify_annotation
-from .config import ANNOTATED_MODES, MODES, RESOURCES, atomic, contract, fingerprint, hash_file, read_json, validate_settings, write_json
+from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, RESOURCES, atomic, contract, fingerprint, hash_file, read_json, validate_settings, write_json
 from .discovery import Controller, SCIENTIFIC, prompt_version
 from .finalize import export
 from .prepare import verify_snapshot
@@ -23,7 +23,7 @@ from .protocol import VERSION as PROTOCOL_VERSION, ProtocolError, parse_message
 def code_fingerprint():
     module = Path(__file__).parent
     files = ("discovery.py", "run.py", "protocol.py", "science.py", "state.py", "providers.py",
-             "config.py", "seed_review.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py")
+             "config.py", "seed_review.py", "exhaustive.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py")
     return fingerprint({name: hash_file(module / name) for name in files})
 
 
@@ -32,6 +32,8 @@ def disjoint(a, b):
 
 
 def new_spec(snapshot, run, cache, annotations, cfg, mode, policy, replication_id):
+    if cfg.get("exhaustive_seed_review") and (policy != "live" or mode not in ACTIVE_MODES):
+        raise ValueError("Exhaustive seed review requires live A2, A3, or A3_adaptive")
     if policy not in {"live", "fixed", "scripted_demo"}:
         raise ValueError("Unknown policy")
     if policy == "fixed" and mode != "A3":
@@ -51,7 +53,7 @@ def new_spec(snapshot, run, cache, annotations, cfg, mode, policy, replication_i
         annotations = None
     return {"snapshot": str(snapshot), "cache": str(cache), "annotations": str(annotations) if annotations else None,
             "mode": mode, "policy": policy, "run_id": uuid.uuid4().hex, "replication_id": replication_id,
-            "software": __version__, "code_sha256": code_fingerprint(), "prompt_version": prompt_version(mode), "cfg_hash": fingerprint(cfg), "contract_hash": fingerprint(contract())}
+            "software": __version__, "code_sha256": code_fingerprint(), "prompt_version": prompt_version(mode, cfg.get("exhaustive_seed_review", False)), "cfg_hash": fingerprint(cfg), "contract_hash": fingerprint(contract())}
 
 
 def fixed_priority(ctrl, c):
@@ -80,17 +82,10 @@ def offline_message(ctrl, strategy, turn):
                        "reason": "Submit threshold-qualified expansions. Competing assignments remain unresolved."})
 
 
-def lookup(state, kind, key):
-    try:
-        return state.get(kind, key)
-    except KeyError:
-        return None
-
-
 def obtain(ctrl, policy, turn, retry_unknown):
     s = ctrl.state
     mid = "%s:T%04d" % (s.get_meta("run_id"), turn)
-    saved = lookup(s, "Message", mid)
+    saved = s.get_optional("Message", mid)
     if saved is not None:
         return saved
     context = ctrl.context(turn)
@@ -104,7 +99,7 @@ def obtain(ctrl, policy, turn, retry_unknown):
             raise providers.ProviderError(health["detail"])
         previous = [r for r in s.all("ProviderDispatch") if r["message_id"] == mid]
         if previous:
-            error = lookup(s, "ProviderFailure", previous[-1]["id"])
+            error = s.get_optional("ProviderFailure", previous[-1]["id"])
             last_status = error["status"] if error else "unknown_execution"
             if len(previous) >= 2 or not retry_unknown:
                 raise providers.ProviderError("Prior dispatch has no usable response; bounded explicit retry available once", last_status)
@@ -139,10 +134,10 @@ def repaired_locally(raw, parsed):
 def follow_browsing_with_seed(ctrl, mid):
     """Use one spare local action on a screened seed. Journal the choice before computation."""
     s = ctrl.state
-    done = lookup(s, "SeedFollowup", mid)
+    done = s.get_optional("SeedFollowup", mid)
     if done is not None:
         return done
-    plan = lookup(s, "SeedFollowupPlan", mid)
+    plan = s.get_optional("SeedFollowupPlan", mid)
     if plan is None:
         if (len(s.all("SeedFollowupPlan")) >= ctrl.budget.get("max_seed_followups", 3) or
                 s.usage()["new_queries"] >= ctrl.budget["max_new_queries"] or
@@ -167,10 +162,12 @@ def follow_browsing_with_seed(ctrl, mid):
 def process_message(ctrl, message, turn):
     s = ctrl.state
     mid = message["message_id"]
-    parse_id = fingerprint([PROTOCOL_VERSION, message["raw"], message.get("complete", True)])
-    interpretation = lookup(s, "ParsedMessage", parse_id)
+    seed_batch = s.get_optional("SeedBatch", mid) if ctrl.exhaustive else None
+    parser_version = PROTOCOL_VERSION + ("/seed" if seed_batch else "")
+    parse_id = fingerprint([parser_version, message["raw"], message.get("complete", True)])
+    interpretation = s.get_optional("ParsedMessage", parse_id)
     if interpretation is None:
-        parsed = parse_message(message["raw"], origin="agent", complete=message.get("complete", True))
+        parsed = parse_message(message["raw"], origin="agent", complete=message.get("complete", True), seed_batch=bool(seed_batch))
         with s.transaction():
             s.put("ParsedMessage", parse_id, {"id": parse_id, "commands": parsed})
             count = int(repaired_locally(message["raw"], parsed))
@@ -178,7 +175,7 @@ def process_message(ctrl, message, turn):
     else:
         parsed = interpretation["commands"]
     limit = ctrl.budget["max_actions_per_turn"]
-    closing = ctrl.closing_actions(turn)
+    closing = () if seed_batch else ctrl.closing_actions(turn)
     if closing and s.get_meta("decision_start_turn") is None:
         s.set_meta("decision_start_turn", turn)
     if not closing and len(parsed) > limit:
@@ -190,7 +187,7 @@ def process_message(ctrl, message, turn):
         opid = "%s/%d" % (mid, index)
         if closing and command.get("action") in closing:
             eligible += 1
-        old = lookup(s, "Receipt", opid)
+        old = s.get_optional("Receipt", opid)
         if old is not None:
             receipts.append(old["result"])
             progress |= old["progress"]
@@ -203,6 +200,8 @@ def process_message(ctrl, message, turn):
                 result = {"error": "Run already submitted; subsequent action blocked", "status": "blocked"}
             else:
                 try:
+                    if seed_batch and command.get("action") and command["action"] != "review_seed":
+                        raise ValueError("Written seed review is open: use review_seed for the listed seeds first")
                     if closing and command.get("action") and command["action"] not in closing:
                         raise ValueError("Decision phase accepts only: " + ", ".join(closing))
                     if closing and eligible > limit:
@@ -239,7 +238,7 @@ def process_message(ctrl, message, turn):
                     logical = fingerprint([command["action"], page])
                 elif result.get("query_key"):
                     logical = fingerprint(["query", result["query_key"]])
-                changed = lookup(s, "Progress", logical) is None
+                changed = s.get_optional("Progress", logical) is None
             with s.transaction():
                 if ctrl.adaptive and command.get("action") == "get_evidence" and "sections" in result:
                     args = command["args"]
@@ -261,7 +260,7 @@ def process_message(ctrl, message, turn):
         receipts.append(result)
         progress |= changed
     browse_only = parsed and all(c.get("action") == "list_candidates" for c in parsed)
-    if (not closing and ctrl.active and s.get_meta("policy") == "live" and browse_only
+    if (not ctrl.exhaustive and not closing and ctrl.active and s.get_meta("policy") == "live" and browse_only
             and len(parsed) < limit and any("candidates" in r for r in receipts)):
         followup = follow_browsing_with_seed(ctrl, mid)
         if followup:
@@ -271,7 +270,11 @@ def process_message(ctrl, message, turn):
     with s.transaction():
         s.set_meta("receipts", receipts[-12:])
         s.set_meta("finished_turn", turn)
-        s.set_meta("stall", 0 if progress else s.get_meta("stall", 0) + 1)
+        stall_counter = "seed_review_stall" if seed_batch else "stall"
+        first_exposure = seed_batch and seed_batch["includes_new"]
+        s.set_meta(stall_counter, 0 if progress or first_exposure else s.get_meta(stall_counter, 0) + 1)
+        if seed_batch:
+            s.set_meta("seed_review_turns", turn)
         s.event("turn", {"message_id": mid, "turn": turn, "progress": progress})
 
 
@@ -299,8 +302,27 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
     s = ctrl.state
     s.set_meta("policy", policy)
     status, detail = "partial", "max_agent_turns"
-    for turn in range(s.get_meta("finished_turn", 0) + 1, ctrl.budget["max_agent_turns"] + 1):
-        if ctrl.stall_review():
+    review_limit = len(ctrl.seed_ids) + ctrl.budget["stall_turns"] if ctrl.exhaustive else 0
+    hard_limit = ctrl.budget["max_agent_turns"] + review_limit
+    for turn in range(s.get_meta("finished_turn", 0) + 1, hard_limit + 1):
+        mid = "%s:T%04d" % (s.get_meta("run_id"), turn)
+        queue = []
+        review = False
+        if ctrl.exhaustive and not s.get_meta("seed_phase_complete", False):
+            queue = exhaustive.pending(ctrl)
+            # A crash can leave every note committed just before the turn checkpoint.
+            review = bool(queue) or s.get_optional("SeedBatch", mid) is not None
+            if review and (turn > review_limit or s.get_meta("seed_review_stall", 0) >= ctrl.budget["stall_turns"]):
+                s.set_meta("current_issue", "Written seed assessments are still missing after the review allowance.")
+                return "partial", "seed_review_incomplete"
+            if not review:
+                if exhaustive.coverage(ctrl)["measurement_blocked"]:
+                    s.set_meta("current_issue", "One or more required seed measurements failed. See seed_reviews.tsv.")
+                    return "partial", "seed_measurement_blocked"
+                s.set_meta("seed_phase_complete", True)
+        if not review and turn > ctrl.turn_limit:
+            break
+        if not review and ctrl.stall_review():
             closing_turn = s.get_meta("closing_turn", turn)
             if turn > closing_turn:
                 detail = "stalled"
@@ -310,12 +332,14 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
         cap = ctrl.budget.get("max_reported_tokens", 0)
         # Budget gates the next dispatch. A reply checkpointed before an
         # interruption is already paid for and must still be applied.
-        if cap and policy == "live" and lookup(s, "Message", "%s:T%04d" % (s.get_meta("run_id"), turn)) is None:
+        if cap and policy == "live" and s.get_optional("Message", mid) is None:
             token_counts = [m["usage"].get("total_tokens") for m in s.all("Message")]
             if any(n is None for n in token_counts) or sum(token_counts) >= cap:
                 detail = "token_usage_unreported" if any(n is None for n in token_counts) else "max_reported_tokens"
                 break
         try:
+            if review:
+                exhaustive.prepare_batch(ctrl, mid, queue)
             message = obtain(ctrl, policy, turn, retry_unknown)
         except providers.ProviderError as exc:
             detail = "provider_blocked" if exc.status == "blocked" else exc.status
@@ -327,8 +351,12 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
             s.set_meta("current_issue", str(exc))
             s.event(detail, {"reason": str(exc), "turn": turn})
             break
-        closing = ctrl.stall_review()
+        closing = not review and ctrl.stall_review()
         process_message(ctrl, message, turn)
+        if review:
+            if pause_after is not None and turn >= pause_after:
+                return "partial", "paused"
+            continue
         if s.get_meta("submitted", False):
             status, detail = "complete", "submitted"
             break
@@ -336,10 +364,10 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
             detail = "stalled"
             break
         if s.get_meta("stall", 0) >= ctrl.budget["stall_turns"]:
-            if not ctrl.stall_review() or turn == ctrl.budget["max_agent_turns"]:
+            if not ctrl.stall_review() or turn == ctrl.turn_limit:
                 detail = "stalled"
                 break
-        if pause_after is not None and turn >= pause_after and (policy != "live" or turn < ctrl.budget["max_agent_turns"]):
+        if pause_after is not None and turn >= pause_after and (policy != "live" or turn < ctrl.turn_limit):
             detail = "paused"
             break
     # A stalled run may use one remaining turn to choose among held hypotheses.
@@ -436,7 +464,7 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
         else:
             status, detail = explore(ctrl, spec["policy"], pause_after, retry_unknown)
         if detail == "submitted":
-            exhausted = ctrl.active and s.usage()["new_queries"] >= ctrl.budget["max_new_queries"]
+            exhausted = ctrl.active and s.usage()["new_queries"] >= ctrl.query_limit
             checked = {r["candidate_id"] for r in s.all("Investigation")}
             pending = any(c["initial"] and c["id"] not in checked for c in ctrl.candidates.values())
             if manifest.get("status") == "partial":

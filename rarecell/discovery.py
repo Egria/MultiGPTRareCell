@@ -3,9 +3,9 @@ import csv
 from functools import cached_property
 from pathlib import Path
 
-from . import __version__, adaptive, seed_review
+from . import __version__, adaptive, exhaustive, seed_review
 from .base_evidence import FrozenSeurat, annotation_parents, prepared_page
-from .config import ADAPTIVE_MODE, ANNOTATED_MODES, contract, fingerprint, json_bytes, read_json, read_lines
+from .config import ACTIVE_MODES, ADAPTIVE_MODE, ANNOTATED_MODES, contract, fingerprint, json_bytes, read_json, read_lines
 from .protocol import ProtocolError, resolve_genes
 from .science import METHOD_VERSION, Science
 from .state import State
@@ -34,10 +34,9 @@ GOAL = (
 )
 
 
-def prompt_version(mode):
-    if mode == ADAPTIVE_MODE:
-        return "discovery/adaptive-5"
-    return "discovery/1.5"
+def prompt_version(mode, exhaustive_review=False):
+    version = "discovery/adaptive-5" if mode == ADAPTIVE_MODE else "discovery/1.5"
+    return version + ("/exhaustive-1" if exhaustive_review else "")
 
 
 def rows(path):
@@ -71,10 +70,11 @@ class Controller:
         self.cell_set = set(self.cells)
         self.genes = rows(self.snapshot / "genes.tsv")
         self.adaptive = mode == ADAPTIVE_MODE
-        self.active = self.adaptive or mode in {"A2", "A3"}
+        self.exhaustive = cfg.get("exhaustive_seed_review", False)
+        self.active = mode in ACTIVE_MODES
         self.labeled = mode in ANNOTATED_MODES
         self.goal = GOAL + adaptive.GOAL if self.adaptive else GOAL
-        self.prompt = prompt_version(mode)
+        self.prompt = prompt_version(mode, self.exhaustive)
         self.budget = cfg["budget"]
         self.annotations = list(annotations) if self.labeled else []
         self.science = None
@@ -235,9 +235,29 @@ class Controller:
         excluded.update(r["candidate_id"] for r in self.state.all("SeedFollowupPlan"))
         return [r for r in self.screened_seeds if not depths.get(r["candidate_id"]) and r["candidate_id"] not in excluded]
 
+    @cached_property
+    def seed_ids(self):
+        return {r["candidate_id"]: r["id"] for r in self.state.all("Seed")}
+
+    @property
+    def query_limit(self):
+        return self.budget["max_new_queries"] + (len(self.seed_ids) if self.exhaustive else 0)
+
+    @property
+    def depth_limit(self):
+        return self.budget["max_expansion_depth"] + int(self.exhaustive and bool(self.seed_ids))
+
+    @property
+    def review_turns(self):
+        return self.state.get_meta("seed_review_turns", 0) if self.exhaustive else 0
+
+    @property
+    def turn_limit(self):
+        return self.budget["max_agent_turns"] + self.review_turns
+
     def decision_start(self):
         limit = self.budget["max_agent_turns"]
-        return limit - 1 if limit >= 3 else max(1, limit)
+        return self.review_turns + (limit - 1 if limit >= 3 else max(1, limit))
 
     def closing_actions(self, turn):
         """One gate shared by the model's catalogue and the command dispatcher."""
@@ -274,7 +294,14 @@ class Controller:
 
     def context(self, turn):
         s = self.state
+        if self.exhaustive:
+            mid = "%s:T%04d" % (s.get_meta("run_id"), turn)
+            batch = s.get_optional("SeedBatch", mid)
+            if batch:
+                return s.read_artifact(batch["context_ref"])
         actions = {k: v for k, v in CATALOGUE.items() if self.active or k not in SCIENTIFIC}
+        if self.exhaustive:
+            actions["list_seed_reviews"] = "offset, limit. Read written seed assessments, follow-up and retained seeds first."
         if self.adaptive:
             actions.update(adaptive.TOOLS)
             actions["get_evidence"] += " For a single expansion evidence_id, page the ranking, optionally sorted by metric."
@@ -291,10 +318,10 @@ class Controller:
                "species": self.manifest.get("species"), "tissue": self.manifest.get("tissue"),
                "views": self.manifest["views"], "candidate_count": len(self.candidates),
                "selected_count": len(s.get_meta("selected", [])),
-               "remaining": {"turns_including_this": max(0, self.budget["max_agent_turns"] - turn + 1),
+               "remaining": {"turns_including_this": max(0, self.turn_limit - turn + 1),
                              "consecutive_no_progress_turns_before_stop": stalls_left,
-                             "new_queries": self.budget["max_new_queries"] - usage["new_queries"] if self.active else 0,
-                             "lineage_max_depth": self.budget["max_expansion_depth"]},
+                             "new_queries": self.query_limit - usage["new_queries"] if self.active else 0,
+                             "lineage_max_depth": self.depth_limit},
                "current_candidates": [], "recent_receipts": [], "prior_queries": [],
                "selected_ids": s.get_meta("selected", [])[:25]}
         ctx["prompt_version"] = self.prompt
@@ -303,7 +330,7 @@ class Controller:
             "Previously viewed pages are available by ID. Repeating a request yields no new evidence. "
             "Use submit when you can decide or no further query is justified. Write the chosen action and its named arguments."
         )
-        if turn == self.budget["max_agent_turns"]:
+        if turn == self.turn_limit:
             ctx["turn_instruction"] = "This is the final turn. Submit your best supported assignment with current evidence."
         elif stalled_turns:
             ctx["turn_instruction"] += (
@@ -382,6 +409,11 @@ class Controller:
                 ctx[key].pop()
                 return False
             return True
+        if self.exhaustive:
+            ctx["written_seed_reviews"] = []
+            for item in exhaustive.page(self, 0, 8)["reviews"]:
+                if not append_if_fits("written_seed_reviews", dict(item, reason=item["reason"][:240])):
+                    break
         if closing:
             for item in reversed(s.all("Investigation")[-12:]):
                 record = {k: item[k] for k in ("candidate_id", "evidence_id", "proposed_revision_id")}
@@ -497,13 +529,13 @@ class Controller:
         if action == "expand_candidate":
             if c is None:
                 raise ValueError("Expansion needs an exact lineage anchor")
-            if signature not in seen and max(depths.get(r, 0) for r in self.lineage_roots(c)) >= self.budget["max_expansion_depth"]:
+            if signature not in seen and max(depths.get(r, 0) for r in self.lineage_roots(c)) >= self.depth_limit:
                 raise ValueError("Expansion depth exhausted for this lineage")
         def compute():
             if self.science is None:
                 self.science = Science(self.snapshot, self.cfg, adaptive=self.adaptive)
             return self.science.execute(action, bound)
-        result, key = self.state.query(canonical, self.budget["max_new_queries"], compute)
+        result, key = self.state.query(canonical, self.query_limit, compute)
         ref = self.state.result_ref(key)
         try:
             with self.state.transaction():
@@ -560,7 +592,7 @@ class Controller:
         if signature in seen:
             used_depth = max(depth, seen[signature])
         else:
-            if depth >= self.budget["max_expansion_depth"]:
+            if depth >= self.depth_limit:
                 raise ValueError("Expansion depth exhausted for this lineage")
             used_depth = depth + 1
             seen[signature] = used_depth
@@ -657,6 +689,8 @@ class Controller:
         return ids
 
     def decide(self, action, args, message_id, *, source="agent"):
+        if self.exhaustive and action == "submit" and exhaustive.coverage(self)["remaining"]:
+            raise ValueError("Submission requires a measurement and written assessment for every seed")
         selected = set(self.state.get_meta("selected", []))
         evidence_ids = self.checked_evidence(args.get("evidence_ids", []))
         reason = args.get("reason", "Submit current provisional assignment")
@@ -842,6 +876,10 @@ class Controller:
         for key, expected in bindings.items():
             if key in args and args.pop(key) != expected:
                 raise ValueError("Conflicting explicit " + key)
+        if self.exhaustive and action == "review_seed":
+            return exhaustive.record(self, message_id, args)
+        if self.exhaustive and action == "list_seed_reviews":
+            return exhaustive.page(self, args.get("offset", 0), min(25, args.get("limit", 8)))
         if action in SCIENTIFIC:
             return self.scientific(action, args)
         if action == "preview_submission" and self.adaptive:

@@ -15,7 +15,7 @@ from contextlib import closing, contextmanager
 
 import yaml
 
-from .config import ANNOTATED_MODES, MODES, config, read_json, write_json
+from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, config, read_json, write_json
 from .runtime import model_overrides, project_model
 
 KINDS = {"pipeline", "prepare", "annotate", "discover", "resume", "evaluate", "demo", "inspect"}
@@ -101,7 +101,14 @@ def submit(root, project, form):
                 override[section] = {"model": form[field]}
         if kind in {"discover", "pipeline"}:
             override["mode"] = mode
+            setting = form.get("exhaustive_seed_review")
+            if setting in {"yes", "no"}:
+                override["exhaustive_seed_review"] = setting == "yes"
+            elif setting:
+                raise ValueError("无效的种子调查选项")
         cfg = config(spec.get("config"), override)
+        if kind in {"pipeline", "discover"} and cfg.get("exhaustive_seed_review") and mode not in ACTIVE_MODES:
+            raise ValueError("强制逐种子调查需要 A2、A3 或 A3_adaptive")
         if kind in {"pipeline", "discover"} and not cfg["provider"].get("model"):
             raise ValueError("请填写发现模型，或选择包含 provider.model 的配置文件")
         needs_annotation = kind == "annotate" or (kind == "pipeline" and mode in ANNOTATED_MODES and not spec.get("annotations"))

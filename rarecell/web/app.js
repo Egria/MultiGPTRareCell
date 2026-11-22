@@ -220,6 +220,7 @@ function updateForm() {
     true
   );
   const annotated = ["A1", "A3", "A3_adaptive"].includes(mode);
+  field("seed-review-field", (full || kind === "discover") && ["A2", "A3", "A3_adaptive"].includes(mode));
   const showAnnotations = (full || kind === "discover") && annotated;
   field("annotations-field", showAnnotations, kind === "discover");
   $("annotations-hint").textContent = full ? "可选，留空自动注释" : "必填";

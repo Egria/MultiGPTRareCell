@@ -191,6 +191,12 @@ class State:
                 "status": row["status"], "started_unix": row["started"], "wall_seconds": row["wall"],
                 "cpu_seconds": row["cpu"], "error": row["error"]}
 
+    def get_optional(self, kind, key):
+        try:
+            return self.get(kind, key)
+        except KeyError:
+            return None
+
     def all(self, kind):
         if kind == "CanonicalQuery":
             return [self._query_dict(r) for r in self.db.execute("SELECT * FROM query ORDER BY rowid")]

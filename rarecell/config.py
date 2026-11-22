@@ -10,6 +10,7 @@ import yaml
 
 ADAPTIVE_MODE = "A3_adaptive"
 MODES = ("A0", "A1", "A2", "A3", ADAPTIVE_MODE)
+ACTIVE_MODES = {"A2", "A3", ADAPTIVE_MODE}
 ANNOTATED_MODES = {"A1", "A3", ADAPTIVE_MODE}
 
 RESOURCES = Path(__file__).parent / "resources"
@@ -31,7 +32,9 @@ def validate_settings(cfg):
         "provider": {"kind", "base_url", "endpoint", "api_style", "model", "api_key_env", "timeout", "options"},
         "annotation": {"enabled", "provider", "model", "base_url", "api_key_env", "top_genes", "timeout", "rscript", "retry_unknown", "batch_size", "single_line_stop"},
     }
-    if set(cfg) != {"mode", "prepare", "search", "budget", "provider", "annotation"}:
+    if type(cfg.get("exhaustive_seed_review", False)) is not bool:
+        raise ValueError("exhaustive_seed_review must be true or false")
+    if set(cfg) - {"exhaustive_seed_review"} != {"mode", "prepare", "search", "budget", "provider", "annotation"}:
         raise ValueError("Unknown or missing top-level configuration section")
     for name, fields in names.items():
         section = cfg[name]
@@ -66,6 +69,8 @@ def config(path=None, override=None):
         raise ValueError("budgets must be nonnegative integers")
     if combined["budget"]["stall_turns"] < 1 or combined["budget"]["max_actions_per_turn"] < 1:
         raise ValueError("stall_turns and max_actions_per_turn must be positive")
+    if not 1 <= combined["budget"]["seed_review_batch_size"] <= 128:
+        raise ValueError("seed_review_batch_size must be between 1 and 128")
     return combined
 
 
