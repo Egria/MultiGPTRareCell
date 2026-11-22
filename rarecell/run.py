@@ -17,7 +17,7 @@ from .config import ANNOTATED_MODES, MODES, RESOURCES, atomic, contract, fingerp
 from .discovery import Controller, SCIENTIFIC, prompt_version
 from .finalize import export
 from .prepare import verify_snapshot
-from .protocol import VERSION as PROTOCOL_VERSION, parse_message
+from .protocol import VERSION as PROTOCOL_VERSION, ProtocolError, parse_message
 
 
 def code_fingerprint():
@@ -174,7 +174,8 @@ def process_message(ctrl, message, turn):
                         raise ValueError("Closing review accepts select_boundary, propose_revision and submit")
                     result = ctrl.execute(command, mid)
                 except (ValueError, KeyError) as exc:
-                    result = {"error": str(exc)[:500], "status": "needs_clarification" if "error" in command else "blocked",
+                    clarification = "error" in command or isinstance(exc, ProtocolError)
+                    result = {"error": str(exc)[:500], "status": "needs_clarification" if clarification else "blocked",
                               "action": command.get("action")}
             logical = fingerprint([command.get("action"), command.get("args"), result.get("query_key"),
                                    result.get("evidence_id"), result.get("candidate_ids"), result.get("candidate_id")])
@@ -211,7 +212,7 @@ def process_message(ctrl, message, turn):
                 if changed:
                     s.put("Progress", logical, {"id": logical})
                 if "error" in result:
-                    metric = "protocol_errors" if "error" in command else "action_errors"
+                    metric = "protocol_errors" if result.get("status") == "needs_clarification" else "action_errors"
                     s.set_meta(metric, s.get_meta(metric, 0) + 1)
                     if str(result["error"]).startswith("max_new_queries"):
                         s.set_meta("denied_budget", True)

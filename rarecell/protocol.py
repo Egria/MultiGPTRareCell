@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
-VERSION = "soft-protocol-1.3"
+VERSION = "soft-protocol-1.4"
 MAX_CHARS = 512_000
 MAX_ACTIONS = 128
 
@@ -202,13 +202,15 @@ def _group(value):
     out = {}
     for raw, val in value.items():
         key = _field(raw)
-        if key in {"members", "candidate_ids", "exclude_candidate_ids"}:
+        if key == "evidence_ids":
+            clean = _ids(val, key, allow_empty=True)
+        elif key in {"members", "candidate_ids", "exclude_candidate_ids"}:
             clean = _ids(val, key)
         elif key == "matched_evidence_id":
             clean = _string(val, key)
         elif key == "candidate_id":
             key, clean = "candidate_ids", [_string(val, key)]
-        elif key in {"proposed_label", "rarity_reason"}:
+        elif key in EXPLANATIONS or key in {"proposed_label", "rarity_reason", "reason"}:
             clean = _string(val, key)
         elif key == "biological_rarity":
             clean = _choice(val, key, {s: s for s in ("yes", "no", "uncertain")})
@@ -224,7 +226,7 @@ def _group(value):
 
 def _value(key, value):
     if key in {"genes", "members", "background", "evidence_ids", "candidate_ids", "parents"}:
-        return _ids(value, key, allow_empty=key in {"evidence_ids", "candidate_ids"})
+        return _ids(value, key, allow_empty=key in {"evidence_ids", "candidate_ids", "parents"})
     if key == "metric":
         return _choice(value, key, {_word(name): name for name in ("score", "expression", "positive_expression")})
     if key == "background_mode":
@@ -280,11 +282,14 @@ def _validate(action, args):
     if action == "get_evidence" and "evidence_ids" in args and "candidate_id" in args:
         raise ProtocolError("choose evidence_ids or candidate_id")
     if action == "propose_revision":
-        missing = {"groups", "parents", "reason", "evidence_ids"} - present
-        if missing:
-            raise ProtocolError("revision missing " + ", ".join(sorted(missing)))
-        if not args["evidence_ids"]:
-            raise ProtocolError("revision requires supporting evidence_ids")
+        groups = args.get("groups")
+        if not groups:
+            raise ProtocolError("revision requires groups")
+        for field in ("reason", "evidence_ids"):
+            if not args.get(field) and not all(g.get(field) for g in groups):
+                raise ProtocolError(f"revision requires {field} on the action or on each group")
+        if not args.get("parents") and not (len(groups) == 1 and groups[0].get("candidate_ids")):
+            raise ProtocolError("provide explicit parents, or cite candidate_ids for one new group")
     # The one available expression layer was checked before removing the assertion.
     args.pop("layer", None)
 
@@ -346,6 +351,10 @@ def _normalize(obj):
         else:
             raise ProtocolError(f"unsupported {action} parameter: {key}")
     _validate(action, args)
+    for index, group in enumerate(args.get("groups", [])):
+        notes = {k: group.pop(k) for k in sorted(group.keys() & EXPLANATIONS)}
+        if notes:
+            metadata.setdefault("group_notes", []).append({"index": index, **notes})
     return {"action": action, "args": args, "metadata": metadata}
 
 
