@@ -12,6 +12,7 @@ from sklearn.random_projection import SparseRandomProjection
 
 from rarecell.config import config
 from rarecell.discovery import Controller
+from rarecell.run import process_message
 
 
 class LineageTests(unittest.TestCase):
@@ -43,6 +44,67 @@ class LineageTests(unittest.TestCase):
         self.addCleanup(c.state.close)
         c.initialize()
         return c
+
+    def test_evidence_read_preserves_expansion_and_scoped_revision_on_resume(self):
+        for mode in ("A3", "A3_adaptive"):
+            with self.subTest(mode=mode):
+                c = self.controller(mode=mode, run=mode)
+                def send(turn, action, **args):
+                    mid = f"run:T{turn:04d}"
+                    process_message(c, {"message_id": mid, "raw": json.dumps(dict(action=action, **args))}, turn)
+                    return c.state.get("Receipt", mid + "/0")["result"]
+
+                expansion = send(1, "expand_candidate", candidate_id="a")
+                eid = expansion["evidence_id"]
+                cid = expansion["candidate_id"]
+                cells = c.candidate(cid)["members"]
+                send(2, "get_evidence", evidence_ids=[eid], limit=20)
+                c = self.controller(mode=mode, run=mode)
+                ctx = c.context(3)
+                self.assertEqual(ctx["recent_expansions"][0], {"candidate_id": cid, "anchor_id": "a",
+                                                               "evidence_id": eid, "n": len(cells)})
+                self.assertFalse(ctx["selected_ids"])
+                observation_count = len(c.state.all("QueryObservation"))
+                group = {"candidate_ids": ["a"], "members": cells[1:], "proposed_label": "rare",
+                         "reason": "The added member shares the seed signature.", "evidence_ids": [eid, eid]}
+                revision = {"parents": [], "groups": [group], "reason": "Group the matching cells.", "evidence_ids": [eid]}
+                decision = send(3, "propose_revision", **revision)
+                draft, = decision["candidate_ids"]
+                self.assertEqual(c.candidate(draft)["members"], cells)
+                self.assertEqual(c.candidate(draft)["parents"], ["a"])
+                self.assertFalse(c.state.get_meta("submitted", False))
+                record = c.state.get("Decision", decision["decision_id"])
+                self.assertEqual(record["reason"], revision["reason"])
+                self.assertEqual(record["parents_from_candidate_ids"], ["a"])
+                interp, = [e for e in c.state.all("Evidence") if e["object"] == draft and e["kind"] == "interpretation"]
+                self.assertEqual(interp["summary"]["reason"], group["reason"])
+                self.assertEqual(interp["parent_ids"].count(eid), 1)
+                self.assertEqual(send(4, "propose_revision", **revision)["status"], "needs_clarification")
+                self.assertEqual(c.state.get_meta("selected"), [draft])
+                self.assertEqual(len(c.state.all("QueryObservation")), observation_count)
+                self.assertEqual(send(5, "submit")["candidate_ids"], [draft])
+
+    def test_sibling_citations_and_atomic_rejection(self):
+        c = self.controller()
+        e1, e2 = (c.candidate(cid)["evidence_ids"][0] for cid in ("b", "all"))
+        groups = [{"members": [cell], "evidence_ids": [eid], "reason": cell}
+                  for cell, eid in zip(["b1", "b2"], [e1, e2])]
+        def revise(mid):
+            raw = json.dumps({"action": "propose_revision", "parents": ["a"], "groups": groups})
+            process_message(c, {"message_id": mid, "raw": raw}, 1)
+            return c.state.get("Receipt", mid + "/0")["result"]
+        ids = revise("good")["candidate_ids"]
+        for cid in ids:
+            candidate = c.candidate(cid)
+            expected, other = (e1, e2) if candidate["members"] == ["b1"] else (e2, e1)
+            self.assertIn(expected, candidate["evidence_ids"])
+            self.assertNotIn(other, candidate["evidence_ids"])
+        candidates_before = set(c.candidates)
+        groups[0]["proposed_label"] = "new version"
+        groups[1]["evidence_ids"] = ["unknown-id"]
+        self.assertIn("Unknown evidence ID", revise("invalid")["error"])
+        self.assertEqual(set(c.candidates), candidates_before)
+        self.assertEqual(c.state.get_meta("selected"), ids)
 
     def test_expansion_depth_after_identical_revision_and_split(self):
         c = self.controller()

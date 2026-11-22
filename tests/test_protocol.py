@@ -131,6 +131,19 @@ def test_transactional_revision_group_normalization_preserves_sibling_roles():
     assert "error" in one({**base, "证据编号": []})
 
 
+def test_revision_source_inference_requires_one_group_with_exact_refs():
+    group = {"candidate": "H1", "理由": "seed supports membership", "证据编号": "E1", "备注": "small sample"}
+    revision = {"action": "propose_revision", "groups": [group]}
+    parsed = one(revision)
+    assert parsed["args"]["groups"][0] == {
+        "candidate_ids": ["H1"], "reason": group["理由"], "evidence_ids": ["E1"]}
+    assert parsed["metadata"]["group_notes"] == [{"index": 0, "note": "small sample"}]
+    for changes in ({"parents": None}, {"groups": [group, group]},
+                    {"groups": [{"members": ["cell"], "reason": "observed", "evidence_ids": ["E1"]}]},
+                    {"groups": [dict(group, threshold=0.5)]}):
+        assert one({**revision, **changes})["status"] == "needs_clarification"
+
+
 def test_gene_resolution_uses_versioned_stable_ids_and_exact_species():
     rows = [{"gene_id": "g1", "symbol": "TCR", "species": "human"},
             {"gene_id": "g2", "symbol": "TCR", "species": "mouse"},

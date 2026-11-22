@@ -1,4 +1,4 @@
-# Discovery 通信协议（soft-protocol-1.1）
+# Discovery 通信协议（soft-protocol-1.4）
 
 模型的一条完整回复包含一个动作，或者一个包含多个独立动作的数组。也接受 `{"actions":[...]}`。控制器提供当前 run、task、数据和契约版本，对回复中显式给出的绑定逐项比对。控制器按当前消融组许可、manifest 与证据登记表执行。解析器只输出结构化请求。
 
@@ -21,10 +21,14 @@
 | `compare_groups` | `candidate_id` 或 `members`。可选 `background_id` 或 `background`、`genes` | background 是明确的 cell_id 集合，background_id 引用候选。省略背景时取 foreground 的补集。空对照由科学工具标记。 |
 | `coexpress` | `candidate_id`、`members`、`scope="all"` 三选一，`genes` 必填。可选 `logic`、`threshold` | 逻辑为 AND（默认）或 OR。每个指定基因的 log1p 表达须严格大于阈值（默认 0）。 |
 | `expand_candidate` / `retrieve_cells` | `candidate_id`。可选 `background_id` 或 `background` | 跨全数据检索，背景只用于对照。一次扩展沿原始候选 lineage 记账。预算、门槛由运行配置决定。 |
-| `propose_revision` | `parents,groups,reason,evidence_ids` | 一个提案包含一个或多个群组。每组可给 `candidate_ids`、`members` 或二者的并集。可附 `proposed_label` 和 `status`。父候选和依据必填，组内成员必须合法，同一提案中各组互斥。关联编辑在同一事务提交。 |
+| `propose_revision` | `parents,groups`，以及动作或组内的 `reason,evidence_ids` | 每组可给 `candidate_ids`、`members` 或二者的并集，可附 `proposed_label` 和 `status`。每组都需要理由和可验证的证据。来源明确时按下文规则恢复父候选，各组在同一事务中更新。 |
 | `submit` | 可选 `candidate_ids,reason,evidence_ids,status` | 省略 candidate_ids 时提交当前选中的修订。显式 `[]` 表示没有选中的候选；剩余细胞交给确定性的回退分配。 |
 
 组的 status 可取 `provisional`、`unresolved`、`confirmed`，生物学名称可以为 `unknown`。submit 的 status 可取 `provisional` 或 `final`。提交意图与运行是否耗尽预算、是否存在外部阻塞分别记录。科学查询可以显式声明固定表达层 `layer="log1p"`。原始 counts 需要通过不同的计算规则处理，因此该层请求会得到局部错误。
+
+修订中的顶层理由记录在 Decision 上，组内理由记录在对应成员版本的解释证据上。顶层引用适用于所有组，组内引用只适用于该组。控制器按精确 ID 检查并去重。当前工作选择为空、提案只有一个组、组中显式给出来源 `candidate_ids` 时，允许省略 `parents` 或填 `[]`。控制器把来源登记在 `Decision.parents_from_candidate_ids`。已有工作选择时，模型须显式指定要替换的父候选。成功的修订更新工作选择，由后续 `submit` 正式提交。
+
+主动查询模式会在每轮上下文的 `recent_expansions` 中优先保留最近查看的扩展候选 ID。通常每项还包括种子 ID、证据 ID 和成员数。控制器从本次运行已保存的调查重建这些引用，读取证据或从检查点恢复后仍可直接提交对应 ID。其余引用在字节预算内提供，最多五项。
 
 每种动作都可显式带 `run_id,task_id,data_version,contract_version,message_id`。这些字段必须与控制器绑定值完全一致。控制器根据候选实际成员、实际基因 ID、背景、逻辑、门槛及影响结果的配置构造科学查询键。消息 ID、字段顺序和说明文字不参与科学查询键。
 

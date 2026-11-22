@@ -5,7 +5,7 @@ from pathlib import Path
 from . import __version__, adaptive
 from .base_evidence import FrozenSeurat, annotation_parents, prepared_page
 from .config import ADAPTIVE_MODE, ANNOTATED_MODES, contract, fingerprint, json_bytes, read_json, read_lines
-from .protocol import resolve_genes
+from .protocol import ProtocolError, resolve_genes
 from .science import METHOD_VERSION, Science
 from .state import State
 
@@ -17,7 +17,11 @@ CATALOGUE = {
     "compare_groups": "candidate_id or members, optional background_id or background, optional genes. Optional evidence_ids cite the reason for this query.",
     "coexpress": "candidate_id, members, or explicit scope=all; genes; optional AND/OR logic and threshold. Optional evidence_ids cite the reason for this query.",
     "expand_candidate": "candidate_id. Searches all cells; omitting background or scalar background=all uses local contrast. Use background_mode=complement for all nonmembers, or background_id/explicit background IDs. Optional evidence_ids cite the query. no_expansion means no additions.",
-    "propose_revision": "Atomic groups [{candidate_ids and/or members, optional proposed_label/status}], parents, reason and evidence_ids. Parents are superseded. Use multiple groups for split/reassignment.",
+    "propose_revision": ('Example shape (replace placeholder IDs): {"action":"propose_revision","parents":["H..."],'
+                         '"groups":[{"candidate_ids":["H..."],"proposed_label":"unknown"}],"reason":"...","evidence_ids":["E..."]}. '
+                         'Parents name candidates to supersede. Groups can union candidate_ids and members and carry their own '
+                         'reason, evidence_ids and status. If nothing is selected, one group can use its candidate_ids as parents. '
+                         'To accept an unchanged expansion, submit its ID in candidate_ids.'),
     "submit": "Optional candidate_ids to select instead of current proposals; reason and evidence_ids. Unclaimed cells get an unresolved baseline assignment.",
 }
 
@@ -31,8 +35,8 @@ GOAL = (
 
 def prompt_version(mode):
     if mode == ADAPTIVE_MODE:
-        return "discovery/adaptive-2"
-    return "discovery/1.3" if mode in {"A2", "A3"} else PROMPT_VERSION
+        return "discovery/adaptive-3"
+    return "discovery/1.4"
 
 
 def rows(path):
@@ -228,6 +232,15 @@ class Controller:
         return self.state.get_meta("stall", 0) >= self.budget["stall_turns"] and (
             bool(self.state.get_meta("selected", [])) or any(not c["initial"] for c in self.candidates.values()))
 
+    def expansion_links(self, receipts):
+        # Reconstruct from persisted investigations on every turn, also after resume.
+        items = [i for i in reversed(self.state.all("Investigation")) if i.get("proposed_revision_id")]
+        focus = {r["evidence_id"]: k for k, r in enumerate(receipts) if r.get("evidence_id")}
+        items.sort(key=lambda i: focus.get(i["evidence_id"], -1), reverse=True)
+        return [{"candidate_id": i["proposed_revision_id"], "anchor_id": i["candidate_id"],
+                 "evidence_id": i["evidence_id"], "n": len(self.candidate(i["proposed_revision_id"])["members"])}
+                for i in items[:5]]
+
     def context(self, turn):
         s = self.state
         actions = {k: v for k, v in CATALOGUE.items() if self.active or k not in SCIENTIFIC}
@@ -290,6 +303,8 @@ class Controller:
                     "in boundary_reviews. Submit the better-supported selection now, or take a distinct action."
                 )
             ctx["boundary_reviews"] = []
+            reviews = s.all("BoundaryReview")
+            ctx["boundary_review_count"] = len(reviews)
             ctx["recent_evidence_pages"] = s.get_meta("evidence_pages", [])[-5:]
             if self.stall_review():
                 ctx["actions"] = {k: actions[k] for k in ("select_boundary", "propose_revision", "submit")}
@@ -312,9 +327,14 @@ class Controller:
                 ctx[key].pop()
                 return False
             return True
+        links = self.expansion_links(recent) if self.active else []
+        if links:
+            ctx["recent_expansions"] = []
+            if not append_if_fits("recent_expansions", links[0]):
+                if not append_if_fits("recent_expansions", {"candidate_id": links[0]["candidate_id"]}):
+                    del ctx["recent_expansions"]
+                    links = []
         if self.adaptive:
-            reviews = s.all("BoundaryReview")
-            ctx["boundary_review_count"] = len(reviews)
             for review in reversed(reviews[-5:]):
                 if not append_if_fits("boundary_reviews", adaptive.review_card(self, review)):
                     break
@@ -336,6 +356,9 @@ class Controller:
             if "candidate" in receipt:
                 shown.add(receipt["candidate"]["id"])
         ctx["recent_receipts"].reverse()
+        for link in links[1:]:
+            if not append_if_fits("recent_expansions", link):
+                break
         for c in self.ordered():
             if c["id"] in shown:
                 continue
@@ -581,14 +604,23 @@ class Controller:
                 evidence_ids = evidence_ids + self.candidate(cid)["evidence_ids"]
                 evidence_ids = evidence_ids + self.current_label(cid).get("evidence_ids", [])
         else:
-            parents = [self.candidate(cid)["id"] for cid in args["parents"]]
-            if not parents or not evidence_ids:
-                raise ValueError("Revisions require parent candidates and registered evidence")
+            groups = args["groups"]
+            parent_ids = args.get("parents")
+            if not parent_ids:
+                if selected or len(groups) != 1 or not groups[0].get("candidate_ids"):
+                    raise ProtocolError("Specify parents to supersede when a selection exists, or when sources are ambiguous")
+                parent_ids = groups[0]["candidate_ids"]
+            parents = [self.candidate(cid)["id"] for cid in parent_ids]
+            reason = args.get("reason") or "\n".join(dict.fromkeys(group["reason"] for group in groups))
             chosen = []
             occupied = set()
             measured_evidence = set()
             revision_inputs = set(parents)
-            for group in args["groups"]:
+            for group in groups:
+                group_reason = group.get("reason", reason)
+                group_evidence = sorted(set(evidence_ids) | set(self.checked_evidence(group.get("evidence_ids", []))))
+                if not group_evidence:
+                    raise ValueError("Each revision group requires registered evidence")
                 refs = [self.candidate(cid) for cid in group.get("candidate_ids", [])]
                 revision_inputs.update(c["id"] for c in refs)
                 member_set = {m for c in refs for m in c["members"]}
@@ -600,7 +632,7 @@ class Controller:
                     if not self.adaptive:
                         raise ValueError("biological rarity metadata requires A3_adaptive")
                     rarity = {"assessment": group.get("biological_rarity", "uncertain"),
-                              "reason": group.get("rarity_reason", reason)}
+                              "reason": group.get("rarity_reason", group_reason)}
                 matched = group.get("matched_evidence_id")
                 if matched:
                     if not self.adaptive:
@@ -620,8 +652,8 @@ class Controller:
                 occupied.update(member_set)
                 inherited = set(parents) | {c["id"] for c in refs} | set(exclusions)
                 chosen.append(self.make_revision(member_set, inherited, group.get("proposed_label", "unknown"),
-                                                 group.get("status", "provisional"), evidence_ids + ([matched] if matched else []),
-                                                 "revision", reason, biological_rarity=rarity)["id"])
+                                                 group.get("status", "provisional"), group_evidence + ([matched] if matched else []),
+                                                 "revision", group_reason, biological_rarity=rarity)["id"])
             if self.adaptive:
                 # Revising from a held alternative also supersedes the old working
                 # boundary of that anchor. An exclusion alone leaves its draft intact.
@@ -634,6 +666,8 @@ class Controller:
             evidence_ids = list(evidence_ids) + sorted(measured_evidence) + [eid for cid in chosen for eid in self.candidate(cid)["evidence_ids"]]
         decision = {"action": action, "reason": reason, "evidence_ids": sorted(set(evidence_ids)),
                     "selected": sorted(selected), "message_id": message_id, "args_hash": fingerprint(args)}
+        if action == "propose_revision" and not args.get("parents"):
+            decision["parents_from_candidate_ids"] = parents
         if action == "submit":
             decision["status"] = args.get("status", "final")
             if self.adaptive:
