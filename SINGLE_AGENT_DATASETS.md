@@ -66,6 +66,17 @@ bash scripts/assemble_single_agent.sh cellsius_spheroid
   --dataset cellsius_spheroid --projectdir "$SINGLE_AGENT_PROJECT" --spheroid-plan
 ```
 
+已配置 Cell Ranger、SRA Toolkit、MCL 和原版兼容的 R 环境后，可在计算节点启动重建。下面两个环境变量分别填本机真实的 GRCh37 Cell Ranger 参考目录和 legacy Rscript 路径。已有同一数据的 filtered 10x 矩阵时，可将参考参数换为 `--spheroid-counts-dir "$FILTERED_10X"`，跳过原始测序下载与比对。
+
+```bash
+"$PREP_PYTHON" "$SINGLE_AGENT_CODE/module/preparation/prepare.py" prepare \
+  --dataset cellsius_spheroid --projectdir "$SINGLE_AGENT_PROJECT" --spheroid-reconstruct \
+  --spheroid-reference "${CELLRANGER_GRCH37:?set the reference path}" \
+  --spheroid-rscript "${LEGACY_RSCRIPT:?set the legacy Rscript path}" \
+  --spheroid-threads 8 --spheroid-memory-gb 64
+bash scripts/assemble_single_agent.sh cellsius_spheroid
+```
+
 ## 运行与评估
 
 GUI 中选择 A3_adaptive、live 和可用的模型。快速试跑可从 CellSIUS V001 开始，V000 可用于检查无目标背景。命令行使用已有的 real.yaml 和独立输出目录。
