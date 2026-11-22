@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import annotation, providers
 from .config import config, merge_config, read_json, write_json
+from .runtime import checkout, load_keys, model_overrides, project_model, save_project_model
 from .prepare import prepare, verify_snapshot
 from .run import discover, resume
 
@@ -69,11 +70,14 @@ def parser():
     def cmd(name, cfg=True):
         sub = subs.add_parser(name)
         if cfg:
+            sub.add_argument("--model", help="model for both discovery and annotation in this invocation")
             sub.add_argument("--config", type=Path, help="YAML overrides for the bundled defaults")
         return sub
     ui = cmd("ui", False)
     ui.add_argument("--workspace", type=Path, default=Path("work/tasks"), help="persistent dashboard task directory")
     ui.add_argument("--port", type=int, default=8787, help="loopback HTTP port (0 chooses a free port)")
+    model_cmd = cmd("model", False)
+    model_cmd.add_argument("--set", dest="value", help="save the project model (empty string clears it)")
     cmd("doctor")
     prep = cmd("prepare")
     prep.add_argument("--dataset", type=Path, required=True)
@@ -110,8 +114,12 @@ def parser():
     return p
 
 
-def dispatch(a):
+def dispatch(a, default_model=""):
     cmd = a.cmd
+    if cmd == "model":
+        if a.value is not None:
+            save_project_model(Path.cwd(), a.value)
+        return {"model": project_model(Path.cwd())}
     if cmd == "ui":
         from .dashboard import serve
         return serve(a.workspace, a.port)
@@ -121,7 +129,7 @@ def dispatch(a):
         from .evaluation import evaluate
         metrics = evaluate(a.run, a.gt, a.out)
         return {"output": str(a.out), "freeze_sha256": metrics["freeze_sha256"], "submitted_partition": metrics["submitted_partition"]}
-    cfg = config(a.config)
+    cfg = config(a.config, model_overrides(a.model or default_model))
     if cmd == "doctor":
         return doctor(cfg)
     if cmd == "prepare":
@@ -155,7 +163,12 @@ def dispatch(a):
 
 def main(argv=None):
     try:
-        answer = dispatch(parser().parse_args(argv))
+        args = parser().parse_args(argv)
+        project = checkout(Path.cwd())
+        if project:
+            load_keys(project / ".api_keys")
+        default = project_model(Path.cwd()) if hasattr(args, "config") else ""
+        answer = dispatch(args, default)
         if answer is None:
             return 0
         print(json.dumps(answer, indent=2, ensure_ascii=False, default=str))
@@ -170,3 +183,7 @@ def main(argv=None):
     except (OSError, ValueError, KeyError) as exc:
         print("%s: %s" % (type(exc).__name__, exc), file=sys.stderr)
         return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
