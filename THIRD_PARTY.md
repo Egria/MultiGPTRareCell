@@ -13,6 +13,8 @@
 
 [Seurat 官方函数说明](https://satijalab.org/seurat/reference/findclusters) 和 v5.3.0 的 `R/clustering.R` 已核对。后者有串行和并行单例分组路径，使用固定版本与串行运行。关闭 `group.singletons` 仍可能产生共享字符串 `singleton`，桥接层依据原始 cell_id 拆开。Seurat 自身没有提供本版定义的全部 outlier 规则。
 
+在 R 4.3.1 和 irlba 2.4.1 上，Seurat 的默认 PCA 调用可能在 `oknum(scale)` 处报 `LENGTH or similar applied to NULL object`。桥接脚本对经过 `ScaleData` 的矩阵调用 `RunPCA(..., scale=FALSE, shift=FALSE)`，显式关闭 irlba 的额外缩放和平移。成功的快照在 `seurat/versions.tsv` 记录 irlba 版本。更新前已在 PCA 阶段失败的任务需要重新准备快照，GUI 可用原数据和配置新建任务。
+
 ## OntoAnno 对接细节
 
 作者的 `run_multi_resolution_clustering` 写 `markers_res_<resolution>.rds`，并把每个 resolution 的标签放入 `cluster_res.<resolution>`。作者高层 `ontoanno` 按同一约定读取，并执行 resolution 选择。本适配器直接调用已导出的注释子函数，按 prepare 产生的精确 partition_id、group_id 和成员集合匹配 `seurat/markers.tsv`。HVG 名单及原始划分留在原 snapshot 中。实际注释对象为各个 HVG 的 Seurat partition；其他视角、singleton 和无阳性 marker 的种子继续参加探索。
