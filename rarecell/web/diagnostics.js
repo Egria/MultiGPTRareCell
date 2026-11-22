@@ -153,6 +153,66 @@ async function loadDiagnostics(page) {
     if (version === diagVersion) $("diag-status").textContent = err.message;
   }
 }
+let transcriptRequest = null, transcriptTag = "", transcriptTimer;
+const transcriptView = $("transcript");
+const transcriptButtons = ["transcript-copy", "transcript-save", "transcript-print"];
+
+async function loadTranscript() {
+  if (!diagTask || transcriptRequest || !diagDialog.open) return;
+  const id = diagTask, controller = new AbortController();
+  transcriptRequest = controller;
+  try {
+    const headers = {Authorization: "Bearer " + token};
+    if (transcriptTag) headers["If-None-Match"] = transcriptTag;
+    const response = await fetch("/api/tasks/" + id + "/diagnostics/transcript", {
+      headers, signal: controller.signal
+    });
+    if (response.status === 304) return;
+    if (!response.ok) throw new Error((await response.json()).error || "读取行为记录失败");
+    const text = await response.text();
+    if (controller.signal.aborted || diagTask !== id) return;
+    const pos = transcriptView.scrollTop;
+    transcriptView.textContent = text;
+    transcriptView.scrollTop = pos;
+    transcriptTag = response.headers.get("ETag");
+    transcriptButtons.forEach(name => $(name).disabled = false);
+    $("transcript-status").textContent = "已读取全部已保存记录 · Ctrl+F 可搜索候选 ID";
+  } catch (err) {
+    if (!controller.signal.aborted) $("transcript-status").textContent = err.message;
+  } finally {
+    if (transcriptRequest === controller) transcriptRequest = null;
+  }
+}
+
+function stopTranscript() {
+  clearInterval(transcriptTimer);
+  transcriptRequest?.abort();
+  transcriptRequest = null;
+}
+
+$("transcript-copy").onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(transcriptView.textContent);
+    $("transcript-status").textContent = "已复制全文";
+  } catch {
+    const range = document.createRange();
+    range.selectNodeContents(transcriptView);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    $("transcript-status").textContent = "已选中全文，可手动复制。";
+  }
+};
+$("transcript-save").onclick = () => {
+  const url = URL.createObjectURL(new Blob([transcriptView.textContent], {type:"text/plain;charset=utf-8"}));
+  const link = element("a");
+  link.href = url;
+  link.download = "rarecell-" + diagTask + "-transcript.txt";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+};
+$("transcript-print").onclick = () => window.print();
+
 function openDiagnostics(id, name) {
   diagTask = id;
   diagPage = 0;
@@ -162,11 +222,18 @@ function openDiagnostics(id, name) {
   $("diag-overview").replaceChildren();
   $("diag-turns").replaceChildren();
   $("diag-pager").hidden = true;
+  stopTranscript();
+  transcriptTag = "";
+  transcriptView.textContent = "";
+  transcriptButtons.forEach(name => $(name).disabled = true);
+  $("transcript-status").textContent = "正在读取全部已保存记录…";
   diagDialog.showModal();
   loadDiagnostics(0);
+  loadTranscript();
+  transcriptTimer = setInterval(() => { if (!document.hidden) loadTranscript(); }, 6500);
 }
 $("open-diagnostics").onclick = () => openDiagnostics(current.id, current.name);
-$("diag-refresh").onclick = () => loadDiagnostics(0);
+$("diag-refresh").onclick = () => { transcriptTag = ""; loadDiagnostics(0); loadTranscript(); };
 $("diag-copy").onclick = async () => {
   try {
     await navigator.clipboard.writeText(diagnosticText);
@@ -183,4 +250,4 @@ $("diag-copy").onclick = async () => {
 $("diag-prev").onclick = () => loadDiagnostics(diagPage - 1);
 $("diag-next").onclick = () => loadDiagnostics(diagPage + 1);
 $("close-diagnostics").onclick = () => diagDialog.close();
-diagDialog.onclose = () => { diagTask = null; diagVersion++; };
+diagDialog.onclose = () => { diagTask = null; diagVersion++; stopTranscript(); };

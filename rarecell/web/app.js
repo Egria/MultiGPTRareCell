@@ -170,6 +170,13 @@ async function refresh() {
   loading = true;
   try {
     const data = await api("/api/tasks");
+    if (data.ui_revision && document.documentElement.dataset.uiRevision !== data.ui_revision &&
+        !$("create").open && !busy && (savedModel === null || $("project-model").value === savedModel)) {
+      sessionStorage.setItem("rarecell-reopen", JSON.stringify({id:selected, diagnostics:$("diagnostics").open,
+        filter:$("filter").value, search:$("search").value}));
+      location.reload();
+      return;
+    }
     tasks = data.tasks;
     displayModel(data.model);
     render();
@@ -369,5 +376,18 @@ form.elements.annotations.oninput = updateForm;
 $("search").oninput = render;
 $("filter").onchange = render;
 document.querySelectorAll("[data-close]").forEach((b) => (b.onclick = () => $(b.dataset.close).close()));
-refresh();
-setInterval(refresh, 2500);
+window.addEventListener("DOMContentLoaded", () => {
+  const saved = sessionStorage.getItem("rarecell-reopen");
+  sessionStorage.removeItem("rarecell-reopen");
+  if (saved) {
+    const view = JSON.parse(saved);
+    $("filter").value = view.filter;
+    $("search").value = view.search;
+    if (view.id) {
+      openDetail(view.id);
+      if (view.diagnostics) openDiagnostics(view.id, view.id);
+    }
+  }
+  refresh();
+  setInterval(refresh, 2500);
+});

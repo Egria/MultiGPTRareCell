@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -17,6 +18,8 @@ import yaml
 from . import job_queue as jobs
 from .config import read_json
 from .dashboard_diagnostics import diagnostics
+from .dashboard_transcript import transcript
+from .dashboard_reload import serve as serve
 from .runtime import project_model, save_project_model
 
 WEB = Path(__file__).with_name("web")
@@ -73,15 +76,23 @@ def detail(root, task_id):
 
 
 class Dashboard(ThreadingHTTPServer):
-    daemon_threads = True
+    daemon_threads = False  # Finish in-flight requests when a hot update retires this backend.
 
-    def __init__(self, root, project, port=8787):
+    def __init__(self, root, project, port=8787, *, listener=None, token=None):
         self.root = Path(root).resolve()
         self.project = Path(project).resolve()
         jobs.initialize(self.root)
-        self.token = secrets.token_urlsafe(32)
+        self.token = token or secrets.token_urlsafe(32)
+        self.revision = secrets.token_hex(12)
+        self.assets = {url: (WEB / name).read_bytes() for url, name in ASSETS.items()}
+        self.assets["/"] = self.assets["/"].replace(b"__UI_REVISION__", self.revision.encode())
         self.worker = None
-        super().__init__(("127.0.0.1", port), Handler)
+        super().__init__(listener.getsockname() if listener else ("127.0.0.1", port), Handler,
+                         bind_and_activate=listener is None)
+        if listener is not None:
+            self.socket.close()
+            self.socket = listener
+            self.server_name, self.server_port = listener.getsockname()
 
     def service_actions(self):
         if self.worker is not None and self.worker.poll() is None:
@@ -103,6 +114,8 @@ class Dashboard(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 30
+
     # No access logs containing capability URLs, paths or user-supplied headers.
     def log_message(self, fmt, *args):
         pass
@@ -127,7 +140,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if method == "GET" and path in ASSETS:
             asset = WEB / ASSETS[path]
-            return self.reply(asset.read_bytes(), mime=mimetypes.guess_type(asset.name)[0] + "; charset=utf-8")
+            return self.reply(self.server.assets[path], mime=mimetypes.guess_type(asset.name)[0] + "; charset=utf-8")
         key = self.headers.get("Authorization", "")
         if not secrets.compare_digest(key.encode(), ("Bearer " + self.server.token).encode()):
             return self.reply({"error": "请使用启动终端显示的完整链接重新打开控制台"}, 401)
@@ -141,10 +154,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/tasks":
             if method == "GET":
                 return self.reply({"tasks": jobs.list_tasks(root), "host": socket.gethostname(),
-                                   "workspace": str(root), "project": str(self.server.project),
+                                   "workspace": str(root), "project": str(self.server.project), "ui_revision": self.server.revision,
                                    "model": project_model(self.server.project)})
             task_id = jobs.submit(root, self.server.project, self.body())
             return self.reply({"id": task_id}, 201)
+        full = re.fullmatch(r"/api/tasks/([0-9a-f]{32})/diagnostics/transcript", path)
+        if method == "GET" and full:
+            tag, body = transcript(root, jobs.get_task(root, full[1]), self.headers.get("If-None-Match"))
+            self.send_response(304 if body is None else 200)
+            if tag:
+                self.send_header("ETag", tag)
+            if body is not None:
+                self.headers_for("text/plain; charset=utf-8", len(body))
+            self.end_headers()
+            if body is not None:
+                self.wfile.write(body)
+            return
         diag = re.fullmatch(r"/api/tasks/([0-9a-f]{32})/diagnostics(?:/turn/([1-9][0-9]{0,8}))?", path)
         if method == "GET" and diag:
             task = jobs.get_task(root, diag[1])
@@ -198,11 +223,23 @@ class Handler(BaseHTTPRequestHandler):
         self.handle_method("POST")
 
 
-def serve(root, port):
-    with Dashboard(root, Path.cwd(), port) as server:
-        print("RareCell 任务控制台（私人链接）", flush=True)
-        print("http://127.0.0.1:%d/#%s" % (server.server_port, server.token), flush=True)
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
+def serve_inherited(root, project, listener_fd, control_fd):
+    with socket.socket(fileno=control_fd) as control, socket.socket(fileno=listener_fd) as listener:
+        # The supervisor alone owns the login across reloads. EOF also stops this
+        # process when the supervisor exits unexpectedly.
+        with control.makefile("rb", buffering=0) as stream:
+            token = stream.readline(128).decode("ascii").strip()
+        if not token:
+            return
+        with Dashboard(root, project, listener=listener, token=token) as server:
+            def retire():
+                control.recv(1)
+                server.shutdown()
+
+            threading.Thread(target=retire, daemon=True).start()
+            control.sendall(b"1")
+            server.serve_forever(poll_interval=.2)
+
+
+if __name__ == "__main__":
+    serve_inherited(Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]))
