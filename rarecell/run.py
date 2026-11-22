@@ -17,7 +17,7 @@ from .config import RESOURCES, atomic, contract, fingerprint, hash_file, read_js
 from .discovery import Controller, PROMPT_VERSION, SCIENTIFIC
 from .finalize import export
 from .prepare import verify_snapshot
-from .protocol import parse_message
+from .protocol import VERSION as PROTOCOL_VERSION, parse_message
 
 
 def code_fingerprint():
@@ -139,7 +139,7 @@ def repaired_locally(raw, parsed):
 def process_message(ctrl, message, turn):
     s = ctrl.state
     mid = message["message_id"]
-    parse_id = fingerprint(["protocol/1", message["raw"], message.get("complete", True)])
+    parse_id = fingerprint([PROTOCOL_VERSION, message["raw"], message.get("complete", True)])
     interpretation = lookup(s, "ParsedMessage", parse_id)
     if interpretation is None:
         parsed = parse_message(message["raw"], origin="agent", complete=message.get("complete", True))
@@ -186,6 +186,11 @@ def process_message(ctrl, message, turn):
                         observations = sorted(e for e in c["evidence_ids"] if s.get("Evidence", e)["kind"] == "observation")
                         projection.add(fingerprint([c["set_hash"], c["proposed_label"], c["status"], observations]))
                     logical = fingerprint(["selected", sorted(projection)])
+                elif command.get("action") in {"get_evidence", "list_candidates"}:
+                    # Reading rows is distinct from computing their underlying observation.
+                    # Equal pages also stay equal when expressed with different paging arguments.
+                    page = {k: v for k, v in result.items() if k not in {"offset", "limit"}}
+                    logical = fingerprint([command["action"], page])
                 elif result.get("query_key"):
                     logical = fingerprint(["query", result["query_key"]])
                 changed = lookup(s, "Progress", logical) is None

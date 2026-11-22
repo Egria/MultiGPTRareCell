@@ -9,14 +9,14 @@ from .protocol import resolve_genes
 from .science import METHOD_VERSION, Science
 from .state import State
 
-PROMPT_VERSION = "discovery/1.1"
+PROMPT_VERSION = "discovery/1.2"
 SCIENTIFIC = {"expand_candidate", "coexpress", "compare_groups"}
 CATALOGUE = {
     "list_candidates": "offset, limit. Browse stable candidate IDs and short evidence cards.",
     "get_evidence": "candidate_id or evidence_ids, offset, limit. A single evidence_id pages frozen HVG or Seurat Wilcoxon marker tables in every mode, or active-query results where enabled. A candidate pages its exact cell IDs.",
-    "compare_groups": "candidate_id or members, optional background_id or background, optional genes.",
-    "coexpress": "candidate_id, members, or explicit scope=all; genes; optional AND/OR logic and threshold.",
-    "expand_candidate": "candidate_id, optional explicit background_id or background. Searches all cells. Inspect the returned revision.",
+    "compare_groups": "candidate_id or members, optional background_id or background, optional genes. Optional evidence_ids cite the reason for this query.",
+    "coexpress": "candidate_id, members, or explicit scope=all; genes; optional AND/OR logic and threshold. Optional evidence_ids cite the reason for this query.",
+    "expand_candidate": "candidate_id, optional explicit background_id or background. Searches all cells. Optional evidence_ids cite the reason for this query. no_expansion means no cells were added.",
     "propose_revision": "Atomic groups [{candidate_ids and/or members, optional proposed_label/status}], parents, reason and evidence_ids. Parents are superseded. Use multiple groups for split/reassignment.",
     "submit": "Optional candidate_ids to select instead of current proposals; reason and evidence_ids. Unclaimed cells get an unresolved baseline assignment.",
 }
@@ -209,6 +209,8 @@ class Controller:
         recent = s.get_meta("receipts", [])
         queries = s.all("CanonicalQuery")
         usage = s.usage()
+        stalled_turns = s.get_meta("stall", 0)
+        stalls_left = self.budget["stall_turns"] - stalled_turns
         ctx = {"contract": contract(), "goal": GOAL, "mode": self.mode, "actions": actions,
                "bindings": {"run_id": s.get_meta("run_id"), "task_id": "discovery",
                             "data_version": self.version, "contract_version": contract()["version"]},
@@ -216,6 +218,7 @@ class Controller:
                "views": self.manifest["views"], "candidate_count": len(self.candidates),
                "selected_count": len(s.get_meta("selected", [])),
                "remaining": {"turns_including_this": max(0, self.budget["max_agent_turns"] - turn + 1),
+                             "consecutive_no_progress_turns_before_stop": stalls_left,
                              "new_queries": self.budget["max_new_queries"] - usage["new_queries"] if self.active else 0,
                              "lineage_max_depth": self.budget["max_expansion_depth"]},
                "current_candidates": [], "recent_receipts": [], "prior_queries": [],
@@ -228,6 +231,23 @@ class Controller:
         )
         if turn == self.budget["max_agent_turns"]:
             ctx["turn_instruction"] = "This is the final turn. Submit your best supported assignment with current evidence."
+        elif stalled_turns:
+            ctx["turn_instruction"] += (
+                " The previous turn made no progress. A repeated page, query, or rejected action cannot reset the stall counter."
+                " Use an unread evidence page or a distinct permitted investigation only if it could change membership."
+            )
+            if stalls_left == 1:
+                ctx["turn_instruction"] += (
+                    " One more turn without progress ends this run. Submit your best supported candidate_ids now"
+                    " if no such investigation is needed. An empty selection is valid when none are supported."
+                )
+            if self.active and ctx["remaining"]["new_queries"] > 0:
+                depths = s.get_meta("depths", {})
+                selected = set(s.get_meta("selected", []))
+                pending = sorted({seed["candidate_id"] for seed in s.all("Seed")
+                                  if not depths.get(seed["candidate_id"]) and seed["candidate_id"] not in selected})
+                if pending:
+                    ctx["pending_seeds"] = {"count": len(pending), "candidate_ids": pending[:3]}
         if not self.active:
             ctx["mode_constraint"] = "Choose or combine complete precomputed candidate sets. No new scientific queries."
         # Reserve the entire contract, catalogue and budgets in every turn.
@@ -280,6 +300,7 @@ class Controller:
     def scientific(self, action, args):
         if not self.active:
             raise ValueError("New scientific queries are disabled in " + self.mode)
+        self.checked_evidence(args.get("evidence_ids", []))
         all_scope = args.get("scope") == "all"
         members = sorted(self.cells) if all_scope else self.resolve_members(args)
         bound = {"members": members}
@@ -348,6 +369,8 @@ class Controller:
         # subset. Record that context without manufacturing a second observation.
         selection_ids = sorted(parents.difference({eid}))
         use = {"canonical_query_key": key, "evidence_id": eid, "selection_evidence_ids": selection_ids}
+        if args.get("evidence_ids"):
+            use["cited_evidence_ids"] = sorted(set(args["evidence_ids"]))
         use_id = "U" + fingerprint(use)
         self.state.put("QueryUse", use_id, dict(use, id=use_id))
         response = {"action": action, "query_key": key, "evidence_id": eid, "query_use_id": use_id,
