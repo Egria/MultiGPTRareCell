@@ -35,8 +35,14 @@ def imported_views(project):
             if folder.name.startswith(".") or folder.parent.name.startswith(".") or not path.is_file():
                 continue
             gt = folder / "evaluation_fixture/gt.tsv"
-            choices.append({"label": f"{folder.parent.name} / {folder.name}", "dataset": str(path),
-                            "gt": str(gt) if verified and gt.is_file() else ""})
+            label = f"{folder.parent.name} / {folder.name}"
+            choices.append({"label": label, "dataset": str(path), "gt": str(gt) if verified and gt.is_file() else ""})
+            if verified:
+                for filename, title in (("labels_l1.tsv", "作者 L1"), ("labels_l3.tsv", "作者 L3"),
+                                        ("targets.tsv", "逐目标 F1")):
+                    reference = gt.with_name(filename)
+                    if reference.is_file():
+                        choices.append({"label": label, "dataset": str(path), "gt": str(reference), "profile": title})
     return choices
 
 

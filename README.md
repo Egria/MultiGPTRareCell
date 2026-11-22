@@ -12,7 +12,7 @@
 .venv/bin/rarecell ui --workspace work/tasks --port 8787
 ```
 
-新环境先按下节安装依赖。旧数据适配、GT 导入、其余数据集和 Windows 访问 DCC GUI 的步骤见[数据使用说明](SINGLE_AGENT_DATASETS.md)。
+已有旧评估目录时，在仓库根目录运行 `bash scripts/convert_benchmarks.sh` 即可批量导入 12 个基准的全部已有 view 和匹配的 GT。脚本默认读取 `../data` 与 `../LLMRareCell/benchmark`。新环境先按下节安装依赖。旧数据适配、GT 导入、其余数据集和 Windows 访问 DCC GUI 的步骤见[数据使用说明](SINGLE_AGENT_DATASETS.md)。
 
 ## 安装与第一次运行
 
