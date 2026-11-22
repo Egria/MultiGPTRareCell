@@ -87,6 +87,9 @@ def parser():
     an = cmd("annotate")
     an.add_argument("--snapshot", type=Path, required=True)
     an.add_argument("--out", type=Path, required=True)
+    an.add_argument("--include-singletons", action=argparse.BooleanOptionalAction, default=None,
+                    help="annotate frozen singleton seeds using positive expression contrasts")
+    an.add_argument("--reuse-annotations", type=Path, help="reuse matching verified batches from an earlier annotation")
     d = cmd("discover")
     d.add_argument("--snapshot", type=Path, required=True)
     d.add_argument("--run", type=Path, required=True)
@@ -136,6 +139,8 @@ def dispatch(a, default_model=""):
     overrides = model_overrides(a.model or default_model)
     if cmd == "discover" and a.exhaustive_seed_review is not None:
         overrides["exhaustive_seed_review"] = a.exhaustive_seed_review
+    if cmd == "annotate" and a.include_singletons is not None:
+        overrides.setdefault("annotation", {})["include_singletons"] = a.include_singletons
     cfg = config(a.config, overrides)
     if cmd == "doctor":
         return doctor(cfg)
@@ -144,7 +149,7 @@ def dispatch(a, default_model=""):
         m = verify_snapshot(a.out)
         return {k: m.get(k) for k in ("snapshot_hash", "status", "views", "stages")}
     if cmd == "annotate":
-        return annotation.annotate(a.snapshot, a.out, cfg)
+        return annotation.annotate(a.snapshot, a.out, cfg, reuse=a.reuse_annotations)
     if cmd == "discover":
         return discover(a.snapshot, a.run, a.cache or a.run.parent / "query_cache", cfg, mode=a.mode,
                         annotations=a.annotations, policy=a.policy, replication_id=a.replication_id, pause_after=a.pause_after)

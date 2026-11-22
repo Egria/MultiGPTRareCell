@@ -80,8 +80,8 @@ def submit(root, project, form):
     if any(not form.get(k) for k in required):
         raise ValueError("缺少必填输入：" + "、".join(required))
     path_fields = {
-        "pipeline": ("dataset", "snapshot", "annotations", "config", "gt"),
-        "prepare": ("dataset", "config"), "annotate": ("snapshot", "config"),
+        "pipeline": ("dataset", "snapshot", "annotations", "reuse_annotations", "config", "gt"),
+        "prepare": ("dataset", "config"), "annotate": ("snapshot", "config", "reuse_annotations"),
         "discover": ("snapshot", "annotations", "config", "gt"), "evaluate": ("run", "gt"),
         "resume": ("run", "gt"), "inspect": ("run",), "demo": (),
     }
@@ -89,7 +89,7 @@ def submit(root, project, form):
         spec["retry_unknown"] = True
     for key in path_fields[kind]:
         if form.get(key):
-            spec[key] = input_path(form[key], project, key in {"snapshot", "annotations", "run"})
+            spec[key] = input_path(form[key], project, key in {"snapshot", "annotations", "reuse_annotations", "run"})
     if kind in {"resume", "inspect"} and not (Path(spec["run"]) / "checkpoint.json").is_file():
         raise ValueError("运行目录中缺少 checkpoint.json")
     if kind == "evaluate" and not (Path(spec["run"]) / "frozen.json").is_file():
@@ -106,12 +106,18 @@ def submit(root, project, form):
                 override["exhaustive_seed_review"] = setting == "yes"
             elif setting:
                 raise ValueError("无效的种子调查选项")
+        if kind in {"annotate", "pipeline"} and form.get("include_singletons"):
+            if form["include_singletons"] not in {"yes", "no"}:
+                raise ValueError("无效的单细胞注释选项")
+            override.setdefault("annotation", {})["include_singletons"] = form["include_singletons"] == "yes"
         cfg = config(spec.get("config"), override)
         if kind in {"pipeline", "discover"} and cfg.get("exhaustive_seed_review") and mode not in ACTIVE_MODES:
             raise ValueError("强制逐种子调查需要 A2、A3 或 A3_adaptive")
         if kind in {"pipeline", "discover"} and not cfg["provider"].get("model"):
             raise ValueError("请填写发现模型，或选择包含 provider.model 的配置文件")
         needs_annotation = kind == "annotate" or (kind == "pipeline" and mode in ANNOTATED_MODES and not spec.get("annotations"))
+        if spec.get("reuse_annotations") and (not needs_annotation or not spec.get("snapshot")):
+            raise ValueError("复用注释批次需要在已有快照上运行注释")
         if needs_annotation and (not cfg["annotation"].get("model") or not cfg["annotation"].get("enabled")):
             raise ValueError("请启用注释并指定 annotation.model，或选择已有注释目录")
         if kind == "discover" and mode in ANNOTATED_MODES and not spec.get("annotations"):
@@ -169,7 +175,8 @@ def steps(root, task):
     if kind == "prepare" or (kind == "pipeline" and "snapshot" not in spec):
         yield ["prepare", "--dataset", spec["dataset"], "--out", snapshot] + cfg
     if kind == "annotate" or (kind == "pipeline" and mode in ANNOTATED_MODES and "annotations" not in spec):
-        yield ["annotate", "--snapshot", snapshot, "--out", annotations] + cfg
+        reuse = ["--reuse-annotations", spec["reuse_annotations"]] if spec.get("reuse_annotations") else []
+        yield ["annotate", "--snapshot", snapshot, "--out", annotations] + reuse + cfg
     if kind in {"discover", "pipeline"}:
         args = ["discover", "--snapshot", snapshot, "--mode", mode, "--policy", "live", "--run", run]
         if mode in ANNOTATED_MODES:

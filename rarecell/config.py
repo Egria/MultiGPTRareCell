@@ -30,8 +30,10 @@ def validate_settings(cfg):
     from .providers import safe_url
     names = {
         "provider": {"kind", "base_url", "endpoint", "api_style", "model", "api_key_env", "timeout", "options"},
-        "annotation": {"enabled", "provider", "model", "base_url", "api_key_env", "top_genes", "timeout", "rscript", "retry_unknown", "batch_size", "single_line_stop"},
+        "annotation": {"enabled", "provider", "model", "base_url", "api_key_env", "top_genes", "timeout", "rscript", "retry_unknown", "batch_size", "single_line_stop", "include_singletons"},
     }
+    if isinstance(cfg.get("annotation"), dict) and type(cfg["annotation"].get("include_singletons", False)) is not bool:
+        raise ValueError("annotation.include_singletons must be true or false")
     if type(cfg.get("exhaustive_seed_review", False)) is not bool:
         raise ValueError("exhaustive_seed_review must be true or false")
     if set(cfg) - {"exhaustive_seed_review"} != {"mode", "prepare", "search", "budget", "provider", "annotation"}:

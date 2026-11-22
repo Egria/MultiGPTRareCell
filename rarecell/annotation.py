@@ -1,4 +1,4 @@
-"""Read-only OntoAnno projection of existing Seurat partitions."""
+"""Read-only OntoAnno projection of Seurat partitions and optional singleton expression contrasts."""
 import csv
 import fcntl
 import hashlib
@@ -13,6 +13,7 @@ from collections import defaultdict
 
 from .config import atomic as _write, fingerprint as _hash, hash_file as _digest
 from .config import json_bytes as _encode, read_json as _read
+from . import singleton_markers
 from .providers import safe_url
 from .runtime import rscript_command
 
@@ -36,6 +37,9 @@ def _resolve(cfg):
     provider = options.get("provider", "openai")
     if provider not in ("openai", "anthropic", "gemini", "ollama", "vllm"):
         raise ValueError("unsupported OntoAnno HTTP provider")
+    include = options.get("include_singletons", False)
+    if type(include) is not bool:
+        raise ValueError("annotation.include_singletons must be true or false")
     top = options.get("top_genes", 10)
     if type(top) is not int or not 1 <= top <= 100:
         raise ValueError("top_genes must be between 1 and 100")
@@ -72,7 +76,7 @@ def _resolve(cfg):
         raise ValueError("annotation.timeout must be positive and finite")
     return {"provider": provider, "model": model, "api_key_env": env, "base_url": url,
             "top_genes": top, "timeout": timeout, "batch_size": batch_size,
-            "single_line_stop": stop_line}
+            "single_line_stop": stop_line, **({"include_singletons": True} if include else {})}
 
 
 def diagnose(cfg):
@@ -128,8 +132,20 @@ def _groups(snapshot):
     return candidates, marker_rows
 
 
+def _partition_issue(manifest):
+    if "views" in manifest and "V_HVG" not in manifest["views"]:
+        return "V_HVG Seurat partition unavailable"
+    stage = manifest.get("stages", {}).get("seurat_markers", {})
+    if "stages" in manifest and stage.get("status") != "ok":
+        return stage.get("reason") or "Seurat marker stage unavailable"
+    return None
+
+
 def _jobs(snapshot, manifest, settings):
-    candidates, markers = _groups(snapshot)
+    candidates, markers = ({}, {}) if _partition_issue(manifest) else _groups(snapshot)
+    include = settings.get("include_singletons", False)
+    # Preserve the exact historical partition job and its content-addressed receipt.
+    partition_settings = {k: v for k, v in settings.items() if k != "include_singletons"}
     by_resolution, skipped = defaultdict(list), []
     for key, info in sorted(candidates.items()):
         rows = markers[key]
@@ -140,6 +156,7 @@ def _jobs(snapshot, manifest, settings):
         group = dict(info, marker_hash=_hash(rows), genes=genes[:settings["top_genes"]])
         if info["n_members"] == 1 or not genes:
             skipped.append(dict(group, status="not_annotatable",
+                                **({"marker_source": "seurat_partition"} if include else {}),
                                 reason="singleton" if info["n_members"] == 1 else "no_positive_markers"))
         else:
             by_resolution[key[0]].append(group)
@@ -148,7 +165,7 @@ def _jobs(snapshot, manifest, settings):
                      + CONTRACT.read_text())
     head = {"commit": PIN, "prompt_version": PROMPT, "adapter_sha256": _digest(SCRIPT),
             "contract_sha256": _digest(CONTRACT), "snapshot_hash": manifest["snapshot_hash"],
-            "data_version": manifest["data_version"], "settings": settings, "system_prompt": system_prompt,
+            "data_version": manifest["data_version"], "settings": partition_settings, "system_prompt": system_prompt,
             "tissue": " ".join(str(manifest.get(k) or "") for k in ("species", "tissue")).strip()}
     jobs = []
     for res, group_list in sorted(by_resolution.items()):
@@ -160,6 +177,22 @@ def _jobs(snapshot, manifest, settings):
                     "There are {} cluster(s) in this request. Output exactly {} line(s), one tentative "
                     "cell type per cluster. If evidence is insufficient, answer unknown.").format(len(batch), len(batch))
             jobs.append(dict(head, resolution=res, groups=batch, system_prompt=system_prompt + note))
+    if include:
+        eligible = []
+        for group in singleton_markers.panels(snapshot, settings["top_genes"]):
+            if group["genes"]:
+                eligible.append(group)
+            else:
+                skipped.append(dict(group, status="not_annotatable"))
+        size = settings["batch_size"]
+        for start in range(0, len(eligible), size):
+            batch = eligible[start:start + size]
+            note = (f"Each of these {len(batch)} marker lists describes ONE individual cell. Genes have "
+                    "higher log-normalized expression than its reference cells. This exploratory contrast "
+                    "has no within-group replication. Give one tentative cell type per line, in order. "
+                    "Answer unknown where the genes do not support an identity.")
+            jobs.append(dict(head, resolution=None, groups=batch, prompt_version=singleton_markers.PROMPT,
+                             system_prompt=system_prompt + "\n" + note))
     return jobs, skipped
 
 
@@ -215,13 +248,13 @@ def _batch(out, job, options):
         fields.update(normalized, proposed_label=normalized["label"], status="annotated",
                       source="OntoAnno::gptcelltype", kind="interpretation",
                       data_version=job["data_version"], author_commit=PIN, model=job["settings"]["model"],
-                      prompt_version=PROMPT, raw_response_ref=str(receipt.relative_to(out)),
-                      cache_key=key, selection_history={"method": "Seurat positive DE", "genes": group["genes"]})
+                      prompt_version=job["prompt_version"], raw_response_ref=str(receipt.relative_to(out)),
+                      cache_key=key, selection_history={"method": group.get("marker_source", "Seurat positive DE"), "genes": group["genes"]})
         rows.append(fields)
     return rows, cache_hit, {str(p.relative_to(out)): _digest(p) for p in [req, receipt]}
 
 
-def _run(snapshot, out, cfg, manifest):
+def _run(snapshot, out, cfg, manifest, reuse=None):
     options = _options(cfg)
     base = {"snapshot_hash": manifest["snapshot_hash"], "source_commit": PIN,
             "provider_calls_observed_at_wire": None, "annotation_cost_usd": None}
@@ -251,14 +284,14 @@ def _run(snapshot, out, cfg, manifest):
         return finish([], "not_run", detail="annotation explicitly off")
     if cfg_error:
         return finish([], "blocked", detail=cfg_error)
-    if "V_HVG" not in manifest["views"]:
-        return finish([], "blocked", detail="V_HVG Seurat partition unavailable")
-    marker_stage = manifest.get("stages", {}).get("seurat_markers", {})
-    if marker_stage.get("status") != "ok":
-        return finish([], "blocked", detail=marker_stage.get("reason", "Seurat marker stage unavailable"))
+    issue = _partition_issue(manifest)
+    if issue and not settings.get("include_singletons"):
+        return finish([], "blocked", detail=issue)
     jobs, skipped = _jobs(snapshot, manifest, settings)
     if not jobs:
-        return finish([], "blocked", detail="no eligible Seurat marker lists", skipped=skipped)
+        return finish([], "blocked", detail=issue or "no eligible marker lists", skipped=skipped)
+    if reuse is not None:
+        _reuse_receipts(snapshot, reuse, out, jobs, settings, manifest)
     system = diagnose(cfg)
     rows, errors, hashes, hits, dispatches = [], [], {}, 0, 0
     for job in jobs:
@@ -275,13 +308,44 @@ def _run(snapshot, out, cfg, manifest):
             dispatches += int(not hit)
         except (ValueError, OSError, RuntimeError) as exc:
             errors.append({"key": key, "reason": str(exc)})
-    status = ("partial" if rows else "blocked") if errors else "success"
+    status = ("partial" if rows else "blocked") if errors or issue else "success"
     return finish(rows, status, settings=settings, skipped=skipped, errors=errors,
                   cached_batches=hits, newly_completed_batches=dispatches,
-                  files=hashes, annotated=len(rows), versions=system["versions"])
+                  files=hashes, annotated=len(rows), versions=system["versions"],
+                  **({"partition_issue": issue} if issue else {}),
+                  **({"annotated_singletons": sum(r.get("marker_source") == singleton_markers.SOURCE for r in rows)}
+                     if settings.get("include_singletons") else {}))
 
 
-def annotate(snapshot, out, cfg):
+def _reuse_receipts(snapshot, source, out, jobs, settings, manifest):
+    source = Path(source).resolve()
+    if source == out or source in out.parents or out in source.parents:
+        raise ValueError("use separate directories for existing receipts and new annotations")
+    verify_annotation(snapshot, source, _manifest=manifest)
+    state = _read(source / "annotation_status.json")
+    previous = dict(state["settings"])
+    requested = dict(settings)
+    previous.pop("include_singletons", None)
+    requested.pop("include_singletons", None)
+    if previous != requested:
+        raise ValueError("reused annotation model and batch settings must match")
+    for job in jobs:
+        batch = Path("batches") / _hash(job)
+        if str(batch / "response.json") not in state["files"]:
+            continue
+        for name in ("request.json", "response.json"):
+            path = batch / name
+            payload = (source / path).read_bytes()
+            if hashlib.sha256(payload).hexdigest() != state["files"][str(path)]:
+                raise ValueError("source annotation changed during reuse")
+            dest = out / path
+            if dest.exists() and dest.read_bytes() != payload:
+                raise ValueError("conflicting existing annotation receipt")
+            if not dest.exists():
+                _write(dest, payload)
+
+
+def annotate(snapshot, out, cfg, *, reuse=None):
     from .prepare import verify_snapshot
     snapshot, out = Path(snapshot).resolve(), Path(out).resolve()
     if out == snapshot or snapshot in out.parents or out in snapshot.parents:
@@ -290,7 +354,7 @@ def annotate(snapshot, out, cfg):
     out.mkdir(parents=True, exist_ok=True)
     with (out / ".lock").open("a") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
-        return _run(snapshot, out, cfg, manifest)
+        return _run(snapshot, out, cfg, manifest, reuse)
 
 
 def verify_annotation(snapshot, out, *, allow_partial=False, _manifest=None):
@@ -311,7 +375,8 @@ def verify_annotation(snapshot, out, *, allow_partial=False, _manifest=None):
     errors = state.get("errors", [])
     failed = {error["key"] for error in errors}
     if (len(failed) != len(errors) or not failed.issubset(by_key)
-            or bool(failed) != (status == "partial")):
+            or state.get("partition_issue") != _partition_issue(manifest)
+            or bool(failed or state.get("partition_issue")) != (status == "partial")):
         raise ValueError("inconsistent annotation batch outcome records")
     expected = {}
     files = {}
@@ -342,6 +407,11 @@ def verify_annotation(snapshot, out, *, allow_partial=False, _manifest=None):
         if entry is None:
             raise ValueError("unexpected annotation row")
         group, reply = entry
+        if group.get("marker_source") == singleton_markers.SOURCE:
+            if (any(row.get(k) != v for k, v in group.items() if k != "genes")
+                    or row.get("selection_history") != {"method": singleton_markers.SOURCE, "genes": group["genes"]}
+                    or row.get("prompt_version") != singleton_markers.PROMPT):
+                raise ValueError("singleton projection/marker panel mismatch")
         if (any(row[k] != group[k] for k in ("cell_set_hash", "marker_hash", "partition_id"))
                 or row["proposed_label"] != reply["label"] or row["label"] != reply["label"]
                 or row["ontology_id"] != reply["ontology_id"]):
