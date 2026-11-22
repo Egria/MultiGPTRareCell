@@ -60,3 +60,24 @@ def test_checkout_batch_entry_reads_key_and_global_model(tmp_path):
         assert discovery["status"] == "configured" and discovery["model"] == expected
         assert secret not in proc.stdout + proc.stderr
     assert project_model(tmp_path) == "shared"
+
+
+def test_credentials_preserve_module_routing_and_explicit_stage_override(tmp_path, monkeypatch):
+    from rarecell.runtime import rscript_command
+    module_bin = str(tmp_path / "R dir" / "bin")
+    chosen = module_bin + "/Rscript"
+    initial = {"PATH": module_bin + ":/usr/bin", "RARECELL_MODULE_RSCRIPT": chosen,
+               "LD_LIBRARY_PATH": "/module/lib", "R_LIBS_USER": "/module/user-library"}
+    for key, value in initial.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("TEST_PROVIDER_KEY", raising=False)
+    keyfile = tmp_path / ".api_keys"
+    keyfile.write_text('PATH="$PATH:/extra"\nLD_LIBRARY_PATH=/other\nR_LIBS_USER=wrong\n'
+                       'RARECELL_MODULE_RSCRIPT=wrong\nexport TEST_PROVIDER_KEY=available\n')
+    load_keys(keyfile)
+    assert {k: os.environ[k] for k in initial} == initial
+    assert os.environ["TEST_PROVIDER_KEY"] == "available"
+    assert rscript_command({}) == rscript_command({"rscript": "Rscript"}) == chosen
+    assert rscript_command({"rscript": "/other/Rscript"}) == "/other/Rscript"
+    monkeypatch.delenv("RARECELL_MODULE_RSCRIPT")
+    assert rscript_command({}) == "Rscript"

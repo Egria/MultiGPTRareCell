@@ -14,6 +14,7 @@ from collections import defaultdict
 from .config import atomic as _write, fingerprint as _hash, hash_file as _digest
 from .config import json_bytes as _encode, read_json as _read
 from .providers import safe_url
+from .runtime import rscript_command
 
 PIN = "ceda74c7d74af67a02093b07dd87623d846a59fe"
 PROMPT = "ontoanno-parent-cl-v1"
@@ -86,10 +87,11 @@ def diagnose(cfg):
             msgs.append("missing credential environment variable " + env)
     except (ValueError, TypeError) as exc:
         msgs.append(str(exc))
-    r = shutil.which(options.get("rscript", "Rscript"))
+    command = rscript_command(options)
+    r = shutil.which(command)
     versions = None
     if not r:
-        msgs.append("Rscript missing; install pinned R dependencies (THIRD_PARTY.md)")
+        msgs.append("Rscript executable not found")
     else:
         try:
             probe = subprocess.run([r, "--vanilla", str(SCRIPT), "--probe"], capture_output=True,
@@ -101,7 +103,7 @@ def diagnose(cfg):
         except (OSError, subprocess.TimeoutExpired):
             msgs.append("Rscript probe failed or timed out")
     return {"status": "blocked" if msgs else "configured", "detail": " | ".join(msgs),
-            "versions": versions, "network_test": "not_run"}
+            "rscript": r or command, "versions": versions, "network_test": "not_run"}
 
 
 def _groups(snapshot):
@@ -197,7 +199,7 @@ def _batch(out, job, options):
         try:
             # Upstream errors can contain sensitive transport details. Only the
             # validated, structured output crosses the process boundary.
-            result = subprocess.run([options.get("rscript", "Rscript"), "--vanilla", str(SCRIPT),
+            result = subprocess.run([rscript_command(options), "--vanilla", str(SCRIPT),
                                      str(req), str(receipt)], stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL, timeout=job["settings"]["timeout"])
         except subprocess.TimeoutExpired:

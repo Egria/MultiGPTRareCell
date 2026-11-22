@@ -18,5 +18,17 @@ if ! type module >/dev/null 2>&1; then
     exit 2
 fi
 module load "$r_module" >&2
+if ! rscript=$(type -P Rscript); then
+    # The DCC RHEL8 module is also used from newer login-node images.
+    if [[ "$r_module" == "R/4.3.1-rhel8" && -x /opt/apps/rhel8/R-4.3.1/bin/Rscript ]]; then
+        export PATH="/opt/apps/rhel8/R-4.3.1/bin:$PATH"
+        rscript=/opt/apps/rhel8/R-4.3.1/bin/Rscript
+    else
+        echo "RareCell: module $r_module did not expose an executable Rscript" >&2
+        exit 2
+    fi
+fi
+[[ "$rscript" = /* ]] || rscript="$PWD/$rscript"
+export RARECELL_MODULE_RSCRIPT="$rscript"
 export R_LIBS_USER="${RARECELL_R_LIBS_USER:-$(dirname "$project")/r-libs/MultiGPTRareCell/4.3.1-rhel8}"
 exec "$python" -m rarecell.cli "$@"
