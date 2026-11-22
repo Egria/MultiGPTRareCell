@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
-VERSION = "soft-protocol-1.0"
+VERSION = "soft-protocol-1.1"
 MAX_CHARS = 512_000
 MAX_ACTIONS = 128
 
@@ -77,9 +77,9 @@ BACKGROUNDS = {"background", "background_id"}
 ALLOWED = {
     "list_candidates": {"offset", "limit"},
     "get_evidence": {"candidate_id", "evidence_ids", "offset", "limit"},
-    "compare_groups": SCOPES | BACKGROUNDS | {"genes", "layer"},
-    "coexpress": SCOPES | {"genes", "logic", "threshold", "layer"},
-    "expand_candidate": {"candidate_id"} | BACKGROUNDS | {"layer"},
+    "compare_groups": SCOPES | BACKGROUNDS | {"genes", "layer", "evidence_ids"},
+    "coexpress": SCOPES | {"genes", "logic", "threshold", "layer", "evidence_ids"},
+    "expand_candidate": {"candidate_id"} | BACKGROUNDS | {"layer", "evidence_ids"},
     "propose_revision": {"groups", "parents", "reason", "evidence_ids"},
     "submit": {"candidate_ids", "reason", "evidence_ids", "status"},
 }
@@ -283,8 +283,10 @@ def _normalize(obj):
     for key, val in entries:
         if key == "action":
             types.add(_choice(val, "action", ACTIONS))
-    if len(types) != 1:
-        raise ProtocolError("a single unambiguous action is required")
+    if not types:
+        raise ProtocolError('missing action selector: use {"action":"<registered action>","args":{}} with the actual action and arguments, or an array of such objects')
+    if len(types) > 1:
+        raise ProtocolError("conflicting action selectors: " + ", ".join(sorted(types)))
     action = types.pop()
     params = []
     metadata = {}

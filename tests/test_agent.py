@@ -142,6 +142,62 @@ def test_budget_or_stall_terminates(app, monkeypatch):
     assert res["detail"] == "context_blocked" and res["n_cells"] == 160
 
 
+def test_active_evidence_pages_and_stall_warning(app):
+    snap, cfg, root = app
+    ctrl = Controller(snap, root / "pages", root / "cache", cfg, "A3")
+    try:
+        ctrl.initialize()
+        candidate = ctrl.ordered()[0]
+        def step(turn, **cmd):
+            mid = f"step-{turn}"
+            process_message(ctrl, {"message_id": mid, "raw": json.dumps(cmd)}, turn)
+            return ctrl.state.get("Receipt", mid + "/0")
+
+        comparison = step(1, action="compare_groups", candidate_id=candidate["id"])["result"]
+        read = dict(action="get_evidence", evidence_ids=[comparison["evidence_id"]], limit=1)
+        assert step(2, **read)["progress"]
+        assert step(3, offset=1, **read)["progress"]
+        assert not step(4, offset=1, **read)["progress"]
+        assert not step(5, offset=0, **read)["progress"]
+        before_stop = ctrl.context(6)
+        assert before_stop["remaining"]["consecutive_no_progress_turns_before_stop"] == 1
+        assert "One more turn without progress" in before_stop["turn_instruction"]
+        seed, = ctrl.state.all("Seed")
+        assert before_stop["pending_seeds"] == {"count": 1, "candidate_ids": [seed["candidate_id"]]}
+        assert step(6, offset=2, **read)["progress"]
+        assert ctrl.context(7)["remaining"]["consecutive_no_progress_turns_before_stop"] == cfg["budget"]["stall_turns"]
+        assert ctrl.state.usage()["new_queries"] == 1
+        assert not ctrl.state.get_meta("submitted", False)
+    finally:
+        ctrl.state.close()
+
+
+def test_cited_expansion_validates_then_reuses_the_same_query(app):
+    snap, cfg, root = app
+    ctrl = Controller(snap, root / "citations", root / "cache", cfg, "A3")
+    try:
+        ctrl.initialize()
+        seed, other = ctrl.ordered()[:2]
+        expansion = {"action": "expand_candidate", "candidate_id": seed["id"]}
+        def expand(turn, **extra):
+            mid = f"expand-{turn}"
+            process_message(ctrl, {"message_id": mid, "raw": json.dumps(dict(expansion, **extra))}, turn)
+            return ctrl.state.get("Receipt", mid + "/0")
+        invalid = expand(1, evidence_ids=["missing"])
+        assert invalid["result"]["status"] == "blocked" and "Unknown evidence ID" in invalid["result"]["error"]
+        assert ctrl.state.usage()["new_queries"] == 0
+        plain = expand(2)
+        eid = other["evidence_ids"][0]
+        cited = expand(3, evidence_ids=[eid])
+        assert not cited["progress"]
+        assert cited["result"]["evidence_id"] == plain["result"]["evidence_id"]
+        use = ctrl.state.get("QueryUse", cited["result"]["query_use_id"])
+        assert use["cited_evidence_ids"] == [eid]
+        assert ctrl.state.usage()["new_queries"] == ctrl.state.usage()["compute_executions"] == 1
+    finally:
+        ctrl.state.close()
+
+
 def test_ambiguous_api_is_not_automatically_replayed(app, monkeypatch):
     snap, cfg, root = app
     cfg["provider"].update(kind="openai_compatible", model="test", api_key_env=None)

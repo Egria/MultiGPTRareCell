@@ -1,4 +1,4 @@
-# Discovery 通信协议（soft-protocol-1.0）
+# Discovery 通信协议（soft-protocol-1.1）
 
 模型的一条完整回复包含一个动作，或者一个包含多个独立动作的数组。也接受 `{"actions":[...]}`。控制器提供当前 run、task、数据和契约版本，对回复中显式给出的绑定逐项比对。控制器按当前消融组许可、manifest 与证据登记表执行。解析器只输出结构化请求。
 
@@ -27,6 +27,10 @@
 组的 status 可取 `provisional`、`unresolved`、`confirmed`，生物学名称可以为 `unknown`。submit 的 status 可取 `provisional` 或 `final`。提交意图与运行是否耗尽预算、是否存在外部阻塞分别记录。科学查询可以显式声明固定表达层 `layer="log1p"`。原始 counts 需要通过不同的计算规则处理，因此该层请求会得到局部错误。
 
 每种动作都可显式带 `run_id,task_id,data_version,contract_version,message_id`。这些字段必须与控制器绑定值完全一致。控制器根据候选实际成员、实际基因 ID、背景、逻辑、门槛及影响结果的配置构造科学查询键。消息 ID、字段顺序和说明文字不参与科学查询键。
+
+`expand_candidate`、`coexpress` 和 `compare_groups` 接受可选的 `evidence_ids`，用于注明发起查询的依据。控制器先核对这些 ID 属于当前运行，再把引用记入 `QueryUse.cited_evidence_ids`。复用相同计算时只产生一条数值观测，引用已有证据不会增加独立支持。
+
+读取候选列表或证据表时，控制器按返回的页面内容判断进展。读取同一次科学查询结果中的新一页可以推进调查，再读相同内容不会重置停机计数。模型可以在 `remaining.consecutive_no_progress_turns_before_stop` 中看到还允许连续多少轮无进展。接近停机时，提示会引导模型提交有依据的成员选择，或执行能改变成员判断的新调查。主动发现模式还有查询预算时，停滞反馈也会列出待调查种子的数量和最多三个候选 ID。没有得到模型的有效提交时，运行仍记录为 `partial`。
 
 ## 可以本地归一化的输入
 
