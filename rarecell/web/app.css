@@ -669,3 +669,28 @@ dd {
   font: inherit;
 }
 .project-settings small, #model-status { color: var(--muted); }
+
+#diagnostics { width: min(880px, calc(100% - 24px)); }
+.detail-actions, .diag-toolbar, #diag-pager {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+.diag-toolbar, #diag-pager { font-size: 12px; color: var(--muted); }
+.diag-toolbar { margin-bottom: 12px; }
+.diag-outcome { background: #eef5f1; border-left: 3px solid #328261; padding: 10px 14px; }
+.diag-outcome.attention { background: #fcf5e8; border-color: #b07c22; }
+.diag-outcome p { margin: 4px 0 0; }
+.diag-turn { border-top: 1px solid var(--line); padding: 12px 0; }
+.diag-turn h4 { margin: 4px 0 8px; }
+.diag-turn .no-progress { color: #8d5921; }
+.diag-disclosure { margin: 8px 0; }
+.diag-disclosure summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+.diag-table { overflow: auto; max-height: 320px; margin: 8px 0; }
+.diag-table th, .diag-table td { padding: 7px 10px; text-align: left; overflow-wrap: anywhere; white-space: normal; }
+.diag-table th { position: sticky; top: 0; background: #f6f6fa; white-space: nowrap; }
+.diag-table td { height: auto; }
+.target-scores td { white-space: nowrap; }
+@media (max-width: 640px) {
+  .diag-table td, .diag-table th { padding: 6px; }
+}
+#diagnostics dl { margin-bottom: 12px; }
+#diag-pager { justify-content: center; padding: 12px 0; }

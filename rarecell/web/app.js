@@ -8,7 +8,8 @@ const kinds = {
   discover: "从快照发现",
   resume: "恢复发现",
   evaluate: "评估结果",
-  demo: "离线 Core demo"
+  demo: "离线 Core demo",
+  inspect: "查看已有运行"
 };
 const states = {
   queued: "排队中",
@@ -20,7 +21,8 @@ const states = {
   failed: "失败",
   stopped: "已停止",
   interrupted: "已中断",
-  paused: "已暂停"
+  paused: "已暂停",
+  linked: "已关联"
 };
 const stages = {
   prepare: "准备",
@@ -220,6 +222,7 @@ function updateForm() {
   form.elements.gt.required = kind === "evaluate";
   $("gt-hint").textContent = kind === "evaluate" ? "必填" : "可选，结束后评估";
   const hints = {
+    inspect: "填写含 checkpoint.json 的发现运行目录，只读查看已有记录。",
     demo: "使用内置合成数据运行并评估，不调用模型 API。",
     pipeline: "模型从服务端环境读取密钥。相对路径以启动控制台的目录为准。",
     prepare: "使用配置中指定的视角生成快照，结果保存在本任务目录。",
@@ -229,6 +232,7 @@ function updateForm() {
     evaluate: "从冻结结果和完整的 cell_id、label 真值表生成评估。"
   };
   $("form-hint").textContent = hints[kind];
+  $("enqueue").textContent = kind === "inspect" ? "查看诊断" : "加入队列";
 }
 function openForm(kind = "pipeline", preset = {}) {
   form.reset();
@@ -244,6 +248,7 @@ async function renderDetail(id) {
     const t = await api("/api/tasks/" + id);
     if (selected !== id || seq !== detailVersion || !$("detail").open) return;
     current = t;
+    $("open-diagnostics").disabled = false;
     $("detail-title").textContent = t.name;
     $("detail-type").textContent = kinds[t.kind] + (t.mode ? " / " + t.mode : "");
     $("detail-status").replaceChildren(badge(t.status));
@@ -301,6 +306,7 @@ async function renderDetail(id) {
 function openDetail(id) {
   selected = id;
   current = null;
+  $("open-diagnostics").disabled = true;
   message("detail-error");
   $("detail-title").textContent = "任务详情";
   $("detail-type").textContent = "";
@@ -321,6 +327,7 @@ $("form").onsubmit = async (e) => {
     $("search").value = "";
     await refresh();
     openDetail(result.id);
+    if ($("kind").value === "inspect") openDiagnostics(result.id, form.elements.name.value || "已有运行");
   } catch (err) {
     message("form-error", err.message);
   } finally {

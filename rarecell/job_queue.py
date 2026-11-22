@@ -18,7 +18,7 @@ import yaml
 from .config import config, read_json, write_json
 from .runtime import model_overrides, project_model
 
-KINDS = {"pipeline", "prepare", "annotate", "discover", "resume", "evaluate", "demo"}
+KINDS = {"pipeline", "prepare", "annotate", "discover", "resume", "evaluate", "demo", "inspect"}
 ACTIVE = {"queued", "running", "stopping"}
 MODES = {"A0", "A1", "A2", "A3"}
 
@@ -75,7 +75,7 @@ def submit(root, project, form):
         raise ValueError("任务名最多 120 个字符")
     spec = {}
     required = {"prepare": ["dataset"], "annotate": ["snapshot"], "discover": ["snapshot"],
-                "resume": ["run"], "evaluate": ["run", "gt"]}.get(kind, [])
+                "resume": ["run"], "inspect": ["run"], "evaluate": ["run", "gt"]}.get(kind, [])
     if kind == "pipeline" and bool(form.get("dataset")) == bool(form.get("snapshot")):
         raise ValueError("完整流程需要选择一个 dataset.yaml 或已有快照")
     if any(not form.get(k) for k in required):
@@ -84,14 +84,14 @@ def submit(root, project, form):
         "pipeline": ("dataset", "snapshot", "annotations", "config", "gt"),
         "prepare": ("dataset", "config"), "annotate": ("snapshot", "config"),
         "discover": ("snapshot", "annotations", "config", "gt"), "evaluate": ("run", "gt"),
-        "resume": ("run", "gt"), "demo": (),
+        "resume": ("run", "gt"), "inspect": ("run",), "demo": (),
     }
     if kind == "resume" and form.get("retry_unknown") == "yes":
         spec["retry_unknown"] = True
     for key in path_fields[kind]:
         if form.get(key):
             spec[key] = input_path(form[key], project, key in {"snapshot", "annotations", "run"})
-    if kind == "resume" and not (Path(spec["run"]) / "checkpoint.json").is_file():
+    if kind in {"resume", "inspect"} and not (Path(spec["run"]) / "checkpoint.json").is_file():
         raise ValueError("运行目录中缺少 checkpoint.json")
     if kind == "evaluate" and not (Path(spec["run"]) / "frozen.json").is_file():
         raise ValueError("运行目录中缺少 frozen.json")
@@ -118,6 +118,10 @@ def submit(root, project, form):
     stored_mode = mode if kind in {"pipeline", "discover"} else None
     with database(root) as db:
         db.execute("BEGIN IMMEDIATE")
+        if kind == "inspect":
+            linked = db.execute("SELECT id FROM tasks WHERE kind='inspect' AND spec=?", (json.dumps(spec),)).fetchone()
+            if linked:
+                return linked["id"]
         if kind == "resume":
             active = db.execute("SELECT id,kind,spec FROM tasks WHERE status IN ('queued','running','stopping')")
             for row in active:
@@ -129,12 +133,13 @@ def submit(root, project, form):
         if cfg is not None:
             (dest / "settings.yaml").write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
         db.execute("INSERT INTO tasks(id,name,kind,mode,status,created,spec) VALUES(?,?,?,?,?,?,?)",
-                   (task_id, name, kind, stored_mode, "queued", time.time(), json.dumps(spec)))
+                   (task_id, name, kind, stored_mode, "linked" if kind == "inspect" else "queued",
+                    time.time(), json.dumps(spec)))
     return task_id
 
 
 def run_path(root, task):
-    if task["kind"] in {"resume", "evaluate"}:
+    if task["kind"] in {"resume", "evaluate", "inspect"}:
         return Path(task["spec"]["run"])
     if task["kind"] in {"pipeline", "discover"}:
         return root / task["id"] / "run"

@@ -8,6 +8,7 @@
     <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/app.css" />
     <script defer src="/app.js"></script>
+    <script defer src="/diagnostics.js"></script>
   </head>
   <body>
     <header class="top">
@@ -108,6 +109,7 @@
                 <option value="discover">从快照发现</option>
                 <option value="resume">恢复发现</option>
                 <option value="evaluate">评估结果</option>
+                <option value="inspect">查看已有运行（只读）</option>
                 <option value="demo">离线 Core demo</option>
               </select></label
             ><label
@@ -137,7 +139,7 @@
             >已有注释目录 <small id="annotations-hint"></small
             ><input name="annotations" placeholder="work/annotations"
           /></label>
-          <label data-kinds="resume evaluate"
+          <label data-kinds="resume evaluate inspect"
             >发现运行目录<input name="run" placeholder="work/A3" required
           /></label>
           <label data-kinds="pipeline prepare annotate discover"
@@ -174,7 +176,9 @@
         <button class="close" data-close="detail" aria-label="关闭">×</button>
       </div>
       <div class="detail-body">
-        <div id="detail-status"></div>
+        <div class="detail-actions"><div id="detail-status"></div>
+          <button class="secondary" id="open-diagnostics" disabled>查看运行诊断</button>
+        </div>
         <dl id="facts"></dl>
         <p class="error" id="detail-error" role="alert" hidden></p>
         <div id="outputs"></div>
@@ -189,6 +193,25 @@
         <button id="stop" class="danger" hidden>停止任务</button
         ><button id="resume" class="primary" hidden>恢复发现</button
         ><button class="secondary" data-close="detail">关闭</button>
+      </div>
+    </dialog>
+    <dialog id="diagnostics" aria-labelledby="diagnostics-title">
+      <div class="dialog-head">
+        <div class="detail-heading"><span class="meta" id="diagnostic-task"></span><h2 id="diagnostics-title">运行诊断</h2></div>
+        <button class="close" aria-label="关闭诊断" id="close-diagnostics">×</button>
+      </div>
+      <div class="detail-body">
+        <div class="diag-toolbar"><span id="diag-status" role="status"></span><div>
+          <button id="diag-copy" class="secondary" disabled>复制本页诊断</button>
+          <button id="diag-refresh" class="secondary">刷新诊断</button>
+        </div></div>
+        <div id="diag-overview"></div>
+        <section aria-labelledby="trace-title">
+          <h3 id="trace-title">逐轮动作与回执</h3>
+          <div id="diag-turns"></div>
+          <div id="diag-pager" hidden><button id="diag-prev" class="secondary">上一页</button>
+            <span id="diag-page"></span><button id="diag-next" class="secondary">下一页</button></div>
+        </section>
       </div>
     </dialog>
   </body>
