@@ -13,7 +13,7 @@ from rarecell.discovery import Controller
 from rarecell.finalize import assignments
 from rarecell.prepare import prepare
 from rarecell.protocol import parse_message
-from rarecell.run import process_message
+from rarecell.run import explore, process_message
 from test_science import expression_fixture
 
 
@@ -95,7 +95,8 @@ def test_gui_cli_and_slurm_entry_point_share_mode(tmp_path):
     assert a.arms == ["A3", ADAPTIVE_MODE]
 
 
-def test_minimal_sparse_adaptive_seed_to_final_partition(tmp_path):
+@pytest.fixture(scope="module")
+def three_views(tmp_path_factory):
     # Generate the real three-view snapshot. A Python-only installation can run the other tests.
     import shutil
     import subprocess
@@ -105,9 +106,15 @@ def test_minimal_sparse_adaptive_seed_to_final_partition(tmp_path):
             capture_output=True).returncode:
         pytest.skip("requires external Seurat and leidenbase for the three-view fixture")
     root = Path(__file__).resolve().parents[1] / "examples/minimal_sparse"
-    snap = tmp_path / "snapshot"
+    snap = tmp_path_factory.mktemp("adaptive_views") / "snapshot"
+    prepare(root / "input/dataset.yaml", snap, config(override={"mode": ADAPTIVE_MODE}))
+    return snap
+
+
+def test_minimal_sparse_adaptive_seed_to_final_partition(tmp_path, three_views):
+    root = Path(__file__).resolve().parents[1] / "examples/minimal_sparse"
+    snap = three_views
     cfg = config(override={"mode": ADAPTIVE_MODE})
-    prepare(root / "input/dataset.yaml", snap, cfg)
     ctrl = Controller(snap, tmp_path / "run", tmp_path / "cache", cfg, ADAPTIVE_MODE)
     seed = "H235dc8d4ae01746f2bfffbb0"  # exact anchor from the reported T0003
     with closing(ctrl.state):
@@ -155,3 +162,100 @@ def test_minimal_sparse_adaptive_seed_to_final_partition(tmp_path):
         assert set(ctrl.candidate(small)["members"]) == truth
         rare_group, = [ctrl.candidate(cid) for cid in done["candidate_ids"] if set(ctrl.candidate(cid)["members"]) == truth]
         assert rare_group["biological_rarity"]["assessment"] == "uncertain" and rare_group["status"] == "provisional"
+
+@pytest.mark.parametrize("ending,expected_n,source", [
+    ("wider", 8, "agent"), ("core", 3, "agent"), ("decline", 0, "agent"),
+    ("repeat", 3, "controller_stall"), ("no_turn", 3, "controller_stall"),
+    ("no_tokens", 3, "controller_stall"),
+])
+def test_adaptive_review_and_stall_submission(tmp_path, three_views, ending, expected_n, source):
+    cfg = config(override={"mode": ADAPTIVE_MODE, "budget": {"max_agent_turns": 6 if ending == "no_turn" else 12}})
+    run, cache = tmp_path / "run", tmp_path / "cache"
+    ctrl = Controller(three_views, run, cache, cfg, ADAPTIVE_MODE)
+    anchor = "H235dc8d4ae01746f2bfffbb0"
+    def save(turn, command):
+        mid = f"audit:T{turn:04}"
+        ctrl.state.put("Message", mid, {"message_id": mid, "raw": json.dumps(command), "complete": True,
+                                        "usage": {"provider": "transcript_replay", "total_tokens": 1}})
+    with closing(ctrl.state):
+        ctrl.initialize()
+        ctrl.state.set_meta("run_id", "audit")
+        save(1, {"action": "expand_candidate", "candidate_id": anchor})
+        assert explore(ctrl, "live", pause_after=1)[1] == "paused"
+        eid = ctrl.state.get("Receipt", "audit:T0001/0")["result"]["evidence_id"]
+        read = {"action": "get_evidence", "evidence_ids": [eid], "offset": 0, "limit": 20}
+        cut = {"action": "apply_boundary", "candidate_id": anchor, "evidence_ids": [eid],
+               "metric": "score", "threshold": 0.82, "reason": "Keep the measured core."}
+        for turn, command in enumerate([read, cut, read, cut, read], 2):
+            save(turn, command)
+        status, phase = explore(ctrl, "live", pause_after=6)
+        review = ctrl.context(7)["boundary_reviews"][0]
+        core, wider = review["requested"], review["wider"]
+        assert (core["n"], wider["n"], core["selected"], wider["selected"]) == (3, 8, True, False)
+        assert review["cohorts"]["additional"]["scored"] == 5
+        assert review["cohorts"]["additional"]["mean"]["positive_expression"] > 0.9
+        assert [core["partition_unclaimed"], wider["partition_unclaimed"]] == [157, 152]
+        if ending != "no_turn":
+            assert phase == "paused" and set(ctrl.context(7)["actions"]) == {"submit", "propose_revision", "select_boundary"}
+        assert ctrl.context(7)["recent_evidence_pages"][0]["offset"] == 0
+        with pytest.raises(ValueError, match="one boundary"):
+            act(ctrl, "submit", candidate_ids=[core["candidate_id"], wider["candidate_id"]])
+    # Reopen SQLite so the draft and the comparison must survive a process boundary.
+    ctrl = Controller(three_views, run, cache, cfg, ADAPTIVE_MODE)
+    with closing(ctrl.state):
+        if ending == "no_tokens":
+            ctrl.budget["max_reported_tokens"] = 6
+        elif ending != "no_turn":
+            last = {"action": "submit", "reason": "Accept core."}
+            if ending == "wider":
+                last = [{"action": "select_boundary", "candidate_id": wider["candidate_id"], "reason": "Include margin."},
+                        {"action": "submit", "reason": "Accept whole group."}]
+            elif ending == "decline":
+                last["candidate_ids"] = []
+            elif ending == "repeat":
+                last = read
+            save(7, last)
+        if ending != "no_turn":
+            status, phase = explore(ctrl, "live")
+        assert (status, phase) == (("complete", "submitted") if source == "agent" else ("partial", "stalled_provisional"))
+        assert ctrl.state.get_meta("submission_source") == source
+        decision = ctrl.state.all("Decision")[-1]
+        if source == "controller_stall":
+            assert decision["message_id"] is None and decision["status"] == "provisional"
+        assert ctrl.state.get_meta("finished_turn") == (6 if ending in {"no_turn", "no_tokens"} else 7)
+        assert not ctrl.state.all("ProviderDispatch") and ctrl.state.usage()["new_queries"] == 1
+        partition, conflicts, _, _ = assignments(ctrl)
+        owned = {r["cell_id"] for r in partition if r["assignment_reason"] == "selected"}
+        gt = Path(__file__).resolve().parents[1] / "examples/minimal_sparse/evaluation_fixture/gt.tsv"
+        with gt.open() as stream:
+            truth = {r["cell_id"] for r in csv.DictReader(stream, delimiter="\t") if r["label"] == "synthetic_rare"}
+        assert len(owned) == expected_n and owned <= truth and not conflicts and len(partition) == 160
+
+
+def test_review_options_preserve_unrelated_selections_and_revise_held_wider(tmp_path, three_views):
+    cfg = config(override={"mode": ADAPTIVE_MODE})
+    ctrl = Controller(three_views, tmp_path/"run", tmp_path/"cache", cfg, ADAPTIVE_MODE)
+    with closing(ctrl.state):
+        ctrl.initialize()
+        seed = "H235dc8d4ae01746f2bfffbb0"
+        exp = act(ctrl, "expand_candidate", candidate_id=seed)
+        eid = exp["evidence_id"]
+        args = dict(candidate_id=seed, evidence_ids=[eid], metric="score", threshold=.82, reason="Core")
+        review = act(ctrl, "apply_boundary", **args)["boundary_review"]
+        small, wide = (review[k]["candidate_id"] for k in ("requested", "wider"))
+        assert set(ctrl.candidate(small)["members"]) < set(ctrl.candidate(wide)["members"])
+        outside = sorted(ctrl.cell_set - set(ctrl.candidate(wide)["members"]))
+        parent = next(c["id"] for c in ctrl.ordered() if c["initial"] and outside[0] in c["members"])
+        separate = act(ctrl, "propose_revision", parents=[parent], groups=[{"members":outside[:1]}],
+                       reason="Unrelated provisional group", evidence_ids=[eid])
+        unrelated, = set(separate["candidate_ids"]) - {small}
+        act(ctrl, "select_boundary", candidate_id=wide, reason="Accept additional cells")
+        assert set(ctrl.state.get_meta("selected")) == {wide, unrelated}
+        act(ctrl, "apply_boundary", **args)
+        assert set(ctrl.state.get_meta("selected")) == {wide, unrelated}
+        act(ctrl, "select_boundary", candidate_id=small, reason="Retain core while reviewing")
+        revised = act(ctrl, "propose_revision", parents=[wide], groups=[{"candidate_id":wide}],
+                      reason="Accept the wider boundary after review", evidence_ids=[eid])
+        assert unrelated in revised["candidate_ids"] and small not in revised["candidate_ids"]
+        assert len(revised["candidate_ids"]) == 2
+        assert ctrl.state.usage()["new_queries"] == 1

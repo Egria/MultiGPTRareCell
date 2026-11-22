@@ -13,14 +13,20 @@ GOAL = (
     "State an alternative explanation and what observation would weaken the split. Low abundance alone is insufficient. "
     "Keep prior knowledge, abundance and boundary support distinct. Reusing the same RNA is selection-dependent. "
     "Preview competing claims before submitting; a broad claim can absorb a rare hypothesis. Explain deferred "
-    "promising candidates in your submission reason. Keep the discovery and token budgets."
+    "promising candidates in your submission reason. Keep the discovery and token budgets. "
+    "Treat the core and wider membership as competing drafts. Assess the incremental cells' positive program, "
+    "their fit to the core versus the outside and the impact on other groups. The wider gap is a search suggestion. "
+    "Choose either set, another measured boundary, or neither. Submit once this comparison is sufficient."
 )
 TOOLS = {
     "apply_boundary": "candidate_id (original seed), evidence_ids (one expansion observation), metric "
         "(score|expression|positive_expression), threshold [0,1], reason. Return an anchored provisional candidate "
         "using all scored cells at or above your cutoff, with no hidden expression or structure cutoff. "
         "max_cells bounds additions; an over-budget rule reports its exact size without truncation. "
-        "Read the expansion ranking with get_evidence. A new cutoff reuses the same observation.",
+        "The first nonconflicting boundary you request per anchor enters the working selection. A wider alternative "
+        "is held separately. Subsequent cutoffs are held for comparison. See boundary_reviews for current choices.",
+    "select_boundary": "candidate_id from a held boundary review and reason. Replace the working boundary of its "
+        "anchor and preserve other disjoint selections. Use propose_revision to resolve cross-anchor overlaps.",
     "preview_submission": "candidate_ids (proposed selection; omit for current selection), optional candidate_id "
         "(hypothesis to track, even when omitted from selection), optional reference_id (reference candidate). "
         "Reports exclusive claims, conflicts, unclaimed cells, and local/global fractions before final assignment.",
@@ -68,11 +74,97 @@ def apply_boundary(ctrl, args):
                 "membership_hash": fingerprint(sorted(members))}
     if added > ctrl.cfg["search"]["max_cells"]:
         return dict(response, status="over_limit", max_additions=ctrl.cfg["search"]["max_cells"])
-    if not added:
-        return dict(response, status="no_expansion", candidate_id=seed["id"])
-    rule = {"metric": metric, "threshold": threshold, "evidence_id": eid}
-    revision = ctrl.make_revision(members, [seed["id"]], "unknown", "provisional", [eid], "boundary", rule)
-    return dict(response, status="proposed", candidate_id=revision["id"])
+    def option(cell_ids, cut):
+        rule = {"metric": metric, "threshold": cut, "evidence_id": eid}
+        candidate = ctrl.make_revision(cell_ids, [seed["id"]], "unknown", "provisional", [eid], "boundary", rule)
+        return {"candidate_id": candidate["id"], "threshold": cut, "n": len(cell_ids)}
+
+    requested = option(members, threshold)
+    cid = requested["candidate_id"]
+    reviews = ctrl.state.all("BoundaryReview")
+    review = next((r for r in reviews if r["requested"]["candidate_id"] == cid), None)
+    if review is None:
+        # Only non-anchor members can change. Enumerate complete tie blocks and
+        # compare realized group sizes to the existing additions budget.
+        others = sorted((r for r in values if r["cell_id"] not in anchor), key=lambda r: -r[metric])
+        best_gap, split = 0.0, None
+        for n in range(added + 1, min(len(others) - 1, ctrl.cfg["search"]["max_cells"]) + 1):
+            gap = others[n-1][metric] - others[n][metric]
+            if gap > max(best_gap, 1e-12):
+                best_gap, split = gap, n
+        review = {"anchor_id": seed["id"], "evidence_id": eid, "metric": metric, "requested": requested}
+        wider = members
+        if split is not None:
+            wider = anchor.union(r["cell_id"] for r in others[:split])
+            review["wider"] = option(wider, others[split-1][metric])
+            review["gap_below_wider"] = best_gap
+        # Include the nearest excluded cells separately so that a large majority
+        # cannot dilute the contrast with the most competitive outside cells.
+        nearest = [r for r in others if r["cell_id"] not in wider][:max(1, len(wider)-len(members))]
+        # Aggregate the same observed expression, including cells scored on a
+        # different component, without treating this comparison as new evidence.
+        cohorts = {"core": [], "additional": [], "outside": []}
+        for row in ranked:
+            cell = row["cell_id"]
+            cohort = "core" if cell in members else "additional" if cell in wider else "outside"
+            cohorts[cohort].append(row)
+        cohorts["nearest_outside"] = nearest
+        review["cohorts"] = {}
+        for name, rows in cohorts.items():
+            metrics = {}
+            for field in ("score", "positive_expression", "expression", "structure"):
+                observed = [r[field] for r in rows if r[field] is not None]
+                if observed:
+                    metrics[field] = round(sum(observed) / len(observed), 5)
+            review["cohorts"][name] = {"scored": len(rows), "mean": metrics}
+        ctrl.state.put("BoundaryReview", cid, review)
+        first = not any(r["anchor_id"] == seed["id"] for r in reviews)
+        selected = ctrl.state.get_meta("selected", [])
+        if first and not any(members.intersection(ctrl.candidate(i)["members"]) for i in selected):
+            ctrl.state.set_meta("selected", sorted([*selected, cid]))
+    return dict(response, status="proposed" if added else "no_expansion", candidate_id=cid,
+                boundary_review=review_card(ctrl, review))
+
+
+def other_selections(ctrl, anchor_id):
+    # The competing drafts all have this exact anchor as their sole parent.
+    return [cid for cid in ctrl.state.get_meta("selected", [])
+            if not (ctrl.candidate(cid).get("boundary_rule") and ctrl.candidate(cid)["parents"] == [anchor_id])]
+
+
+def review_card(ctrl, review):
+    from .finalize import membership_claims
+    other = other_selections(ctrl, review["anchor_id"])
+    claims = membership_claims(ctrl, other)
+    existing_conflicts = sum(len(owners) > 1 for owners in claims.values())
+    result = dict(review)
+    for role in ("requested", "wider"):
+        if role not in review:
+            continue
+        item = review[role]
+        cid = item["candidate_id"]
+        members = ctrl.candidate(cid)["members"]
+        overlap = sum(cell in claims for cell in members)
+        new_conflicts = sum(len(claims.get(cell, ())) == 1 for cell in members)
+        result[role] = dict(item, selected=cid in ctrl.state.get_meta("selected", []),
+                            exclusive_members=len(members)-overlap,
+                            partition_conflicts=existing_conflicts+new_conflicts,
+                            partition_unclaimed=len(ctrl.cells)-len(claims)-len(members)+overlap)
+    return result
+
+
+def select_boundary(ctrl, args):
+    cid = args["candidate_id"]
+    c = ctrl.candidate(cid)
+    if not c.get("boundary_rule"):
+        raise ValueError("Choose a candidate_id from a boundary review")
+    other = other_selections(ctrl, c["parents"][0])
+    members = set(c["members"])
+    if any(members.intersection(ctrl.candidate(i)["members"]) for i in other):
+        raise ValueError("Overlapping selections from another group. Use propose_revision to allocate them.")
+    chosen = sorted([*other, cid])
+    ctrl.state.set_meta("selected", chosen)
+    return {"action": "select_boundary", "candidate_id": cid, "selected_ids": chosen, "reason": args["reason"]}
 
 
 def preview(ctrl, args):

@@ -40,6 +40,7 @@ function showOverview(data) {
     const note = element("div", undefined, s.submitted ? "diag-outcome" : "diag-outcome attention");
     note.append(element("strong", title));
     if (s.detail === "stalled") note.append(element("p", "连续多轮动作都没有被控制器计为新进展，运行已停止。"));
+    if (s.detail === "stalled_provisional") note.append(element("p", "探索停滞。控制器已暂定提交当前草案，模型尚未作出最终提交。"));
     if (s.issue) note.append(element("p", s.issue));
     box.append(note);
   }

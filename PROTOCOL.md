@@ -30,7 +30,7 @@
 
 `expand_candidate`、`coexpress` 和 `compare_groups` 接受可选的 `evidence_ids`，用于注明发起查询的依据。控制器先核对这些 ID 属于当前运行，再把引用记入 `QueryUse.cited_evidence_ids`。复用相同计算时只产生一条数值观测，引用已有证据不会增加独立支持。
 
-读取候选列表或证据表时，控制器按返回的页面内容判断进展。读取同一次科学查询结果中的新一页可以推进调查，再读相同内容不会重置停机计数。模型可以在 `remaining.consecutive_no_progress_turns_before_stop` 中看到还允许连续多少轮无进展。接近停机时，提示会引导模型提交有依据的成员选择，或执行能改变成员判断的新调查。主动发现模式还有查询预算时，停滞反馈也会列出待调查种子的数量和最多三个候选 ID。没有得到模型的有效提交时，运行仍记录为 `partial`。
+读取候选列表或证据表时，控制器按返回的页面内容判断进展。读取同一次科学查询结果中的新一页可以推进调查，再读相同内容不会重置停机计数。模型可以在 `remaining.consecutive_no_progress_turns_before_stop` 中看到还允许连续多少轮无进展。接近停机时，提示会引导模型提交有依据的成员选择，或执行能改变成员判断的新调查。主动发现模式还有查询预算时，停滞反馈也会列出待调查种子的数量和最多三个候选 ID。没有得到模型的有效提交时，运行仍记录为 `partial`。A3_adaptive 的暂定提交见下文。
 
 ## 可以本地归一化的输入
 
@@ -69,3 +69,14 @@
 - `apply_boundary(candidate_id=H, evidence_ids=[E], metric=..., threshold=..., reason=...)` 使用原始锚点 H 对应的扩展观测 E，保留锚点原成员，并加入所选分量达到阈值的所有可评分细胞。阈值在 [0,1] 内，由模型决定；其他分量没有隐含下限。超出配置的 max_cells 新增数时返回 over_limit 和完整命中数，模型可以修订规则。成功的提案为 provisional，需另行选择。复用分数不会新建独立观察或再耗扩展深度。
 - `coexpress(scope="all", genes=[...], min_detected=k, threshold=t)` 检索在至少 k 个基因上 log1p 表达严格大于 t 的细胞。k 的范围为去重并解析后的 1 到基因数；k 与 AND/OR 二选一。阈值默认 0。可在 `propose_revision.groups` 中以 `matched_evidence_id` 引用某次共检出的全部成员；可通过 `exclude_candidate_ids` 从成员并集中减掉已存在的候选，再执行原子修订。
 - `preview_submission(candidate_ids=[...], candidate_id=H, reference_id=R)` 预览拟提交选择。candidate_id 可填一个未被选中的待查假设，以判断其细胞会进入哪个类别（独立归属、被其他候选认领、冲突或回退）；reference_id 指定参考候选。两个字段均可省略。局部占比以候选与参考集合交集大小除以参考集合大小。实际 submit 按相同成员认领规则记录结果。每个修订群可选填 biological_rarity（yes/no/uncertain）和 rarity_reason，作为模型解释关联到该成员版本。
+
+
+### 边界比较与停滞提交（discovery/adaptive-2）
+
+首次对某个种子成功执行 `apply_boundary` 时，控制器保存模型指定的成员集。如果它与当前已选群互不重叠，即刻纳入工作草案。控制器对同一指标的非种子细胞排序，在允许的新增人数内寻找更宽边界下方最大的正分数间隙，同分细胞一起纳入。没有可用间隙时只保留模型方案。宽方案作为可选群保存，模型后续指定的其他阈值也可暂存。各方案沿用同一观察 ID。
+
+`boundary_reviews` 比较核心、新增成员、宽方案之外的全部可评分细胞，以及其中指标最高的一小组细胞。后者人数最多等于新增人数，未扩宽时显示一个。表内给出人数及综合分、正向表达分、表达分和结构分的均值。两种成员集各自与其他工作草案组合，分别报告独占成员数、全局冲突数和未认领数。上下文优先保留近期比较，以及最近读过的证据页。可用 `get_evidence(candidate_id=...)` 回看对应的比较。
+
+`select_boundary(candidate_id=..., reason=...)` 替换同一种子的工作边界，保留其他互不重叠的草案。跨群重叠可用 `propose_revision` 分配成员。模型可以用 `submit` 提交当前选择，用显式候选列表指定最终选择，或用空列表放弃全部候选。同一种子的互斥边界只能选一个，除非先修订为互不重叠的群。
+
+停滞时，只要已有提案或工作草案，且原轮数和 token 预算允许，就保留一次只接受 `select_boundary`、`propose_revision` 和 `submit` 的收尾轮。如果该轮没有提交，或在停滞时预算已经用尽，控制器只发布已选的非空草案。此时 `submitted=true`、`submission_status=provisional`、`submission_source=controller_stall`，运行状态为 `partial / stalled_provisional`。没有已选草案时保留未提交状态。服务连接失败按既有规则记录和恢复。模型明确提交的结果标记 `submission_source=agent`。

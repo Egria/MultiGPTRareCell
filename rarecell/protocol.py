@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
-VERSION = "soft-protocol-1.2"
+VERSION = "soft-protocol-1.3"
 MAX_CHARS = 512_000
 MAX_ACTIONS = 128
 
@@ -35,6 +35,7 @@ def _alias_map(groups):
 
 ACTIONS = _alias_map({
     "apply_boundary": (),
+    "select_boundary": (),
     "preview_submission": (),
     "list_candidates": ("list candidates", "show candidates", "列出候选", "列出候选群"),
     "get_evidence": ("read evidence", "查看证据", "读取证据"),
@@ -79,6 +80,7 @@ BINDINGS = {"run_id", "task_id", "data_version", "contract_version", "message_id
 SCOPES = {"candidate_id", "members", "scope"}
 BACKGROUNDS = {"background", "background_id"}
 ALLOWED = {
+    "select_boundary": {"candidate_id", "reason"},
     "apply_boundary": {"candidate_id", "evidence_ids", "metric", "threshold", "reason"},
     "preview_submission": {"candidate_ids", "candidate_id", "reference_id"},
     "list_candidates": {"offset", "limit"},
@@ -268,6 +270,8 @@ def _validate(action, args):
         else:
             args.setdefault("logic", "AND")
         args.setdefault("threshold", 0.0)
+    if action == "select_boundary" and not {"candidate_id", "reason"} <= present:
+        raise ProtocolError("select_boundary needs a held candidate_id and reason")
     if action == "apply_boundary":
         if not {"candidate_id", "evidence_ids", "metric", "threshold", "reason"} <= present or len(args["evidence_ids"]) != 1:
             raise ProtocolError("apply_boundary needs candidate_id, one expansion evidence_id, metric, threshold and reason")

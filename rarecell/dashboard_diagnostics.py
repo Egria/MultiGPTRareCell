@@ -105,7 +105,7 @@ def turn_detail(db, number):
         raise KeyError("该轮次没有记录")
     commands = []
     if msg:
-        for version in (VERSION, "soft-protocol-1.1", "protocol/1"):
+        for version in (VERSION, "soft-protocol-1.2", "soft-protocol-1.1", "protocol/1"):
             key = fingerprint([version, msg["raw"], msg.get("complete", True)])
             saved = record(db, "ParsedMessage", key)
             if saved:
@@ -164,7 +164,7 @@ def diagnostics(root, task, page=None, turn=None):
     inspected = task["kind"] == "inspect"
     scores = evaluation((run.parent if inspected else base) / "evaluation" / "metrics.json",
                         run / "frozen.json" if inspected else None)
-    return {"trace": trace, "summary": fields(summary, "status detail issue submitted n_cells n_candidates n_groups "
+    return {"trace": trace, "summary": fields(summary, "status detail issue submitted submission_status submission_source n_cells n_candidates n_groups "
                                            "unresolved_cells n_pending_seeds fallback_view_resolution annotation_status"),
             "pending_seeds": seeds, "annotation_model": (ann.get("settings") or {}).get("model"),
             "stall_limit": (cfg.get("budget") or {}).get("stall_turns"),
