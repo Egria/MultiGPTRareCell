@@ -128,8 +128,11 @@
           >
           <label id="reuse-annotation-field" hidden>复用同一快照的成功注释批次（可选）
             <input name="reuse_annotations" placeholder="旧任务的 annotations 目录"></label>
+          <label id="panel-mode-field" hidden>OntoAnno marker 背景<select name="panel_mode">
+            <option value="">沿用配置（默认仅全局）</option><option value="global">仅全局，每个候选一个标签</option>
+            <option value="dual">邻居与全局，分别注释</option></select></label>
           <label id="singleton-annotation-field" hidden>OntoAnno 注释对象<select name="include_singletons">
-            <option value="">沿用配置（默认群及种子，双背景）</option><option value="yes">所有 Seurat 群和单细胞种子</option>
+            <option value="">沿用配置（默认群及种子）</option><option value="yes">所有 Seurat 群和单细胞种子</option>
             <option value="no">仅注释 Seurat 群</option></select></label>
           <label id="seed-review-field" hidden>单细胞种子调查<select name="exhaustive_seed_review">
             <option value="">沿用配置</option><option value="yes">强制逐种子调查并写明判断</option>

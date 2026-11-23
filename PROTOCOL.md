@@ -17,8 +17,9 @@
 | 动作 | 请求参数 | 语义和边界 |
 |---|---|---|
 | `list_candidates` | 可选 `offset,limit` | 候选按稳定顺序分页。offset 从 0 起计，limit 为正整数。 |
+| `list_ontology_pools` | 可选 `offset,limit` | 分页查看同一全局 CL ID 的单细胞种子候选群。用候选 ID 调用 `get_evidence` 可分页读取完整 marker 并集的逐 seed 频次和种子 ID。 |
 | `get_evidence` | 可选 `candidate_id` 或 `evidence_ids`，以及 `offset,limit` | 按候选读成员页与 marker，或按证据 ID 读证据卡。省略选择器时浏览已登记证据。 |
-| `compare_groups` | `candidate_id` 或 `members`。可选 `background_id` 或 `background`、`genes` | background 是明确的 cell_id 集合，background_id 引用候选。省略背景时取 foreground 的补集。空对照由科学工具标记。 |
+| `compare_groups` | `candidate_id` 或 `members`。可选 `background_id` 或 `background`、`genes` | background 是明确的 cell_id 集合，background_id 引用候选。省略背景时取 foreground 的补集。空对照由科学工具标记。点名基因时另在前景与背景的并集上按基因拟合单成分与双成分负二项模型，使用原始计数、文库大小 offset 和成分间共享离散度。BIC 支持双成分时，按高成分后验概率 > 0.5 分组，逐基因返回细胞较少组的完整 minor_members 及 minor_mean_per_10k、major_mean_per_10k（拟合均值）。两组等大时列高表达组。多数成员可从拟合范围取补集恢复，零文库细胞另列 excluded_zero_depth。单成分及拟合失败只报状态。缺少原始计数时仍返回原有描述性比较。 |
 | `coexpress` | `candidate_id`、`members`、`scope="all"` 三选一，`genes` 必填。可选 `logic`、`threshold` | 逻辑为 AND（默认）或 OR。每个指定基因的 log1p 表达须严格大于阈值（默认 0）。 |
 | `expand_candidate` / `retrieve_cells` | `candidate_id`。可选 `background_id` 或 `background` | 跨全数据检索，背景只用于对照。一次扩展沿原始候选 lineage 记账。预算、门槛由运行配置决定。 |
 | `propose_revision` | `parents,groups`，以及动作或组内的 `reason,evidence_ids` | 每组可给 `candidate_ids`、`members` 或二者的并集，可附 `proposed_label` 和 `status`。每组都需要理由和可验证的证据。来源明确时按下文规则恢复父候选，各组在同一事务中更新。 |

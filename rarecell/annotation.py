@@ -40,7 +40,18 @@ def _resolve(cfg):
     dual = options.get("dual_backgrounds", True)
     if type(dual) is not bool:
         raise ValueError("annotation.dual_backgrounds must be true or false")
-    include = options.get("include_singletons", dual)
+    mode = options.get("panel_mode")
+    if mode is not None and mode not in ("global", "dual"):
+        raise ValueError("annotation.panel_mode must be global or dual")
+    global_only = mode == "global" or (mode is None and "dual_backgrounds" not in options)
+    if mode is not None:
+        dual = mode == "dual"
+    contrast_settings = {}
+    if global_only:
+        contrast_settings["panel_mode"] = "global"
+    elif dual:
+        contrast_settings["dual_backgrounds"] = True
+    include = options.get("include_singletons", bool(contrast_settings))
     if type(include) is not bool:
         raise ValueError("annotation.include_singletons must be true or false")
     top = options.get("top_genes", 10)
@@ -79,7 +90,7 @@ def _resolve(cfg):
         raise ValueError("annotation.timeout must be positive and finite")
     return {"provider": provider, "model": model, "api_key_env": env, "base_url": url,
             "top_genes": top, "timeout": timeout, "batch_size": batch_size,
-            "single_line_stop": stop_line, **({"dual_backgrounds": True} if dual else {}), **({"include_singletons": True} if include else {})}
+            "single_line_stop": stop_line, **contrast_settings, **({"include_singletons": True} if include else {})}
 
 
 def diagnose(cfg):
@@ -144,6 +155,10 @@ def _partition_issue(manifest):
     return None
 
 
+def _uses_contrasts(settings):
+    return settings.get("panel_mode") == "global" or settings.get("dual_backgrounds", False)
+
+
 def _jobs(snapshot, manifest, settings):
     system_prompt = ("Provide one tentative cell type name per marker row, in the same order. "
                      "Use unknown when the markers cannot support a name. Return only those names.\n"
@@ -152,8 +167,12 @@ def _jobs(snapshot, manifest, settings):
             "contract_sha256": _digest(CONTRACT), "snapshot_hash": manifest["snapshot_hash"],
             "data_version": manifest["data_version"], "settings": settings, "system_prompt": system_prompt,
             "tissue": " ".join(str(manifest.get(k) or "") for k in ("species", "tissue")).strip()}
-    if settings.get("dual_backgrounds"):
+    if _uses_contrasts(settings):
+        # A global row is byte-identical to the global half of a historical dual run.
+        # Keep the executed job identity (including the R bridge) so its receipt can be reused.
         head["settings"] = {k: v for k, v in settings.items() if k != "include_singletons"}
+        head["settings"].pop("panel_mode", None)
+        head["settings"]["dual_backgrounds"] = True
         return contrast_panels.jobs(snapshot, manifest, settings, head)
     candidates, markers = ({}, {}) if _partition_issue(manifest) else _groups(snapshot)
     include = settings.get("include_singletons", False)
@@ -270,7 +289,7 @@ def _unavailable(panel, status, key=None):
 
 
 def _issue(manifest, settings):
-    if settings.get("dual_backgrounds"):
+    if _uses_contrasts(settings):
         stage = manifest.get("stages", {}).get("V_HVG_graph", {})
         if "V_HVG" not in manifest.get("views", ()) or stage.get("status") == "blocked":
             return stage.get("reason") or "V_HVG partition unavailable"
@@ -308,12 +327,12 @@ def _run(snapshot, out, cfg, manifest, reuse=None):
         return finish([], "not_run", detail="annotation explicitly off")
     if cfg_error:
         return finish([], "blocked", detail=cfg_error)
-    dual = settings.get("dual_backgrounds", False)
+    contrast = _uses_contrasts(settings)
     issue = _issue(manifest, settings)
     if issue and not settings.get("include_singletons"):
         return finish([], "blocked", detail=issue)
     jobs, skipped = _jobs(snapshot, manifest, settings)
-    if not jobs and not (dual and skipped):
+    if not jobs and not (contrast and skipped):
         return finish([], "blocked", detail=issue or "no eligible marker lists", skipped=skipped)
     if reuse is not None:
         _reuse_receipts(snapshot, reuse, out, jobs, settings, manifest)
@@ -334,16 +353,16 @@ def _run(snapshot, out, cfg, manifest, reuse=None):
         except (ValueError, OSError, RuntimeError) as exc:
             errors.append({"key": key, "reason": str(exc)})
     annotated = len(rows)
-    if dual:
+    if contrast:
         failed = {error["key"] for error in errors}
         for job in jobs:
             key = _hash(job)
             if key in failed:
                 rows.extend(_unavailable(panel, "unavailable", key) for panel in job["groups"])
         rows.extend(_unavailable(panel, "not_annotatable") for panel in skipped)
-    status = ("partial" if annotated or (dual and skipped and not errors) else "blocked") if errors or issue else "success"
+    status = ("partial" if annotated or (contrast and skipped and not errors) else "blocked") if errors or issue else "success"
     coverage = {}
-    if dual:
+    if contrast:
         coverage = {"panel_slots": len(rows), "annotated_singletons": len({
             r["seed_id"] for r in rows if r.get("seed_id") and r["status"] == "annotated"})}
     elif settings.get("include_singletons"):
@@ -365,6 +384,8 @@ def _reuse_receipts(snapshot, source, out, jobs, settings, manifest):
     requested = dict(settings)
     previous.pop("include_singletons", None)
     requested.pop("include_singletons", None)
+    previous.pop("panel_mode", None)
+    requested.pop("panel_mode", None)
     previous.pop("dual_backgrounds", None)
     requested.pop("dual_backgrounds", None)
     if previous != requested:
@@ -410,7 +431,7 @@ def verify_annotation(snapshot, out, *, allow_partial=False, _manifest=None):
         raise ValueError("annotation is " + status)
     if state["snapshot_hash"] != manifest["snapshot_hash"] or state["source_commit"] != PIN:
         raise ValueError("annotation source/snapshot version mismatch")
-    dual = state["settings"].get("dual_backgrounds", False)
+    contrast = _uses_contrasts(state["settings"])
     jobs, skipped = _jobs(snapshot, manifest, state["settings"])
     by_key = {_hash(job): job for job in jobs}
     errors = state.get("errors", [])
@@ -441,14 +462,14 @@ def verify_annotation(snapshot, out, *, allow_partial=False, _manifest=None):
     if _digest(path) != state["annotation_sha256"]:
         raise ValueError("annotation projection modified")
     rows = [json.loads(line) for line in path.read_text().splitlines()]
-    if dual:
+    if contrast:
         missing = [_unavailable(panel, "unavailable", key) for key, job in by_key.items() if key in failed
                    for panel in job["groups"]]
         missing.extend(_unavailable(panel, "not_annotatable") for panel in skipped)
         if (state.get("skipped") != skipped or state.get("panel_slots") != len(rows)
                 or [_hash(r) for r in rows if r["status"] != "annotated"] != [_hash(r) for r in missing]):
-            raise ValueError("inconsistent dual-background panel coverage")
-    annotated_rows = [r for r in rows if r.get("status") == "annotated"] if dual else rows
+            raise ValueError("inconsistent expression panel coverage")
+    annotated_rows = [r for r in rows if r.get("status") == "annotated"] if contrast else rows
     if not rows or len(annotated_rows) != len(expected) or state.get("annotated") != len(annotated_rows):
         raise ValueError("incomplete annotation projection")
     for row in annotated_rows:

@@ -30,8 +30,11 @@ def validate_settings(cfg):
     from .providers import safe_url
     names = {
         "provider": {"kind", "base_url", "endpoint", "api_style", "model", "api_key_env", "timeout", "options"},
-        "annotation": {"enabled", "provider", "model", "base_url", "api_key_env", "top_genes", "timeout", "rscript", "retry_unknown", "batch_size", "single_line_stop", "include_singletons", "dual_backgrounds"},
+        "annotation": {"enabled", "provider", "model", "base_url", "api_key_env", "top_genes", "timeout", "rscript", "retry_unknown", "batch_size", "single_line_stop", "include_singletons", "dual_backgrounds", "panel_mode"},
     }
+    annotation = cfg.get("annotation")
+    if isinstance(annotation, dict) and "panel_mode" in annotation and annotation["panel_mode"] not in ("global", "dual"):
+        raise ValueError("annotation.panel_mode must be global or dual")
     for flag in ("include_singletons", "dual_backgrounds"):
         if isinstance(cfg.get("annotation"), dict) and type(cfg["annotation"].get(flag, True)) is not bool:
             raise ValueError(f"annotation.{flag} must be true or false")

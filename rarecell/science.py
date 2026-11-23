@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 from scipy import sparse
 
+from .nb_mixture import fit_nb_split
+
 
 METHOD_VERSION = "local-contrast/1"
 VIEW_NAMES = frozenset(("V_HVG", "V_GINI", "V_LINEAR", "V_TENSOR2"))
@@ -91,6 +93,7 @@ class Science:
         self.rna_valid = np.diff(self.data.indptr) > 0
         if self.data.shape != (len(self.cell_index), len(self.gene_index)):
             raise ValueError("snapshot IDs and matrix dimensions disagree")
+        self.raw_counts = None
         self.views = {}
         for name in sorted(manifest["views"]):
             if name not in VIEW_NAMES:
@@ -139,7 +142,7 @@ class Science:
         else:
             selected = list(range(len(genes)))
         records = self._gene_records(statistics, selected)
-        return {
+        result = {
             "status": "ok", "statistics": records, "purpose": "exploration",
             "signature_kind": "exploratory_singleton" if len(group) == 1 else "descriptive_contrast",
             "selection_history": {"members": members, "background": background,
@@ -147,6 +150,47 @@ class Science:
             "summary": {"n_query": len(group), "n_background": len(background),
                         "n_genes_reported": len(records), "leading_genes": records[:6]},
         }
+
+        if genes:
+            self._add_nb_splits(result, group, self._indices(background), genes)
+        return result
+
+    def _add_nb_splits(self, result, group, background, genes):
+        path = self.snapshot / "raw.npz"
+        if not path.is_file():
+            result["summary"]["nb_mixture"] = {"status": "raw_counts_unavailable"}
+            return
+        if self.raw_counts is None:
+            self.raw_counts = sparse.load_npz(path).tocsc()
+            self.library_sizes = np.asarray(self.raw_counts.sum(axis=1, dtype=np.float64)).ravel()
+        rows = np.concatenate((group, background))
+        valid = self.library_sizes[rows] > 0
+        excluded = self.cells[rows[~valid]].tolist()
+        n_foreground = int(valid[:len(group)].sum())
+        rows = rows[valid]
+        summaries, diagnostics = {}, {}
+        for gene in genes:
+            counts = self.raw_counts[:, self.gene_index[gene]].toarray().ravel()[rows]
+            summary, high = fit_nb_split(counts, self.library_sizes[rows])
+            if high is not None:
+                summary["high_foreground"] = int(high[:n_foreground].sum())
+                summary["high_background"] = int(high[n_foreground:].sum())
+                low_mean, high_mean = summary["means_per_10k"]
+                minor_high = 2 * int(high.sum()) <= len(rows)
+                minor = high if minor_high else ~high
+                summaries[gene] = {
+                    "minor_members": self.cells[rows[minor]].tolist(),
+                    "minor_mean_per_10k": high_mean if minor_high else low_mean,
+                    "major_mean_per_10k": low_mean if minor_high else high_mean,
+                }
+            else:
+                summaries[gene] = {"status": summary["status"]}
+            diagnostics[gene] = summary
+        result["summary"]["nb_mixture"] = {"genes": summaries, "n_fit": len(rows),
+                                           "n_zero_depth_excluded": int((~valid).sum())}
+        if excluded:
+            result["summary"]["nb_mixture"]["excluded_zero_depth"] = excluded
+        result["nb_diagnostics"] = diagnostics
 
     def _indices(self, names):
         return np.array([self.cell_index[name] for name in names], dtype=np.intp)

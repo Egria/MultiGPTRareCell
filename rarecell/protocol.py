@@ -36,6 +36,7 @@ def _alias_map(groups):
 ACTIONS = _alias_map({
     "review_seed": ("assess_seed", "record_seed_review", "调查种子"),
     "list_seed_reviews": ("list seed assessments",),
+    "list_ontology_pools": ("list seed pools",),
     "apply_boundary": (),
     "select_boundary": (),
     "preview_submission": (),
@@ -89,6 +90,7 @@ BACKGROUNDS = {"background", "background_id"}
 ALLOWED = {
     "review_seed": {"candidate_id", "disposition", "reason", "evidence_ids"},
     "list_seed_reviews": {"offset", "limit"},
+    "list_ontology_pools": {"offset", "limit"},
     "select_boundary": {"candidate_id", "reason"},
     "apply_boundary": {"candidate_id", "evidence_ids", "metric", "threshold", "reason"},
     "preview_submission": {"candidate_ids", "candidate_id", "reference_id"},

@@ -87,6 +87,7 @@ def parser():
     an = cmd("annotate")
     an.add_argument("--snapshot", type=Path, required=True)
     an.add_argument("--out", type=Path, required=True)
+    an.add_argument("--panel-mode", choices=["global", "dual"], help="OntoAnno marker backgrounds")
     an.add_argument("--include-singletons", action=argparse.BooleanOptionalAction, default=None,
                     help="annotate frozen singleton seeds using positive expression contrasts")
     an.add_argument("--reuse-annotations", type=Path, help="reuse matching verified batches from an earlier annotation")
@@ -139,6 +140,8 @@ def dispatch(a, default_model=""):
     overrides = model_overrides(a.model or default_model)
     if cmd == "discover" and a.exhaustive_seed_review is not None:
         overrides["exhaustive_seed_review"] = a.exhaustive_seed_review
+    if cmd == "annotate" and a.panel_mode:
+        overrides.setdefault("annotation", {})["panel_mode"] = a.panel_mode
     if cmd == "annotate" and a.include_singletons is not None:
         overrides.setdefault("annotation", {})["include_singletons"] = a.include_singletons
     cfg = config(a.config, overrides)

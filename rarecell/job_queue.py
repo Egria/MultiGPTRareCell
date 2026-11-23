@@ -106,6 +106,8 @@ def submit(root, project, form):
                 override["exhaustive_seed_review"] = setting == "yes"
             elif setting:
                 raise ValueError("无效的种子调查选项")
+        if kind in {"annotate", "pipeline"} and form.get("panel_mode"):
+            override.setdefault("annotation", {})["panel_mode"] = form["panel_mode"]
         if kind in {"annotate", "pipeline"} and form.get("include_singletons"):
             if form["include_singletons"] not in {"yes", "no"}:
                 raise ValueError("无效的单细胞注释选项")

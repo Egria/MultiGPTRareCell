@@ -56,5 +56,5 @@ annotation:
   api_key_env: OPENAI_API_KEY
   timeout: 180
   top_genes: 10
-  dual_backgrounds: true
+  # panel_mode defaults to global. Explicit older dual_backgrounds settings retain their meaning.
   include_singletons: true

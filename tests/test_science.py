@@ -13,6 +13,7 @@ from sklearn.preprocessing import normalize
 from sklearn.random_projection import SparseRandomProjection
 from threadpoolctl import threadpool_limits
 
+from rarecell.discovery import observation_summary
 from rarecell.data import read_dataset
 from rarecell.science import Science
 
@@ -66,6 +67,7 @@ def expression_fixture(folder, rare_size, technical_scale=False, homogeneous=Fal
     write_table(snap / "genes.tsv", "gene_id", data.gene_ids)
     x = data.x[rows]
     sparse.save_npz(snap / "data.npz", x)
+    sparse.save_npz(snap / "raw.npz", data.raw[rows])
     rp = SparseRandomProjection(n_components=96, random_state=373)
     view = rp.fit_transform(normalize(x)).toarray()
     np.save(snap / "views" / "V_LINEAR.npy", view)
@@ -78,6 +80,27 @@ class NumericalSearchTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.root = Path(tmp.name)
         self.addCleanup(tmp.cleanup)
+
+    def test_named_contrast_returns_depth_adjusted_high_members(self):
+        snap = expression_fixture(self.root / "case", 12, technical_scale=True, shuffled=True)
+        truth = json.loads((snap.parent / "evaluation_fixture" / "truth.json").read_text())
+        tool = Science(snap, {})
+        args = {"members": [truth["seed"]], "genes": ["g020", "g021", "g143"]}
+        result = tool.execute("compare_groups", args)
+        genes = observation_summary(result)["nb_mixture"]["genes"]
+        for gene in ("g020", "g021"):
+            self.assertEqual(set(genes[gene]["minor_members"]), set(truth["rare"]))
+            self.assertGreater(genes[gene]["minor_mean_per_10k"], genes[gene]["major_mean_per_10k"])
+        self.assertEqual(genes["g143"], {"status": "insufficient_signal"})
+        majority = tool.execute("compare_groups", {"members": truth["rare"], "background": [
+            next(cell for cell in tool.cells if cell not in truth["rare"])], "genes": ["g020"]})
+        gene = observation_summary(majority)["nb_mixture"]["genes"]["g020"]
+        self.assertEqual(len(gene["minor_members"]), 1)
+        self.assertLess(gene["minor_mean_per_10k"], gene["major_mean_per_10k"])
+        (snap / "raw.npz").unlink()
+        fallback = Science(snap, {}).execute("compare_groups", args)
+        self.assertEqual(fallback["statistics"], result["statistics"])
+        self.assertEqual(fallback["summary"]["nb_mixture"]["status"], "raw_counts_unavailable")
 
     def run_search(self, rare_size, name="run", search=None, **kwargs):
         snap = expression_fixture(self.root / name, rare_size, **kwargs)

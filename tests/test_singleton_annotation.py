@@ -128,7 +128,7 @@ def test_dual_panels_reach_discovery_and_recover_partial(tmp_path):
     sparse.save_npz(views / "V_HVG_snn.npz", sparse.csr_matrix(np.array([
         [0, 1, 0, 1], [1, 0, 1, 1], [0, 1, 0, 0], [1, 1, 0, 0]])))
     np.save(views / "V_HVG.npy", np.array([[2, 0], [2, 1], [1, 1], [0, 0], [0, 1.]]))
-    options = dict(model="fixture", rscript="/absent", batch_size=3)
+    options = dict(model="fixture", rscript="/absent", batch_size=3, panel_mode="dual")
     settings = annotation._resolve(options)
     assert settings["include_singletons"] and settings["dual_backgrounds"]
     jobs, skipped = annotation._jobs(snap, manifest, settings)
@@ -187,3 +187,84 @@ def test_dual_panels_reach_discovery_and_recover_partial(tmp_path):
     fallback = next(p for p in contrast_panels.panels(snap, manifest, settings)
                     if p["candidate_id"] == "Hp" and p["background_type"] == "neighbor")
     assert fallback["background_rule"] == "HVG_nearest_external_to_centroid" and fallback["n_background"] == 1
+
+
+def test_global_only_reuses_dual_global_receipts_and_builds_actionable_seed_pool(tmp_path):
+    from rarecell.discovery import Controller
+    from rarecell.protocol import parse_message
+
+    snap, old, new = (tmp_path / x for x in ("snap", "dual", "global"))
+    manifest = snapshot(snap)
+    manifest["prepare"] = {"k": 1}
+    (snap / "views").mkdir()
+    np.save(snap / "views/V_HVG.npy", np.ones((5, 2)))
+    write_json(snap / "manifest.json", manifest)
+    with (snap / "initial.jsonl").open("a") as out:
+        out.write(json.dumps(dict(id="Hb", members=["b"], sources=[dict(kind="outlier", view="V_GINI")],
+                                  markers=[])) + "\n")
+    with (snap / "seeds.jsonl").open("a") as out:
+        out.write(json.dumps(dict(id="b", cell_id="b", candidate_id="Hb")) + "\n")
+    dual = dict(model="fixture", rscript="/unavailable", dual_backgrounds=True)
+    opts = dict(model="fixture", rscript="/unavailable")
+    old_jobs, _ = annotation._jobs(snap, manifest, annotation._resolve(dual))
+    jobs, skipped = annotation._jobs(snap, manifest, annotation._resolve(opts))
+    assert jobs == [job for job in old_jobs if job["groups"][0]["background_type"] == "global"]
+    assert all(r["background_type"] == "global" for r in skipped)
+    for job in old_jobs:
+        group, = job["groups"]
+        global_panel = group["background_type"] == "global"
+        cid = group["candidate_id"]
+        batch = old / "batches" / fingerprint(job)
+        batch.mkdir(parents=True)
+        label = "Schwann cell" if cid == "Ha" else "Schwann Cell"
+        row = dict(candidate_id=cid, label=label, ontology_id="CL:0002573" if global_panel else "CL:0000003")
+        write_json(batch / "response.json", dict(commit=annotation.PIN, valid=True, raw_response=label, rows=[row]))
+    assert annotation._run(snap, old, dual, manifest)["status"] == "success"
+    status = annotation._run(snap, new, opts, manifest, reuse=old)
+    assert status["cached_batches"] == len(jobs) and status["newly_completed_batches"] == 0
+    annotations = annotation.verify_annotation(snap, new, _manifest=manifest)
+    expected = {g: sum(g in r["selection_history"]["genes"] for r in annotations if r["candidate_id"] in {"Ha", "Hb"})
+                for r in annotations if r["candidate_id"] in {"Ha", "Hb"} for g in r["selection_history"]["genes"]}
+    cfg = config()
+    run, cache = tmp_path / "discovery", tmp_path / "cache"
+    for i in range(2):
+        ctrl = Controller(snap, run, cache, cfg, "A3", annotations)
+        try:
+            ctrl.initialize()
+            ctrl.state.set_meta("policy", "live")
+            pool, = ctrl.context(1)["ontology_seed_pools"]
+            cid = pool["candidate_id"]
+            assert pool["n_seeds"] == 2 and pool["ontology_id"] == "CL:0002573"
+            cmd, = parse_message('{"action":"list seed pools"}')
+            assert ctrl.execute(cmd, "test")["ontology_seed_pools"] == [pool]
+            page = ctrl.read_tool("get_evidence", dict(candidate_id=cid))
+            assert page["seed_candidate_ids"] == ["Ha", "Hb"] and page["members"] == ["a", "b"]
+            assert page["marker_seed_counts"] == expected
+            assert ctrl.state.get_meta("selected", []) == []
+            query = ctrl.scientific("coexpress", dict(candidate_id=cid, genes=["g1"]))
+            assert query["summary"]["n_query"] == 2
+            if i == 0:
+                first = cid
+            else:
+                assert cid == first
+                assert ctrl.decide("submit", {"candidate_ids":[cid]}, "test")["candidate_ids"] == [cid]
+        finally:
+            ctrl.state.close()
+
+
+def test_ontology_pool_counts_distinct_global_seed_panels_only():
+    from rarecell.contrast_panels import ontology_seed_pools
+
+    def row(cid, term, genes, scope="global", status="annotated", label="example"):
+        return dict(candidate_id=cid, ontology_id=term, label=label, background_type=scope,
+                    status=status, evidence_id=cid + scope, selection_history={"genes": genes})
+
+    term = "CL:0002573"
+    rows = [row("A", term, ["G", "G", "X"]), row("B", term, ["G", "Y"]),
+            row("A", term, ["Z"], scope="neighbor"), row("C", term, ["Z"], scope="neighbor"),
+            row("D", None, ["Z"]), row("E", term, ["Z"], status="unavailable"),
+            row("F", term, ["Z"], label="unknown"), row("group", term, ["Z"]),
+            row("H", "CL:0005019", ["Y"])]
+    result, = ontology_seed_pools(set("ABCDEFH"), rows + rows[:1])
+    assert result[0] == term and result[2] == ["A", "B"]
+    assert result[4] == {"G": 2, "X": 1, "Y": 1}

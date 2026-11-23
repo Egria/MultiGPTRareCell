@@ -1,17 +1,17 @@
-# OntoAnno labels for each Seurat group and seed
+# OntoAnno marker panels and Cell Ontology seed pools
 
-Run annotation on an existing frozen snapshot, then supply its new output directory to discovery:
+Each distinct Seurat HVG group and each proposed singleton seed gets one global marker panel by default. The contrast compares mean log-normalized expression inside the candidate with the mean across all other cells. Up to ten distinct symbols with the largest positive differences enter the panel (`annotation.top_genes`). OntoAnno receives them once, in a reproducible shuffled order with equal weight. The annotation directory records the effects, detection fractions, original response, CL mapping and any failure or reason for an empty panel.
+
+To use a frozen snapshot and reuse the matching global batches of a completed dual-background annotation run:
 
 ```bash
-.venv/bin/python -m rarecell annotate --snapshot "$TASK/snapshot" --out "$TASK/annotations-dual" --config "$TASK/settings.yaml" --include-singletons
+.venv/bin/python -m rarecell annotate --snapshot "$TASK/snapshot" \
+  --config "$TASK/settings.yaml" --panel-mode global --include-singletons \
+  --reuse-annotations "$TASK/annotations" --out "$TASK/annotations-global"
 ```
 
-The default workflow covers every V_HVG partition group at every resolution and every proposed singleton seed, across all nomination views. An identical member set shares one pair of labels, retaining its seed ID and all partition/resolution links. Existing snapshots work without another prepare. Set `annotation.include_singletons: true` for seed coverage when reusing an older configuration that explicitly turned it off.
+Omit `--reuse-annotations` for a fresh annotation. Reuse requires matching snapshot, model, prompt, batch composition and settings. A new output directory keeps the original experiment reproducible. YAML accepts `annotation.panel_mode: global` or `dual`. The explicit panel mode takes precedence over older configurations that set `dual_backgrounds`. Without a panel mode, an explicit historical `dual_backgrounds: true` requests separate global and neighbor labels, and `false` selects legacy Seurat markers. The dashboard also offers the global and dual modes.
 
-* **Global** compares mean log-normalized RNA expression inside the target with the mean across all other input cells.
-* **Neighbor** uses the seed’s frozen local neighbours when available. For a group it uses unique outside cells adjacent to its members in the frozen HVG SNN graph. For an isolated group with a valid HVG embedding it uses up to prepare.k external cells nearest the group's centroid by cosine similarity of the unit PCA vectors. A missing neighborhood is recorded explicitly.
-* Each contrast ranks positive mean differences across measured genes and keeps up to `annotation.top_genes` distinct symbols (default 10). Ranked effects and detection fractions are retained. Gene order is deterministically shuffled for the model. Neighbor and global requests run separately, even when their input sets coincide. A no-expression, no-background, or no-positive-marker result produces a local unknown with the reason. An unsuccessful request is distinguishable from an upstream model answer of unknown.
-* A1, A3 and A3_adaptive expose both labels and gene lists on candidate cards. Active seed triage and exhaustive review also receive them. These are interpretations of the same RNA. No label changes seed membership.
-* Inspect `annotations.jsonl` and the run's `annotations.tsv` for both rows per target. Per-panel background rules, sample sizes, marker effects, cell-set hashes, and original model receipts are retained in the annotation directory. `annotation_status.json` distinguishes completed labels, skipped panels and failed batches. Run the same command on a partial directory to reuse successful receipts under the existing retry policy.
+In A1, A3 and A3_adaptive, each exact CL ID assigned to at least two singleton seeds by the global panel creates one provisional candidate. Names that map to the same CL ID contribute to the same pool. Unmapped seeds retain their individual candidates. A Seurat group can receive a label but does not vote in the seed counts. For previously saved dual annotations discovery uses their global rows for pooling.
 
-For historical experiments set `annotation.dual_backgrounds: false` to use the previous Seurat Wilcoxon input and optional single-seed contrast. Historical annotation directories remain readable by discovery. Use a fresh output directory when changing the panel protocol. Historical single-panel receipts belong to a different request.
+Ordinary discovery turns show the pool IDs, sizes and most frequent genes. `list_ontology_pools` pages the full index. `get_evidence(candidate_id, offset, limit)` pages the seed IDs, cell IDs and the union of marker genes with counts. Each count is the number of distinct member seeds whose global panel included that gene. It describes panel selection, not the expression frequency across all cells. Active discovery can use the pool as a foreground for comparison and query global marker expression to find further members. The agent can select, revise or leave out the pool.

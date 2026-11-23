@@ -230,6 +230,7 @@ function updateForm() {
   field("model-field", model);
   field("ann-model-field", annModel);
   field("singleton-annotation-field", annModel);
+  field("panel-mode-field", annModel);
   field("reuse-annotation-field", annModel && (kind === "annotate" || $("start").value === "snapshot"));
   form.elements.gt.required = kind === "evaluate";
   $("gt-hint").textContent = kind === "evaluate" ? "必填" : "可选，结束后评估";

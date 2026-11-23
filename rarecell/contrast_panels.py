@@ -1,6 +1,7 @@
 """Paired positive RNA marker panels for frozen Seurat groups and singleton seeds."""
 import csv
-from collections import defaultdict
+import re
+from collections import Counter, defaultdict
 
 import numpy as np
 from scipy import sparse
@@ -9,8 +10,8 @@ from .config import fingerprint, read_lines
 
 SOURCE = "positive_mean_log_expression_difference"
 PROMPT = "ontoanno-dual-background-v1"
-GUIDANCE = ("Neighbor and global labels interpret the same RNA with different reference cells. "
-            "Treat agreement as shared evidence and examine competing identities when labels differ.")
+GUIDANCE = ("Marker panels and their OntoAnno labels derive from the same RNA. "
+            "Consider competing identities when their evidence differs.")
 
 
 def _table(path):
@@ -87,7 +88,8 @@ def panels(snapshot, manifest, settings):
     x = sparse.load_npz(snapshot / 'data.npz').tocsr().astype(np.float64, copy=False)
     totals = np.asarray(x.sum(axis=0)).ravel()
     detected = x.getnnz(axis=0)
-    neighbours = GroupNeighbours(snapshot, manifest, index)
+    global_only = settings.get("panel_mode") == "global"
+    neighbours = None if global_only else GroupNeighbours(snapshot, manifest, index)
     for row in read_lines(snapshot / 'initial.jsonl'):
         cid = row['id']
         seed = seeds.pop(cid, None)
@@ -112,14 +114,16 @@ def panels(snapshot, manifest, settings):
         if seed:
             common['seed_id'] = seed['id']
         bg = row.get('marker_background', {})
-        if len(fg) == 1 and bg.get('type') == 'local_neighbours':
+        if neighbours is None:
+            local, rule = None, None
+        elif len(fg) == 1 and bg.get('type') == 'local_neighbours':
             local = np.array(sorted({index[c] for c in bg['members']}), dtype=int)
             if np.intersect1d(fg, local).size:
                 raise ValueError('local reference overlaps foreground')
             rule = 'frozen_seed_neighbours'
         else:
             local, rule = neighbours.outside(fg)
-        for scope in ('neighbor', 'global'):
+        for scope in (('global',) if global_only else ('neighbor', 'global')):
             if scope == 'global':
                 n = x.shape[0] - len(fg)
                 bg_hash = fingerprint(['complement', manifest['snapshot_hash'], common['cell_set_hash']])
@@ -163,3 +167,25 @@ def jobs(snapshot, manifest, settings, head):
             result.append(dict(head, prompt_version=PROMPT, resolution=None, groups=group[pos:pos+size],
                                system_prompt=head['system_prompt'] + '\n' + note))
     return result, skipped
+
+
+def ontology_seed_pools(seed_ids, annotations):
+    """Group the frozen global annotations by exact CL term, counting a gene once per seed."""
+    groups = defaultdict(dict)
+    for row in annotations:
+        cid = row["candidate_id"]
+        term = row.get("ontology_id")
+        if (cid not in seed_ids or row.get("background_type") != "global"
+                or row.get("status") != "annotated" or not isinstance(term, str) or not re.fullmatch(r"CL:[0-9]{7}", term)
+                or row["label"].strip().casefold() == "unknown"):
+            continue
+        groups[term][cid] = row
+    for term, rows in sorted(groups.items()):
+        if len(rows) < 2:
+            continue
+        counts, labels = Counter(), Counter()
+        for row in rows.values():
+            counts.update(set(row["selection_history"]["genes"]))
+            labels[row["label"]] += 1
+        label = min(labels, key=lambda name: (-labels[name], name))
+        yield term, label, sorted(rows), sorted({r["evidence_id"] for r in rows.values()}), dict(counts)
