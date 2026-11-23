@@ -13,7 +13,7 @@ from collections import defaultdict
 
 from .config import atomic as _write, fingerprint as _hash, hash_file as _digest
 from .config import json_bytes as _encode, read_json as _read
-from . import singleton_markers
+from . import contrast_panels, singleton_markers
 from .providers import safe_url
 from .runtime import rscript_command
 
@@ -37,7 +37,10 @@ def _resolve(cfg):
     provider = options.get("provider", "openai")
     if provider not in ("openai", "anthropic", "gemini", "ollama", "vllm"):
         raise ValueError("unsupported OntoAnno HTTP provider")
-    include = options.get("include_singletons", False)
+    dual = options.get("dual_backgrounds", True)
+    if type(dual) is not bool:
+        raise ValueError("annotation.dual_backgrounds must be true or false")
+    include = options.get("include_singletons", dual)
     if type(include) is not bool:
         raise ValueError("annotation.include_singletons must be true or false")
     top = options.get("top_genes", 10)
@@ -76,7 +79,7 @@ def _resolve(cfg):
         raise ValueError("annotation.timeout must be positive and finite")
     return {"provider": provider, "model": model, "api_key_env": env, "base_url": url,
             "top_genes": top, "timeout": timeout, "batch_size": batch_size,
-            "single_line_stop": stop_line, **({"include_singletons": True} if include else {})}
+            "single_line_stop": stop_line, **({"dual_backgrounds": True} if dual else {}), **({"include_singletons": True} if include else {})}
 
 
 def diagnose(cfg):
@@ -142,10 +145,21 @@ def _partition_issue(manifest):
 
 
 def _jobs(snapshot, manifest, settings):
+    system_prompt = ("Provide one tentative cell type name per marker row, in the same order. "
+                     "Use unknown when the markers cannot support a name. Return only those names.\n"
+                     + CONTRACT.read_text())
+    head = {"commit": PIN, "prompt_version": PROMPT, "adapter_sha256": _digest(SCRIPT),
+            "contract_sha256": _digest(CONTRACT), "snapshot_hash": manifest["snapshot_hash"],
+            "data_version": manifest["data_version"], "settings": settings, "system_prompt": system_prompt,
+            "tissue": " ".join(str(manifest.get(k) or "") for k in ("species", "tissue")).strip()}
+    if settings.get("dual_backgrounds"):
+        head["settings"] = {k: v for k, v in settings.items() if k != "include_singletons"}
+        return contrast_panels.jobs(snapshot, manifest, settings, head)
     candidates, markers = ({}, {}) if _partition_issue(manifest) else _groups(snapshot)
     include = settings.get("include_singletons", False)
     # Preserve the exact historical partition job and its content-addressed receipt.
     partition_settings = {k: v for k, v in settings.items() if k != "include_singletons"}
+    head["settings"] = partition_settings
     by_resolution, skipped = defaultdict(list), []
     for key, info in sorted(candidates.items()):
         rows = markers[key]
@@ -160,13 +174,6 @@ def _jobs(snapshot, manifest, settings):
                                 reason="singleton" if info["n_members"] == 1 else "no_positive_markers"))
         else:
             by_resolution[key[0]].append(group)
-    system_prompt = ("Provide one tentative cell type name per marker row, in the same order. "
-                     "Use unknown when the markers cannot support a name. Return only those names.\n"
-                     + CONTRACT.read_text())
-    head = {"commit": PIN, "prompt_version": PROMPT, "adapter_sha256": _digest(SCRIPT),
-            "contract_sha256": _digest(CONTRACT), "snapshot_hash": manifest["snapshot_hash"],
-            "data_version": manifest["data_version"], "settings": partition_settings, "system_prompt": system_prompt,
-            "tissue": " ".join(str(manifest.get(k) or "") for k in ("species", "tissue")).strip()}
     jobs = []
     for res, group_list in sorted(by_resolution.items()):
         # Exact batch composition/order affects the upstream prompt and cache key.
@@ -254,6 +261,23 @@ def _batch(out, job, options):
     return rows, cache_hit, {str(p.relative_to(out)): _digest(p) for p in [req, receipt]}
 
 
+def _unavailable(panel, status, key=None):
+    row = {k: v for k, v in panel.items() if k != "genes"}
+    return dict(row, status=status, label="unknown", proposed_label="unknown", ontology_id=None,
+                source="panel_status", kind="interpretation", cache_key=key, prompt_version=contrast_panels.PROMPT,
+                reason=panel.get("reason", "annotation_batch_failed"),
+                selection_history={"method": panel["marker_source"], "genes": panel["genes"]})
+
+
+def _issue(manifest, settings):
+    if settings.get("dual_backgrounds"):
+        stage = manifest.get("stages", {}).get("V_HVG_graph", {})
+        if "V_HVG" not in manifest.get("views", ()) or stage.get("status") == "blocked":
+            return stage.get("reason") or "V_HVG partition unavailable"
+        return None
+    return _partition_issue(manifest)
+
+
 def _run(snapshot, out, cfg, manifest, reuse=None):
     options = _options(cfg)
     base = {"snapshot_hash": manifest["snapshot_hash"], "source_commit": PIN,
@@ -284,15 +308,16 @@ def _run(snapshot, out, cfg, manifest, reuse=None):
         return finish([], "not_run", detail="annotation explicitly off")
     if cfg_error:
         return finish([], "blocked", detail=cfg_error)
-    issue = _partition_issue(manifest)
+    dual = settings.get("dual_backgrounds", False)
+    issue = _issue(manifest, settings)
     if issue and not settings.get("include_singletons"):
         return finish([], "blocked", detail=issue)
     jobs, skipped = _jobs(snapshot, manifest, settings)
-    if not jobs:
+    if not jobs and not (dual and skipped):
         return finish([], "blocked", detail=issue or "no eligible marker lists", skipped=skipped)
     if reuse is not None:
         _reuse_receipts(snapshot, reuse, out, jobs, settings, manifest)
-    system = diagnose(cfg)
+    system = diagnose(cfg) if jobs else {"versions": None}
     rows, errors, hashes, hits, dispatches = [], [], {}, 0, 0
     for job in jobs:
         key = _hash(job)
@@ -308,13 +333,26 @@ def _run(snapshot, out, cfg, manifest, reuse=None):
             dispatches += int(not hit)
         except (ValueError, OSError, RuntimeError) as exc:
             errors.append({"key": key, "reason": str(exc)})
-    status = ("partial" if rows else "blocked") if errors or issue else "success"
+    annotated = len(rows)
+    if dual:
+        failed = {error["key"] for error in errors}
+        for job in jobs:
+            key = _hash(job)
+            if key in failed:
+                rows.extend(_unavailable(panel, "unavailable", key) for panel in job["groups"])
+        rows.extend(_unavailable(panel, "not_annotatable") for panel in skipped)
+    status = ("partial" if annotated or (dual and skipped and not errors) else "blocked") if errors or issue else "success"
+    coverage = {}
+    if dual:
+        coverage = {"panel_slots": len(rows), "annotated_singletons": len({
+            r["seed_id"] for r in rows if r.get("seed_id") and r["status"] == "annotated"})}
+    elif settings.get("include_singletons"):
+        coverage["annotated_singletons"] = sum(r.get("marker_source") == singleton_markers.SOURCE for r in rows)
     return finish(rows, status, settings=settings, skipped=skipped, errors=errors,
                   cached_batches=hits, newly_completed_batches=dispatches,
-                  files=hashes, annotated=len(rows), versions=system["versions"],
+                  files=hashes, annotated=annotated, versions=system["versions"],
                   **({"partition_issue": issue} if issue else {}),
-                  **({"annotated_singletons": sum(r.get("marker_source") == singleton_markers.SOURCE for r in rows)}
-                     if settings.get("include_singletons") else {}))
+                  **coverage)
 
 
 def _reuse_receipts(snapshot, source, out, jobs, settings, manifest):
@@ -327,6 +365,8 @@ def _reuse_receipts(snapshot, source, out, jobs, settings, manifest):
     requested = dict(settings)
     previous.pop("include_singletons", None)
     requested.pop("include_singletons", None)
+    previous.pop("dual_backgrounds", None)
+    requested.pop("dual_backgrounds", None)
     if previous != requested:
         raise ValueError("reused annotation model and batch settings must match")
     for job in jobs:
@@ -370,12 +410,13 @@ def verify_annotation(snapshot, out, *, allow_partial=False, _manifest=None):
         raise ValueError("annotation is " + status)
     if state["snapshot_hash"] != manifest["snapshot_hash"] or state["source_commit"] != PIN:
         raise ValueError("annotation source/snapshot version mismatch")
-    jobs, _ = _jobs(snapshot, manifest, state["settings"])
+    dual = state["settings"].get("dual_backgrounds", False)
+    jobs, skipped = _jobs(snapshot, manifest, state["settings"])
     by_key = {_hash(job): job for job in jobs}
     errors = state.get("errors", [])
     failed = {error["key"] for error in errors}
     if (len(failed) != len(errors) or not failed.issubset(by_key)
-            or state.get("partition_issue") != _partition_issue(manifest)
+            or state.get("partition_issue") != _issue(manifest, state["settings"])
             or bool(failed or state.get("partition_issue")) != (status == "partial")):
         raise ValueError("inconsistent annotation batch outcome records")
     expected = {}
@@ -400,18 +441,26 @@ def verify_annotation(snapshot, out, *, allow_partial=False, _manifest=None):
     if _digest(path) != state["annotation_sha256"]:
         raise ValueError("annotation projection modified")
     rows = [json.loads(line) for line in path.read_text().splitlines()]
-    if not rows or len(rows) != len(expected) or state.get("annotated") != len(rows):
+    if dual:
+        missing = [_unavailable(panel, "unavailable", key) for key, job in by_key.items() if key in failed
+                   for panel in job["groups"]]
+        missing.extend(_unavailable(panel, "not_annotatable") for panel in skipped)
+        if (state.get("skipped") != skipped or state.get("panel_slots") != len(rows)
+                or [_hash(r) for r in rows if r["status"] != "annotated"] != [_hash(r) for r in missing]):
+            raise ValueError("inconsistent dual-background panel coverage")
+    annotated_rows = [r for r in rows if r.get("status") == "annotated"] if dual else rows
+    if not rows or len(annotated_rows) != len(expected) or state.get("annotated") != len(annotated_rows):
         raise ValueError("incomplete annotation projection")
-    for row in rows:
+    for row in annotated_rows:
         entry = expected.pop((row["cache_key"], row["candidate_id"]), None)
         if entry is None:
             raise ValueError("unexpected annotation row")
         group, reply = entry
-        if group.get("marker_source") == singleton_markers.SOURCE:
+        if group.get("marker_source") in (singleton_markers.SOURCE, contrast_panels.SOURCE):
             if (any(row.get(k) != v for k, v in group.items() if k != "genes")
-                    or row.get("selection_history") != {"method": singleton_markers.SOURCE, "genes": group["genes"]}
-                    or row.get("prompt_version") != singleton_markers.PROMPT):
-                raise ValueError("singleton projection/marker panel mismatch")
+                    or row.get("selection_history") != {"method": group["marker_source"], "genes": group["genes"]}
+                    or row.get("prompt_version") != by_key[row["cache_key"]]["prompt_version"]):
+                raise ValueError("annotation projection/marker panel mismatch")
         if (any(row[k] != group[k] for k in ("cell_set_hash", "marker_hash", "partition_id"))
                 or row["proposed_label"] != reply["label"] or row["label"] != reply["label"]
                 or row["ontology_id"] != reply["ontology_id"]):

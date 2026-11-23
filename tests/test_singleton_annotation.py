@@ -56,7 +56,7 @@ def cached_reply(out, job):
 def test_old_receipt_reuse_and_singleton_provenance(tmp_path):
     snap, old, new = [tmp_path / s for s in ("snap", "old", "new")]
     manifest = snapshot(snap)
-    old_cfg = {"model": "example", "rscript": "/unavailable"}
+    old_cfg = {"model": "example", "dual_backgrounds": False, "rscript": "/unavailable"}
     cfg = dict(old_cfg, include_singletons=True)
     partition, = annotation._jobs(snap, manifest, annotation._resolve(old_cfg))[0]
     jobs, skipped = annotation._jobs(snap, manifest, annotation._resolve(cfg))
@@ -82,7 +82,7 @@ def test_singleton_result_when_seurat_blocked(tmp_path):
     snap, out = tmp_path / "snap", tmp_path / "ann"
     m = snapshot(snap)
     m["views"] = ["V_GINI"]
-    cfg = dict(model="example", rscript="/unavailable", include_singletons=True)
+    cfg = dict(model="example", rscript="/unavailable", include_singletons=True, dual_backgrounds=False)
     jobs, _ = annotation._jobs(snap, m, annotation._resolve(cfg))
     assert len(jobs) == 1
     cached_reply(out, jobs[0])
@@ -107,3 +107,83 @@ def test_task_settings_and_cache_source(tmp_path):
     assert args.reuse_annotations == old and args.include_singletons is None
     with pytest.raises(ValueError, match="true or false"):
         config(override={"annotation":{"include_singletons":"yes"}})
+
+
+def test_dual_panels_reach_discovery_and_recover_partial(tmp_path):
+    from rarecell import contrast_panels, exhaustive
+    from rarecell.discovery import Controller
+
+    snap, out = tmp_path / "snap", tmp_path / "ann"
+    manifest = snapshot(snap)
+    path = snap / "initial.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[-1]["sources"].append(dict(kind="partition", view="V_HVG", partition_id="P2", resolution=1))
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    manifest["prepare"] = {"k": 1}
+    manifest["stages"]["seurat_markers"] = {"status": "blocked"}
+    write_json(snap / "manifest.json", manifest)
+    views = snap / "views"
+    views.mkdir()
+    (views / "V_HVG_graph_rows.tsv").write_text("cell_id\na\nb\nc\ne\n")
+    sparse.save_npz(views / "V_HVG_snn.npz", sparse.csr_matrix(np.array([
+        [0, 1, 0, 1], [1, 0, 1, 1], [0, 1, 0, 0], [1, 1, 0, 0]])))
+    np.save(views / "V_HVG.npy", np.array([[2, 0], [2, 1], [1, 1], [0, 0], [0, 1.]]))
+    options = dict(model="fixture", rscript="/absent", batch_size=3)
+    settings = annotation._resolve(options)
+    assert settings["include_singletons"] and settings["dual_backgrounds"]
+    jobs, skipped = annotation._jobs(snap, manifest, settings)
+    pairs = {(p["candidate_id"], p["background_type"]): p for p in
+             skipped + [p for job in jobs for p in job["groups"]]}
+    assert len(pairs) == 8  # three seeds and one repeated group
+    seed_local, seed_global = [pairs["Ha", scope] for scope in ("neighbor", "global")]
+    assert [m["symbol"] for m in seed_local["markers"]] == ["High", "g4"]
+    assert seed_global["n_background"] == 4 and seed_local["n_background"] == 2
+    assert [m["symbol"] for m in seed_global["markers"]] == ["High", "g4", "Equal"]
+    assert pairs["Hp", "neighbor"]["n_background"] == 1 and len(pairs["Hp", "global"]["partitions"]) == 2
+    assert pairs["Hp", "neighbor"]["background_hash"] == fingerprint(["e"])
+    assert pairs["Hd", "neighbor"]["reason"] == pairs["Hd", "global"]["reason"] == "no_expression"
+    assert all(len({p["background_type"] for p in job["groups"]}) == 1 for job in jobs)
+
+    def reply(job):
+        batch = out / "batches" / fingerprint(job)
+        batch.mkdir(parents=True, exist_ok=True)
+        labels = [dict(candidate_id=p["candidate_id"], label=p["background_type"] + " label", ontology_id=None)
+                  for p in job["groups"]]
+        write_json(batch / "response.json", dict(valid=True, commit=annotation.PIN, raw_response="fixture reply", rows=labels))
+
+    for job in jobs[1:]:
+        reply(job)
+    assert annotation._run(snap, out, options, manifest)["status"] == "partial"
+    partial = annotation.verify_annotation(snap, out, _manifest=manifest, allow_partial=True)
+    assert len(partial) == 8 and any(p["status"] == "unavailable" for p in partial)
+    reply(jobs[0])
+    assert annotation._run(snap, out, options, manifest)["status"] == "success"
+    annotations = annotation.verify_annotation(snap, out, _manifest=manifest)
+    assert len(annotations) == 8
+    cfg = config(override={"exhaustive_seed_review": True})
+    ctrl = Controller(snap, tmp_path / "run", tmp_path / "cache", cfg, "A3", annotations)
+    try:
+        ctrl.initialize()
+        card = ctrl.card(ctrl.candidate("Ha"))
+        assert set(card["tentative_alternatives"]) == {"neighbor label", "global label"}
+        assert {r["background_type"]: set(r["genes"]) for r in card["annotation_sources"]} == {
+            "neighbor": set(seed_local["genes"]), "global": set(seed_global["genes"])}
+        for obj in card["annotation_sources"]:
+            entry = ctrl.state.get("Evidence", obj["evidence_id"])
+            parent = ctrl.state.get("Evidence", entry["parent_ids"][0])
+            assert parent["kind"] == "observation" and parent["method_version"] == contrast_panels.SOURCE
+        ctrl.state.put("SeedMeasurement", "Ha", {"candidate_id": "Ha", "status": "no_expansion", "evidence_id": "obs"})
+        exhaustive.prepare_batch(ctrl, "T1", [{"candidate_id": "Ha", "previous_batches": 0}])
+        batch = ctrl.state.get("SeedBatch", "T1")
+        shown = ctrl.state.read_artifact(batch["context_ref"])["seeds"][0]
+        assert shown["annotation_sources"] == card["annotation_sources"]
+        label_eid = shown["annotation_sources"][0]["evidence_id"]
+        result = exhaustive.record(ctrl, "T1", dict(candidate_id="Ha", evidence_ids=[label_eid],
+                                   disposition="follow_up", reason="Resolve the conflicting labels"))
+        assert result["evidence_id"] == "obs" and result["annotation_evidence_ids"] == [label_eid]
+    finally:
+        ctrl.state.close()
+    sparse.save_npz(views / "V_HVG_snn.npz", sparse.csr_matrix((4, 4)))
+    fallback = next(p for p in contrast_panels.panels(snap, manifest, settings)
+                    if p["candidate_id"] == "Hp" and p["background_type"] == "neighbor")
+    assert fallback["background_rule"] == "HVG_nearest_external_to_centroid" and fallback["n_background"] == 1

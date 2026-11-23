@@ -83,7 +83,9 @@ def export(ctrl, status, detail, policy, annotation_status):
         (dict(candidate_id=c["id"], cell_id=cell) for c in records for cell in c["members"]))
     jsonlines(run / "candidates.jsonl", ({k: v for k, v in c.items() if k != "members"} for c in records))
     annotations = s.all("Annotation")
-    tsv(run / "annotations.tsv", ["candidate_id", "label", "ontology_id", "partition_id", "marker_hash", "cache_key", "evidence_id"], annotations)
+    tsv(run / "annotations.tsv", ["candidate_id", "seed_id", "background_type", "n_background", "label", "status", "reason",
+                                  "genes", "ontology_id", "partition_id", "marker_hash", "cache_key", "evidence_id"],
+        (dict(row, genes=",".join(row.get("selection_history", {}).get("genes", []))) for row in annotations))
     jsonlines(run / "decisions.jsonl", s.all("Decision"))
     jsonlines(run / "evidence.jsonl", s.all("Evidence"))
     seeds = s.all("Seed")

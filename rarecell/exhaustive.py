@@ -1,6 +1,7 @@
 """Mandatory singleton measurements and public model assessments for opted-in live runs."""
 from collections import Counter
 
+from .contrast_panels import GUIDANCE as PANEL_GUIDANCE
 from .config import contract, json_bytes
 from .protocol import ProtocolError
 from .state import QueryBlocked
@@ -46,6 +47,8 @@ def prepare_batch(ctrl, mid, queue):
                "to test or why to stop. A singleton or no additions can merit follow-up. Specify the candidate ID; the "
                "controller binds the measurement shown. A disposition is a recommendation for later discovery.",
                "previous_errors": [str(r["error"])[:200] for r in previous if "error" in r][:3], "seeds": []}
+    if ctrl.labeled:
+        context["turn_instruction"] += " " + PANEL_GUIDANCE
     size = min(ctrl.budget.get("seed_review_batch_size", 4), ctrl.budget["max_actions_per_turn"])
     for seed in queue[:size]:
         cid = seed["candidate_id"]
@@ -55,6 +58,7 @@ def prepare_batch(ctrl, mid, queue):
         label = ctrl.current_label(cid)
         if label:
             item["tentative_label"] = label["label"]
+            item["annotation_sources"] = label["sources"]
         context["seeds"].append(item)
         if len(json_bytes(context)) > ctrl.budget["context_bytes"]:
             context["seeds"].pop()
@@ -80,11 +84,15 @@ def record(ctrl, mid, args):
         raise ProtocolError("Seed ID is outside the batch in this message")
     obs = s.get("SeedMeasurement", cid)
     eid = obs.get("evidence_id")
-    if args.get("evidence_ids") and set(args["evidence_ids"]) != {eid}:
-        raise ProtocolError("Cite this seed's measured evidence ID, or omit evidence_ids to bind it automatically")
+    citations = set(args.get("evidence_ids", []))
+    label_ids = set(ctrl.current_label(cid).get("evidence_ids", []))
+    if citations - ({eid} | label_ids):
+        raise ProtocolError("Cite evidence for the assigned seed. Its measurement is bound automatically")
     assessment = {"source": "discovery_agent", "candidate_id": cid, "seed_id": ctrl.seed_ids[cid], "message_id": mid,
                   "evidence_id": eid, "measurement_status": obs["status"], "proposal_id": obs.get("proposal_id"),
                   "disposition": args["disposition"], "reason": args["reason"].strip()}
+    if citations & label_ids:
+        assessment["annotation_evidence_ids"] = sorted(citations & label_ids)
     old = s.get_optional("SeedAssessment", cid)
     if old and old != assessment:
         raise ProtocolError("This seed already has a written assessment")

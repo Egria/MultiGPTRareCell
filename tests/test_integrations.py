@@ -81,7 +81,7 @@ def _marker_snapshot(path):
 def test_annotation_contents_and_separate_singleton(tmp_path):
     _marker_snapshot(tmp_path)
     manifest = {"snapshot_hash": "snap", "data_version": "v1"}
-    settings = annotation._resolve({"model": "m"})
+    settings = annotation._resolve({"model": "m", "dual_backgrounds": False})
     first, skipped = annotation._jobs(tmp_path, manifest, settings)
     assert len(first) == 1 and first[0]["groups"][0]["genes"] == ["CD3E", "CD3D"]
     assert len(skipped) == 1 and skipped[0]["reason"] == "singleton"
@@ -97,7 +97,7 @@ def test_annotation_contents_and_separate_singleton(tmp_path):
 def test_annotation_unknown_dispatch_and_receipt_recovery(tmp_path):
     _marker_snapshot(tmp_path)
     manifest = {"snapshot_hash": "snap", "data_version": "v1"}
-    job = annotation._jobs(tmp_path, manifest, annotation._resolve({"model": "m"}))[0][0]
+    job = annotation._jobs(tmp_path, manifest, annotation._resolve({"model": "m", "dual_backgrounds": False}))[0][0]
     key = annotation._hash(job)
     dst = tmp_path / "batches" / key
     dst.mkdir(parents=True)
@@ -169,7 +169,7 @@ def test_partial_annotation_exact_successful_subset(tmp_path):
     with (fixture / "seurat" / "markers.tsv").open("a") as f:
         f.write("1\tH2\tg2\tCD3E\t1\t0.01\n")
     manifest = {"snapshot_hash": "fixture", "data_version": "data"}
-    settings = annotation._resolve({"model": "test"})
+    settings = annotation._resolve({"model": "test", "dual_backgrounds": False})
     jobs, _ = annotation._jobs(fixture, manifest, settings)
     assert len(jobs) == 2
     key, missing = map(annotation._hash, jobs)
