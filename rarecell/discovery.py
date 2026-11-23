@@ -16,7 +16,7 @@ SCIENTIFIC = {"expand_candidate", "coexpress", "compare_groups"}
 CATALOGUE = {
     "list_candidates": "offset, limit. Browse stable candidate IDs and short evidence cards.",
     "get_evidence": "candidate_id or evidence_ids, offset, limit. A single evidence_id pages frozen HVG or Seurat Wilcoxon marker tables in every mode, or active-query results where enabled. A candidate pages its exact cell IDs.",
-    "compare_groups": "candidate_id or members, optional background_id or background, optional genes. Optional evidence_ids cite the reason for this query.",
+    "compare_groups": "candidate_id or members, optional background_id or background, optional genes. Named genes also return a pooled foreground/background NB mixture with depth offset when raw counts exist. Optional evidence_ids cite the reason for this query.",
     "coexpress": "candidate_id, members, or explicit scope=all; genes; optional AND/OR logic and threshold. Optional evidence_ids cite the reason for this query.",
     "expand_candidate": "candidate_id. Searches all cells; omitting background or scalar background=all uses local contrast. Use background_mode=complement for all nonmembers, or background_id/explicit background IDs. Optional evidence_ids cite the query. no_expansion means no additions.",
     "propose_revision": ('Example shape (replace placeholder IDs): {"action":"propose_revision","parents":["H..."],'
@@ -596,6 +596,8 @@ class Controller:
         canonical = {"action": action, "args": bound, "data_version": self.version,
                      "transform_version": self.snapshot_hash, "method_version": [__version__, METHOD_VERSION],
                      "parameters": self.cfg["search"], "layer": "log1p"}
+        if action == "compare_groups" and bound.get("genes"):
+            canonical["method_version"].append("nb-mixture/1")
         if self.adaptive and action == "expand_candidate":
             canonical["method_version"].append("ranked-expansion/1")
         signature = fingerprint(canonical)

@@ -66,6 +66,7 @@ def expression_fixture(folder, rare_size, technical_scale=False, homogeneous=Fal
     write_table(snap / "genes.tsv", "gene_id", data.gene_ids)
     x = data.x[rows]
     sparse.save_npz(snap / "data.npz", x)
+    sparse.save_npz(snap / "raw.npz", data.raw[rows])
     rp = SparseRandomProjection(n_components=96, random_state=373)
     view = rp.fit_transform(normalize(x)).toarray()
     np.save(snap / "views" / "V_LINEAR.npy", view)
@@ -78,6 +79,20 @@ class NumericalSearchTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.root = Path(tmp.name)
         self.addCleanup(tmp.cleanup)
+
+    def test_named_contrast_returns_depth_adjusted_high_members(self):
+        snap = expression_fixture(self.root / "case", 6, technical_scale=True, shuffled=True)
+        truth = json.loads((snap.parent / "evaluation_fixture" / "truth.json").read_text())
+        tool = Science(snap, {})
+        args = {"members": [truth["seed"]], "genes": ["g020"]}
+        result = tool.execute("compare_groups", args)
+        self.assertEqual(set(result["nb_high_members"]["g020"]), set(truth["rare"]))
+        gene = result["summary"]["nb_mixture"]["genes"]["g020"]
+        self.assertEqual((gene["high_foreground"], gene["high_background"]), (1, 5))
+        (snap / "raw.npz").unlink()
+        fallback = Science(snap, {}).execute("compare_groups", args)
+        self.assertEqual(fallback["statistics"], result["statistics"])
+        self.assertEqual(fallback["summary"]["nb_mixture"]["status"], "raw_counts_unavailable")
 
     def run_search(self, rare_size, name="run", search=None, **kwargs):
         snap = expression_fixture(self.root / name, rare_size, **kwargs)
