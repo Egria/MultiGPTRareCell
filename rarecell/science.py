@@ -165,20 +165,32 @@ class Science:
             self.library_sizes = np.asarray(self.raw_counts.sum(axis=1, dtype=np.float64)).ravel()
         rows = np.concatenate((group, background))
         valid = self.library_sizes[rows] > 0
+        excluded = self.cells[rows[~valid]].tolist()
         n_foreground = int(valid[:len(group)].sum())
         rows = rows[valid]
-        summaries, high_members = {}, {}
+        summaries, diagnostics = {}, {}
         for gene in genes:
             counts = self.raw_counts[:, self.gene_index[gene]].toarray().ravel()[rows]
             summary, high = fit_nb_split(counts, self.library_sizes[rows])
             if high is not None:
                 summary["high_foreground"] = int(high[:n_foreground].sum())
                 summary["high_background"] = int(high[n_foreground:].sum())
-                high_members[gene] = self.cells[rows[high]].tolist()
-            summaries[gene] = summary
+                low_mean, high_mean = summary["means_per_10k"]
+                minor_high = 2 * int(high.sum()) <= len(rows)
+                minor = high if minor_high else ~high
+                summaries[gene] = {
+                    "minor_members": self.cells[rows[minor]].tolist(),
+                    "minor_mean_per_10k": high_mean if minor_high else low_mean,
+                    "major_mean_per_10k": low_mean if minor_high else high_mean,
+                }
+            else:
+                summaries[gene] = {"status": summary["status"]}
+            diagnostics[gene] = summary
         result["summary"]["nb_mixture"] = {"genes": summaries, "n_fit": len(rows),
                                            "n_zero_depth_excluded": int((~valid).sum())}
-        result["nb_high_members"] = high_members
+        if excluded:
+            result["summary"]["nb_mixture"]["excluded_zero_depth"] = excluded
+        result["nb_diagnostics"] = diagnostics
 
     def _indices(self, names):
         return np.array([self.cell_index[name] for name in names], dtype=np.intp)

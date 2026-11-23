@@ -16,7 +16,7 @@ SCIENTIFIC = {"expand_candidate", "coexpress", "compare_groups"}
 CATALOGUE = {
     "list_candidates": "offset, limit. Browse stable candidate IDs and short evidence cards.",
     "get_evidence": "candidate_id or evidence_ids, offset, limit. A single evidence_id pages frozen HVG or Seurat Wilcoxon marker tables in every mode, or active-query results where enabled. A candidate pages its exact cell IDs.",
-    "compare_groups": "candidate_id or members, optional background_id or background, optional genes. Named genes also return a pooled foreground/background NB mixture with depth offset when raw counts exist. Optional evidence_ids cite the reason for this query.",
+    "compare_groups": "candidate_id or members, optional background_id or background, optional genes. Named genes also return a pooled foreground/background NB mixture with depth offset when raw counts exist. Each split gives complete minor_members and fitted minor/major means per 10k. For co-high overlap, use minority IDs when minor mean is higher, otherwise their complement in fitted cells. Optional evidence_ids cite the reason for this query.",
     "coexpress": "candidate_id, members, or explicit scope=all; genes; optional AND/OR logic and threshold. Optional evidence_ids cite the reason for this query.",
     "expand_candidate": "candidate_id. Searches all cells; omitting background or scalar background=all uses local contrast. Use background_mode=complement for all nonmembers, or background_id/explicit background IDs. Optional evidence_ids cite the query. no_expansion means no additions.",
     "propose_revision": ('Example shape (replace placeholder IDs): {"action":"propose_revision","parents":["H..."],'
@@ -57,6 +57,15 @@ def compact(value, n=8):
     if isinstance(value, str):
         return value[:320]
     return value
+
+
+def observation_summary(result):
+    raw = result.get("summary", {"status": result.get("status")})
+    summary = compact(raw)
+    if "nb_mixture" in raw:
+        # Cell sets and gene panels must survive the generic preview limits intact.
+        summary["nb_mixture"] = raw["nb_mixture"]
+    return summary
 
 
 class Controller:
@@ -597,7 +606,7 @@ class Controller:
                      "transform_version": self.snapshot_hash, "method_version": [__version__, METHOD_VERSION],
                      "parameters": self.cfg["search"], "layer": "log1p"}
         if action == "compare_groups" and bound.get("genes"):
-            canonical["method_version"].append("nb-mixture/1")
+            canonical["method_version"].append("nb-mixture/2")
         if self.adaptive and action == "expand_candidate":
             canonical["method_version"].append("ranked-expansion/1")
         signature = fingerprint(canonical)
@@ -642,7 +651,7 @@ class Controller:
     def _register_result(self, action, args, bound, c, signature, result, key, ref):
         parents = self._selection_parents(args, bound)
         sh = fingerprint(bound["members"])
-        summary = compact(result.get("summary", {"status": result.get("status")}))
+        summary = observation_summary(result)
         hist = [{"query_key": key, "selection_dependent": True, "selection_history_ref": ref}]
         try:
             eid = self.state.get("QueryObservation", key)["evidence_id"]
@@ -938,7 +947,7 @@ class Controller:
                         if field in history:
                             sections[field] = history[field]
                     return {"evidence_id": ids[0], "query_key": key, "offset": offset, "limit": limit,
-                            "status": data["status"], "summary": compact(data.get("summary", {})),
+                            "status": data["status"], "summary": observation_summary(data),
                             "sections": {field: {"total": len(values), "rows": values[offset:offset+limit]}
                                          for field, values in sections.items()}}
         if ids is None:

@@ -44,8 +44,7 @@ def fit_nb_split(counts, libraries):
 
     single, _ = fit([mean], 0.5)
     fits = []
-    for q in (0.5, 0.95, 0.998):
-        cut = np.quantile(rates, q)
+    for cut in np.unique(np.quantile(rates, [0.002, 0.05, 0.5, 0.95, 0.998])):
         upper = rates > cut
         if not upper.any():
             upper = rates == rates.max()
