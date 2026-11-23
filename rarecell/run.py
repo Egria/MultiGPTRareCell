@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from . import __version__, exhaustive, providers
+from . import __version__, exhaustive, pool_followup, providers
 from .annotation import verify_annotation
 from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, RESOURCES, atomic, contract, fingerprint, hash_file, read_json, validate_settings, write_json
 from .discovery import Controller, SCIENTIFIC, prompt_version
@@ -24,7 +24,7 @@ def code_fingerprint():
     module = Path(__file__).parent
     files = ("discovery.py", "run.py", "protocol.py", "science.py", "state.py", "providers.py",
              "config.py", "seed_review.py", "exhaustive.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py",
-             "contrast_panels.py", "singleton_markers.py")
+             "contrast_panels.py", "singleton_markers.py", "pool_followup.py", "nb_mixture.py")
     return fingerprint({name: hash_file(module / name) for name in files})
 
 
@@ -164,6 +164,7 @@ def process_message(ctrl, message, turn):
     s = ctrl.state
     mid = message["message_id"]
     seed_batch = s.get_optional("SeedBatch", mid) if ctrl.exhaustive else None
+    pool_batch = s.get_optional("PoolBatch", mid) if ctrl.exhaustive and ctrl.labeled else None
     parser_version = PROTOCOL_VERSION + ("/seed" if seed_batch else "")
     parse_id = fingerprint([parser_version, message["raw"], message.get("complete", True)])
     interpretation = s.get_optional("ParsedMessage", parse_id)
@@ -176,7 +177,7 @@ def process_message(ctrl, message, turn):
     else:
         parsed = interpretation["commands"]
     limit = ctrl.budget["max_actions_per_turn"]
-    closing = () if seed_batch else ctrl.closing_actions(turn)
+    closing = () if seed_batch or pool_batch else ctrl.closing_actions(turn)
     if closing and s.get_meta("decision_start_turn") is None:
         s.set_meta("decision_start_turn", turn)
     if not closing and len(parsed) > limit:
@@ -195,12 +196,15 @@ def process_message(ctrl, message, turn):
             continue
         # A revision/submit and its receipt commit together. Local numeric work
         # has an independent cache-publication journal and can be reattached.
-        outer = nullcontext() if command.get("action") in SCIENTIFIC else s.transaction()
+        local_query = command.get("action") in SCIENTIFIC or command.get("action") == "investigate_pool"
+        outer = nullcontext() if local_query else s.transaction()
         with outer:
             if s.get_meta("submitted", False):
                 result = {"error": "Run already submitted; subsequent action blocked", "status": "blocked"}
             else:
                 try:
+                    if pool_batch and command.get("action") and command["action"] != "investigate_pool":
+                        raise ValueError("Pool investigation is open: choose one test per assigned pool")
                     if seed_batch and command.get("action") and command["action"] != "review_seed":
                         raise ValueError("Written seed review is open: use review_seed for the listed seeds first")
                     if closing and command.get("action") and command["action"] not in closing:
@@ -260,6 +264,8 @@ def process_message(ctrl, message, turn):
                                    "status": result.get("status", "ok"), "receipt": opid, "changed": changed})
         receipts.append(result)
         progress |= changed
+    if pool_batch:
+        pool_followup.finish_batch(ctrl, mid, pool_batch)
     browse_only = parsed and all(c.get("action") == "list_candidates" for c in parsed)
     if (not ctrl.exhaustive and not closing and ctrl.active and s.get_meta("policy") == "live" and browse_only
             and len(parsed) < limit and any("candidates" in r for r in receipts)):
@@ -273,7 +279,10 @@ def process_message(ctrl, message, turn):
         s.set_meta("finished_turn", turn)
         stall_counter = "seed_review_stall" if seed_batch else "stall"
         first_exposure = seed_batch and seed_batch["includes_new"]
-        s.set_meta(stall_counter, 0 if progress or first_exposure else s.get_meta(stall_counter, 0) + 1)
+        if pool_batch:
+            s.set_meta("pool_review_turns", s.get_meta("pool_review_turns", 0) + 1)
+        else:
+            s.set_meta(stall_counter, 0 if progress or first_exposure else s.get_meta(stall_counter, 0) + 1)
         if seed_batch:
             s.set_meta("seed_review_turns", turn)
         s.event("turn", {"message_id": mid, "turn": turn, "progress": progress})
@@ -304,7 +313,7 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
     s.set_meta("policy", policy)
     status, detail = "partial", "max_agent_turns"
     review_limit = len(ctrl.seed_ids) + ctrl.budget["stall_turns"] if ctrl.exhaustive else 0
-    hard_limit = ctrl.budget["max_agent_turns"] + review_limit
+    hard_limit = ctrl.budget["max_agent_turns"] + review_limit + (len(ctrl.pool_candidates) if ctrl.exhaustive else 0)
     for turn in range(s.get_meta("finished_turn", 0) + 1, hard_limit + 1):
         mid = "%s:T%04d" % (s.get_meta("run_id"), turn)
         queue = []
@@ -321,14 +330,6 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
                     s.set_meta("current_issue", "One or more required seed measurements failed. See seed_reviews.tsv.")
                     return "partial", "seed_measurement_blocked"
                 s.set_meta("seed_phase_complete", True)
-        if not review and turn > ctrl.turn_limit:
-            break
-        if not review and ctrl.stall_review():
-            closing_turn = s.get_meta("closing_turn", turn)
-            if turn > closing_turn:
-                detail = "stalled"
-                break
-            s.set_meta("closing_turn", closing_turn)
         # A fresh invocation reconstructs context or replays a persisted full message.
         cap = ctrl.budget.get("max_reported_tokens", 0)
         # Budget gates the next dispatch. A reply checkpointed before an
@@ -341,6 +342,16 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
         try:
             if review:
                 exhaustive.prepare_batch(ctrl, mid, queue)
+            elif ctrl.exhaustive and ctrl.labeled:
+                review = pool_followup.prepare_batch(ctrl, mid)
+            if not review and turn > ctrl.turn_limit:
+                break
+            if not review and ctrl.stall_review():
+                closing_turn = s.get_meta("closing_turn", turn)
+                if turn > closing_turn:
+                    detail = "stalled"
+                    break
+                s.set_meta("closing_turn", closing_turn)
             message = obtain(ctrl, policy, turn, retry_unknown)
         except providers.ProviderError as exc:
             detail = "provider_blocked" if exc.status == "blocked" else exc.status
@@ -472,6 +483,10 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
                 status, detail = "partial", "submitted_with_blocked_prepare"
             elif astatus == "partial":
                 status, detail = "partial", "submitted_with_partial_annotations"
+            elif ctrl.exhaustive and ctrl.labeled and pool_followup.coverage(ctrl)["pending"]:
+                status, detail = "partial", "submitted_with_pending_pool_followup"
+            elif ctrl.exhaustive and ctrl.labeled and pool_followup.coverage(ctrl)["blocked"]:
+                status, detail = "partial", "submitted_with_blocked_pool_followup"
             elif s.get_meta("denied_budget", False) or (exhausted and pending):
                 status, detail = "partial", "submitted_after_budget_exhaustion"
             elif any(q["status"] != "success" for q in s.all("CanonicalQuery")):

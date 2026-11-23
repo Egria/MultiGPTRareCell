@@ -227,3 +227,71 @@ def test_parent_annotation_join_binds_both_group_and_resolution(tmp_path):
     rows = list(memberships(tmp_path, ann, {"x", "y"}))
     assert [(r["cell_id"], r["parent_label"], r["seed_candidate_id"], r["marker_input"]) for r in rows] == [
         ("x","unknown","seed-x","m,n"), ("x","b","seed-x","p"), ("y","","","")]
+
+
+@pytest.mark.parametrize("query_budget", [1, 2])
+def test_pool_followups_run_before_closeout_and_survive_resume(frozen, tmp_path, monkeypatch, query_budget):
+    from rarecell.config import read_lines, write_json
+
+    ids = [r["candidate_id"] for r in read_lines(frozen / "seeds.jsonl")]
+    with (frozen / "genes.tsv").open() as stream:
+        gene = next(csv.DictReader(stream, delimiter="\t"))["gene_id"]
+    annotations = [dict(candidate_id=cid, label="type " + str(i//2), ontology_id="CL:%07d" % (i//2),
+                        background_type="global", status="annotated", selection_history={"genes":[gene]})
+                   for i, cid in enumerate(ids[:6])]
+    ann = tmp_path/"annotations"
+    ann.mkdir()
+    write_json(ann/"annotation_status.json", {"status":"success"})
+    monkeypatch.setattr("rarecell.run.verify_annotation", lambda *args, **kwargs: annotations)
+    cfg = strict(max_agent_turns=1, max_new_queries=query_budget)
+    cfg["annotation"]["enabled"] = True
+    phases = []
+
+    def reply(ctx, _):
+        phases.append(ctx["phase"])
+        if ctx["phase"] == "exhaustive_seed_review":
+            out = [dict(written(row), recommendation="follow_up" if row["candidate_id"] in
+                        (ids[0], ids[2], ids[-1]) else "retain") for row in ctx["seeds"]]
+        elif ctx["phase"] == "pool_follow_up":
+            first = ctx["pools"][0]
+            assert all(p["written_questions"] and p["n_follow_up"] == 1 for p in ctx["pools"])
+            out = [dict(action="investigate_pool", candidate_id=first["candidate_id"],
+                        genes=[gene], min_detected=1, reason="Test across the entire dataset")]
+            if query_budget == 2:
+                out.append(dict(action="investigate_pool", candidate_id=ctx["pools"][1]["candidate_id"],
+                                genes=["nonexistent_gene"], reason="Invalid nomination exercises fallback"))
+        else:
+            coverage = ctx["pool_followup_coverage"]
+            assert coverage["eligible_pools"] == 2 and coverage["pooled_follow_up_seeds"] == 2
+            assert coverage["unpooled_follow_up_seeds"] == 1
+            assert coverage["measured"] == query_budget and coverage["pending"] == 2 - query_budget
+            assert len(ctx["pool_followups"]) == query_budget and ctx["selected_count"] == 0
+            assert ctx["remaining"]["turns_including_this"] == 1 and ctx["remaining"]["new_queries"] == 0
+            out = dict(action="submit", candidate_ids=[])
+        return json.dumps(out), {"api_calls":1}
+
+    monkeypatch.setattr(providers, "complete", reply)
+    run = tmp_path/"run"
+    status = discover(frozen, run, tmp_path/"cache", cfg, mode="A3_adaptive", annotations=ann,
+                      pause_after=(len(ids)+3)//4 + 1)
+    assert status["detail"] == "paused" and phases[-1] == "pool_follow_up"
+    result = resume(run)
+    assert result["submitted"] and phases.count("pool_follow_up") == 1
+    if query_budget == 1 and result["prepare_status"] != "partial":
+        assert result["detail"] == "submitted_with_pending_pool_followup"
+    rows = list(read_lines(run/"pool_followups.jsonl"))
+    assert len(rows) == 2 and sum(r["status"] == "pending" for r in rows) == 2 - query_budget
+    first = next(r for r in rows if r.get("action") == "coexpress")
+    assert first["source"] == "discovery_agent" and first["matching_seeds"] <= first["n_seeds"]
+    ctrl = Controller(frozen, run, tmp_path/"cache", cfg, "A3_adaptive")
+    try:
+        page = ctrl.read_tool("get_evidence", {"evidence_ids":[first["evidence_id"]]})
+        assert page["summary"]["n_query"] == len(ctrl.cells)
+        assert page["summary"]["n_matching"] == first["n_matching"]
+        if query_budget == 2:
+            fallback = next(r for r in rows if r["action"] == "compare_groups")
+            assert fallback["source"] == "controller_fallback" and fallback["n_background"] == len(ctrl.cells)-2
+            assert ctrl.read_tool("get_evidence", {"candidate_id":fallback["candidate_id"]})["pool_followup"]["contrasts"]
+        assert "pool_followups.jsonl" in read_json(run/"frozen.json")["files"]
+    finally:
+        ctrl.state.close()

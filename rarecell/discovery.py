@@ -4,7 +4,7 @@ from functools import cached_property
 from pathlib import Path
 
 from .contrast_panels import GUIDANCE as PANEL_GUIDANCE, SOURCE as PAIRED_CONTRAST, ontology_seed_pools
-from . import __version__, adaptive, exhaustive, seed_review
+from . import __version__, adaptive, exhaustive, pool_followup, seed_review
 from .base_evidence import FrozenSeurat, annotation_parents, prepared_page
 from .config import ACTIVE_MODES, ADAPTIVE_MODE, ANNOTATED_MODES, contract, fingerprint, json_bytes, read_json, read_lines
 from .protocol import ProtocolError, resolve_genes
@@ -39,7 +39,11 @@ def prompt_version(mode, exhaustive_review=False):
     version = "discovery/adaptive-5" if mode == ADAPTIVE_MODE else "discovery/1.5"
     if mode in ANNOTATED_MODES:
         version += "/ontology-pools-1"
-    return version + ("/exhaustive-1" if exhaustive_review else "")
+    if exhaustive_review:
+        version += "/exhaustive-1"
+        if mode in ANNOTATED_MODES:
+            version += "/pool-followup-1"
+    return version
 
 
 def rows(path):
@@ -305,7 +309,8 @@ class Controller:
 
     @property
     def review_turns(self):
-        return self.state.get_meta("seed_review_turns", 0) if self.exhaustive else 0
+        return (self.state.get_meta("seed_review_turns", 0) + self.state.get_meta("pool_review_turns", 0)
+                if self.exhaustive else 0)
 
     @property
     def turn_limit(self):
@@ -352,7 +357,7 @@ class Controller:
         s = self.state
         if self.exhaustive:
             mid = "%s:T%04d" % (s.get_meta("run_id"), turn)
-            batch = s.get_optional("SeedBatch", mid)
+            batch = s.get_optional("SeedBatch", mid) or s.get_optional("PoolBatch", mid)
             if batch:
                 return s.read_artifact(batch["context_ref"])
         actions = {k: v for k, v in CATALOGUE.items() if self.active or k not in SCIENTIFIC}
@@ -367,7 +372,7 @@ class Controller:
             actions.update(adaptive.TOOLS)
             actions["get_evidence"] += " For a single expansion evidence_id, page the ranking, optionally sorted by metric."
             actions["coexpress"] += " Alternatively specify min_detected=k of the distinct genes, with optional expression threshold."
-            actions["propose_revision"] += " Optional group biological_rarity (yes/no/uncertain) and rarity_reason record context-specific interpretation. Use matched_evidence_id in a group for all exact hits of one measured coexpress query. Each group can subtract exclude_candidate_ids from its union (e.g. remove a rare candidate from a broad group)."
+            actions["propose_revision"] += " Optional group biological_rarity (yes/no/uncertain) and rarity_reason record context-specific interpretation. Use matched_evidence_id for exact coexpress hits, or use matched_evidence_id plus nb_high_gene for all fitted high-state cells of that gene in a compare_groups result. Each group can subtract exclude_candidate_ids from its union (e.g. remove a rare candidate from a broad group)."
         recent = s.get_meta("receipts", [])
         queries = s.all("CanonicalQuery")
         usage = s.usage()
@@ -448,7 +453,14 @@ class Controller:
                                   "basis": "Shared signed markers and RNA views guide follow-up. These are not independent "
                                            "validation. Use their evidence IDs to propose a joint group if warranted."}
             if not closing:
-                ctx["seed_review"]["pending_followup"] = len(queue)
+                field = "pending_initial_expansions" if self.exhaustive else "pending_followup"
+                ctx["seed_review"][field] = len(queue)
+        if self.exhaustive and self.labeled and self.pool_candidates:
+            ctx["pool_followup_coverage"] = pool_followup.coverage(self)
+            ctx["pool_followups"] = []
+            ctx["turn_instruction"] += (" Use pool_followups to decide which measured groups to revise, submit or "
+                                        "defer. Inspect competing programs and explain promising deferrals. "
+                                        "get_evidence(candidate_id) retrieves the pool result.")
         if self.adaptive and self.budget.get("max_reported_tokens"):
             consumed = [m["usage"].get("total_tokens") for m in s.all("Message")]
             if all(n is not None for n in consumed):
@@ -470,6 +482,16 @@ class Controller:
                 ctx[key].pop()
                 return False
             return True
+        if "pool_followups" in ctx:
+            # Keep room for the agent's subsequent measurements and selection feedback.
+            allowance = (limit - len(json_bytes(ctx))) // 2
+            for c in self.pool_candidates:
+                row = s.get_optional("PoolFollowup", c["id"])
+                if row:
+                    card = pool_followup.card(row)
+                    allowance -= len(json_bytes(card)) + 1
+                    if allowance < 0 or not append_if_fits("pool_followups", card):
+                        break
         if self.labeled and self.pool_candidates:
             ctx["ontology_pool_count"] = len(self.pool_candidates)
             visible = ctx["ontology_seed_pools"] = []
@@ -828,7 +850,10 @@ class Controller:
                 if matched:
                     if not self.adaptive:
                         raise ValueError("matched_evidence_id requires A3_adaptive")
-                    measured = adaptive.coexpression_members(self, matched)
+                    if "nb_high_gene" in group:
+                        measured = adaptive.nb_high_members(self, matched, group["nb_high_gene"])
+                    else:
+                        measured = adaptive.coexpression_members(self, matched)
                     member_set.update(measured)
                     measured_evidence.add(matched)
                 member_set |= explicit
@@ -900,6 +925,9 @@ class Controller:
                     "members": c["members"][offset:offset+limit],
                     "markers": compact(c.get("markers", [])[offset:offset+limit], limit)}
             if "ontology_pool" in c:
+                followup = self.state.get_optional("PoolFollowup", c["id"])
+                if followup:
+                    page["pool_followup"] = pool_followup.card(followup)
                 page["seed_candidate_ids"] = c["parents"][offset:offset+limit]
                 page["marker_seed_counts"] = dict(c["ontology_pool"]["marker_counts"][offset:offset+limit])
             if self.adaptive:
@@ -974,6 +1002,8 @@ class Controller:
             size = min(25, args.get("limit", 8))
             return {"total": len(self.pool_candidates), "offset": start,
                     "ontology_seed_pools": [self.pool_card(c) for c in self.pool_candidates[start:start+size]]}
+        if self.exhaustive and self.labeled and action == "investigate_pool":
+            return pool_followup.run_query(self, message_id, args)
         if self.exhaustive and action == "review_seed":
             return exhaustive.record(self, message_id, args)
         if self.exhaustive and action == "list_seed_reviews":

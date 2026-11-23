@@ -296,3 +296,35 @@ def test_budget_stop_after_progress(tmp_path, three_views, ending, has_draft):
             assert ctrl.state.get_meta("submission_status") == "provisional"
             assert ctrl.state.get_meta("closeout_trigger") == ending
             assert len(ctrl.state.get_meta("selected")) == 1
+
+
+def test_revision_from_named_nb_split_uses_exact_fitted_scope(tmp_path):
+    from scipy import sparse
+    from rarecell.adaptive import nb_high_members
+
+    snap = expression_fixture(tmp_path/"mix", 12, shuffled=True)
+    truth = json.loads((snap.parent/"evaluation_fixture"/"truth.json").read_text())
+    rare = truth["rare"]
+    cells = (snap/"cells.tsv").read_text().splitlines()[1:]
+    low, zero = [c for c in cells if c not in rare][:2]
+    raw = sparse.load_npz(snap/"raw.npz").tolil()
+    raw[cells.index(zero)] = 0
+    sparse.save_npz(snap/"raw.npz", raw.tocsr())
+    (snap/"manifest.json").write_text(json.dumps({"views":["V_LINEAR"], "data_version":"test", "snapshot_hash":"test"}))
+    (snap/"initial.jsonl").write_text(json.dumps({"id":"pool", "members":rare, "sources":[], "markers":[]})+"\n")
+    (snap/"seeds.jsonl").write_text("")
+    ctrl = Controller(snap, tmp_path/"run", tmp_path/"cache", config(), ADAPTIVE_MODE)
+    try:
+        ctrl.initialize()
+        for background in ([low, zero], [c for c in cells if c not in rare]):
+            obs = act(ctrl, "compare_groups", candidate_id="pool", background=background, genes=["g020","g143"])
+            eid = obs["evidence_id"]
+            assert set(nb_high_members(ctrl, eid, "g020")) == set(rare)
+            with pytest.raises(ValueError, match="No fitted"):
+                nb_high_members(ctrl, eid, "g143")
+        group = {"matched_evidence_id":eid, "nb_high_gene":"g020", "proposed_label":"hypothesis"}
+        result = act(ctrl, "propose_revision", parents=["pool"], evidence_ids=[eid], groups=[group],
+                     reason="Check the measured high state")
+        assert set(ctrl.candidate(result["candidate_ids"][0])["members"]) == set(rare)
+    finally:
+        ctrl.state.close()
