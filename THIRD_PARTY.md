@@ -17,9 +17,9 @@
 
 ## OntoAnno 对接细节
 
-作者的 `run_multi_resolution_clustering` 写 `markers_res_<resolution>.rds`，并把每个 resolution 的标签放入 `cluster_res.<resolution>`。作者高层 `ontoanno` 按同一约定读取，并执行 resolution 选择。本适配器直接调用已导出的注释子函数，按 prepare 产生的精确 partition_id、group_id 和成员集合匹配 `seurat/markers.tsv`。HVG 名单及原始划分留在原 snapshot 中。实际注释对象为各个 HVG 的 Seurat partition；其他视角、singleton 和无阳性 marker 的种子继续参加探索。
+作者的 `run_multi_resolution_clustering` 写 `markers_res_<resolution>.rds`，并把每个 resolution 的标签放入 `cluster_res.<resolution>`。作者高层 `ontoanno` 按同一约定读取，并执行 resolution 选择。本适配器直接调用已导出的注释子函数。默认对所有 HVG partition 群和 seed 分别计算邻居与全局正向表达差，再分开提交两份 marker。详见 [双背景注释](SINGLETON_ANNOTATION.md)。原始 HVG 和 Seurat Wilcoxon 表仍可供发现阶段查询。
 
-同组按调整后 p 值升序、log2FC 降序和稳定 gene_id 排序，选效应正的前 `top_genes` 个不同 symbol（缺失时使用 gene_id）。作者的命名 list 分支在源码中不会执行 topgenenumber 截断，因此在适配层先截断。按 resolution、稳定候选 ID 排序。默认每批只含一组，减少串行配对和跨群提示依赖。可设 `annotation.batch_size` 为 1–50 以降低 API 开销，整个批次内容及顺序计入缓存键。支持 stop 序列的模型可显式设置 `annotation.single_line_stop: true`（要求 `batch_size: 1`），通过 ellmer 告知生成器在换行时结束一条标签；默认关闭。传 `add_cl_prompt=TRUE`，允许父层所有细胞类型及 mixed/unknown。使用 `restrict_to=NULL, parent_celltype=NULL, min_log2fc=NULL`。作者的包内 `gptcelltype` 只在此唯一注释路径调用。支持作者内置的本地 CL 同义词键对齐，未映射时记录空 ontology_id。
+旧单背景模式的 Seurat 群按调整后 p 值升序、log2FC 降序和稳定 gene_id 排序，选效应正的前 `top_genes` 个不同 symbol（缺失时使用 gene_id）。作者的命名 list 分支在源码中不会执行 topgenenumber 截断，因此在适配层先截断。按 resolution、稳定候选 ID 排序。默认每批只含一组，减少串行配对和跨群提示依赖。可设 `annotation.batch_size` 为 1–50 以降低 API 开销，整个批次内容及顺序计入缓存键。支持 stop 序列的模型可显式设置 `annotation.single_line_stop: true`（要求 `batch_size: 1`），通过 ellmer 告知生成器在换行时结束一条标签；默认关闭。传 `add_cl_prompt=TRUE`，允许父层所有细胞类型及 mixed/unknown。使用 `restrict_to=NULL, parent_celltype=NULL, min_log2fc=NULL`。作者的包内 `gptcelltype` 只在此唯一注释路径调用。支持作者内置的本地 CL 同义词键对齐，未映射时记录空 ontology_id。
 
 `rarecell/r/annotation.R` 将作者注释函数的一个本地副本绑定到私有环境。这个环境把一次真实 `OntoAnno::call_llm` 的输入和原始输出来回记录，然后返回原始文本给原函数的解析器。R 包自身无需补丁。对响应行数及名称顺序再校验，才能接受标签关联。原始响应、归一化行、选中 genes、marker 和 cell set hash、完整模型/作者配置及 contract 版本进入外部注释目录。作者传输层对 429 有最多 3 次额外重试，本包只报告可观察到的已完成批次，未知 token/价格保持空。
 

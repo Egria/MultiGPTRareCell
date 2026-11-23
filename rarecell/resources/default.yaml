@@ -56,4 +56,5 @@ annotation:
   api_key_env: OPENAI_API_KEY
   timeout: 180
   top_genes: 10
-  include_singletons: false
+  dual_backgrounds: true
+  include_singletons: true

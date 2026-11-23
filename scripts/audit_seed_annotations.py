@@ -5,24 +5,37 @@ import sys
 from pathlib import Path
 
 from rarecell.annotation import verify_annotation
+from rarecell.contrast_panels import SOURCE as PAIRED_CONTRAST
 from rarecell.config import read_json, read_lines
 
 
 def memberships(snapshot, annotations, targets):
-    by_group = {(float(r["resolution"]), r["candidate_id"]): r for r in annotations if r.get("resolution") is not None}
-    singles = {r["candidate_id"]: r for r in annotations if r.get("marker_source") == "singleton_positive_contrast"}
+    by_group, singles = {}, {}
+    paired = any(r.get("marker_source") == PAIRED_CONTRAST for r in annotations)
+    scopes = ("neighbor", "global") if paired else ("legacy",)
+    for ann in annotations:
+        scope = ann["background_type"] if ann.get("marker_source") == PAIRED_CONTRAST else "legacy"
+        cid = ann["candidate_id"]
+        if ann.get("seed_id") or ann.get("marker_source") == "singleton_positive_contrast":
+            singles[(cid, scope)] = ann
+        for part in ann.get("partitions", [ann]):
+            if part.get("resolution") is not None:
+                by_group[(float(part["resolution"]), cid, scope)] = ann
     seeds = {r["cell_id"]: r["candidate_id"] for r in read_lines(snapshot/"seeds.jsonl")}
     with (snapshot/"baselines.tsv").open(newline="", encoding="utf-8") as stream:
         for row in csv.DictReader(stream, delimiter="\t"):
             if row["view"] != "V_HVG" or row["cell_id"] not in targets:
                 continue
-            annotation = by_group.get((float(row["resolution"]), row["group_id"]), {})
-            direct = singles.get(seeds.get(row["cell_id"]), {})
-            yield dict(row, seed_label=direct.get("label", ""),
-                       seed_marker_input=",".join(direct.get("selection_history", {}).get("genes", [])),
-                       seed_candidate_id=seeds.get(row["cell_id"], ""),
-                       parent_label=annotation.get("label", ""), ontology_id=annotation.get("ontology_id", ""),
-                       marker_input=",".join(annotation.get("selection_history", {}).get("genes", [])))
+            for scope in scopes:
+                annotation = by_group.get((float(row["resolution"]), row["group_id"], scope), {})
+                direct = singles.get((seeds.get(row["cell_id"]), scope), {})
+                yield dict(row, background_type=scope, seed_label=direct.get("label", ""),
+                           seed_status=direct.get("status", ""), parent_status=annotation.get("status", ""),
+                           seed_marker_input=",".join(direct.get("selection_history", {}).get("genes", [])),
+                           seed_candidate_id=seeds.get(row["cell_id"], ""),
+                           parent_label=annotation.get("label", ""), ontology_id=annotation.get("ontology_id", ""),
+                           marker_input=",".join(annotation.get("selection_history", {}).get("genes", [])))
+
 
 
 def main():
@@ -44,7 +57,8 @@ def main():
     if targets != {r["cell_id"] for r in rows}:
         parser.error("one or more ground-truth cells lack V_HVG membership in this snapshot")
     writer = csv.DictWriter(sys.stdout, ["cell_id", "seed_candidate_id", "resolution", "group_id",
-                            "parent_label", "ontology_id", "marker_input", "seed_label", "seed_marker_input"], delimiter="\t",
+                            "background_type", "parent_label", "parent_status", "ontology_id", "marker_input",
+                            "seed_label", "seed_status", "seed_marker_input"], delimiter="\t",
                             lineterminator="\n", extrasaction="ignore")
     writer.writeheader()
     writer.writerows(rows)

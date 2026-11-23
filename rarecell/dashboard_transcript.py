@@ -33,7 +33,7 @@ def block(label, value):
 
 def annotation_blocks(directory, batches):
     state = optional_json(directory / "annotation_status.json")
-    summary = fields(state, "status detail settings annotated annotated_singletons partition_issue skipped errors cached_batches "
+    summary = fields(state, "status detail settings annotated annotated_singletons panel_slots partition_issue skipped errors cached_batches "
                      "newly_completed_batches provider_calls_observed_at_wire annotation_cost_usd")
     yield block("OntoAnno 注释", summary or "尚无阶段报告")
     if batches:

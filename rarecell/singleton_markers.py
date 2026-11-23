@@ -5,6 +5,7 @@ import numpy as np
 from scipy import sparse
 
 from .config import fingerprint, read_lines
+from .contrast_panels import positive_markers
 
 
 SOURCE = "singleton_positive_contrast"
@@ -49,22 +50,8 @@ def panels(snapshot, top):
             counts = detected[indices] - 1
         else:
             raise ValueError("unknown singleton background")
-        markers = []
-        symbols = set()
-        if n and len(indices):
-            effects = cell.data - sums / n
-            for k in np.lexsort((indices, -effects)):
-                if effects[k] <= 1e-12:
-                    break
-                gene = genes[indices[k]]
-                symbol = gene.get("symbol") or gene["gene_id"]
-                if symbol in symbols:
-                    continue
-                symbols.add(symbol)
-                markers.append(dict(gene_id=gene["gene_id"], symbol=symbol, effect=float(effects[k]),
-                                    pct_in=1.0, pct_out=float(counts[k] / n)))
-                if len(markers) == top:
-                    break
+        markers = positive_markers(genes, indices, cell.data, sums / n, np.ones(len(indices)), counts / n,
+                                   top) if n and len(indices) else []
         yield dict(candidate_id=row["id"], seed_id=seed["id"], n_members=1, resolution=None,
                    partition_id=None, marker_source=SOURCE, cell_set_hash=fingerprint(members),
                    background_type=bg["type"], background_hash=fingerprint(bg), n_background=n,

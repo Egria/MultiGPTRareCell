@@ -3,6 +3,7 @@ import csv
 from functools import cached_property
 from pathlib import Path
 
+from .contrast_panels import GUIDANCE as PANEL_GUIDANCE, SOURCE as PAIRED_CONTRAST
 from . import __version__, adaptive, exhaustive, seed_review
 from .base_evidence import FrozenSeurat, annotation_parents, prepared_page
 from .config import ACTIVE_MODES, ADAPTIVE_MODE, ANNOTATED_MODES, contract, fingerprint, json_bytes, read_json, read_lines
@@ -36,6 +37,8 @@ GOAL = (
 
 def prompt_version(mode, exhaustive_review=False):
     version = "discovery/adaptive-5" if mode == ADAPTIVE_MODE else "discovery/1.5"
+    if mode in ANNOTATED_MODES:
+        version += "/panels-2"
     return version + ("/exhaustive-1" if exhaustive_review else "")
 
 
@@ -74,6 +77,8 @@ class Controller:
         self.active = mode in ACTIVE_MODES
         self.labeled = mode in ANNOTATED_MODES
         self.goal = GOAL + adaptive.GOAL if self.adaptive else GOAL
+        if self.labeled:
+            self.goal += " " + PANEL_GUIDANCE
         self.prompt = prompt_version(mode, self.exhaustive)
         self.budget = cfg["budget"]
         self.annotations = list(annotations) if self.labeled else []
@@ -157,7 +162,19 @@ class Controller:
                 aid = "A" + fingerprint(ann)
                 projection = {k: ann[k] for k in ("label", "ontology_id", "resolution", "partition_id",
                                                   "marker_hash", "model", "cache_key", "marker_source", "n_background") if k in ann}
-                eid = self.evidence(aid, "interpretation", annotation_parents(ann, c), "input_expression",
+                if ann.get("marker_source") == PAIRED_CONTRAST:
+                    panel = {k: ann[k] for k in ("background_type", "background_rule", "n_background",
+                                                  "background_hash", "markers", "marker_hash", "partitions")}
+                    obs = self.evidence(c["id"] + "/" + panel["background_type"], "observation",
+                                        [c["evidence_ids"][0]], "input_expression", c["set_hash"],
+                                        {k: v for k, v in panel.items() if k != "markers"},
+                                        [self.state.artifact(panel)], method=PAIRED_CONTRAST, purpose="exploration")
+                    parents = [obs]
+                    projection.update(background_type=ann["background_type"], status=ann["status"],
+                                      genes=ann["selection_history"]["genes"])
+                else:
+                    parents = annotation_parents(ann, c)
+                eid = self.evidence(aid, "interpretation", parents, "input_expression",
                                     c["set_hash"], projection, [ref], history=ann.get("selection_history"),
                                     method=ann.get("author_commit"), prompt=ann.get("prompt_version"))
                 row = dict(ann, evidence_id=eid, id=aid)
@@ -182,10 +199,15 @@ class Controller:
         items = self.labels.get(cid, {})
         if not items:
             return {}
-        labels = sorted({item["label"] for item in items.values()})
+        labels = sorted({item["label"] for item in items.values() if item.get("status", "annotated") == "annotated"}) or ["unknown"]
         sources = []
         for eid, record in sorted(items.items()):
             summary = {k: record[k] for k in ("label", "partition_id", "resolution", "ontology_id", "marker_source") if k in record}
+            if record.get("marker_source") == PAIRED_CONTRAST:
+                summary.update(background_type=record["background_type"], status=record["status"],
+                               n_background=record["n_background"], genes=record["selection_history"]["genes"])
+                if record.get("reason"):
+                    summary["reason"] = record["reason"]
             sources.append(dict(summary, evidence_id=eid))
         return {"label": labels[0] if len(labels) == 1 else "unknown", "labels": labels,
                 "evidence_ids": sorted(items), "sources": sources}
@@ -422,7 +444,11 @@ class Controller:
         if live_active:
             for row in queue[:4]:
                 refs = [self.candidate(cid)["evidence_ids"][0] for cid in (row["candidate_id"], row["peer"]) if cid]
-                ctx["seed_review"]["priority"].append(dict(row, evidence_ids=refs))
+                item = dict(row, evidence_ids=refs)
+                label = self.current_label(row["candidate_id"])
+                if label:
+                    item["annotation_sources"] = label["sources"]
+                ctx["seed_review"]["priority"].append(item)
                 if len(json_bytes(ctx)) > limit:
                     ctx["seed_review"]["priority"].pop()
                     break
