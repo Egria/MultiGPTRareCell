@@ -59,13 +59,13 @@ if (mode == "pca") {
   emit(groups[rownames(z), , drop=FALSE], "groups.tsv")
 } else if (mode == "markers") {
   message("Reading normalized RNA for Wilcoxon markers")
-  assay <- CreateAssay5Object(data=readRDS(path("marker_data.rds")))
+  rna <- readRDS(path("marker_data.rds"))
   parts <- read.delim(path("marker_partitions.tsv"), stringsAsFactors=FALSE, colClasses="character")
   outfile <- path("markers_out.tsv")
   cat("resolution\tgroup_id\tgene_index\tavg_log2FC\tpct.1\tpct.2\tp_val\tp_val_adj\n", file=outfile)
-  pooled <- colnames(assay)
-  genes <- rownames(assay)
-  # Limit the gene-by-cell working set. Keep the full assay for Bonferroni n.
+  pooled <- colnames(rna)
+  genes <- rownames(rna)
+  # Bound each block across all cells; adjust against the full gene count below.
   block_size <- max(1L, floor(32 * 1024^2 / (8 * length(pooled))))
   blocks <- unname(split(genes, ceiling(seq_along(genes) / block_size)))
   if (as.character(packageVersion("SeuratObject")) != "5.2.0") {
@@ -81,12 +81,14 @@ if (mode == "pca") {
       for (i in seq_along(blocks)) {
         message(sprintf("markers resolution=%s group=%s cells=%d vs %d block=%d/%d",
                         resolution, gid, length(members), length(background), i, length(blocks)))
-        block <- FindMarkers(assay, features=blocks[[i]], cells.1=members, cells.2=background,
+        assay <- CreateAssay5Object(data=rna[blocks[[i]], , drop=FALSE])
+        block <- FindMarkers(assay, cells.1=members, cells.2=background,
           test.use="wilcox", min.pct=0.01, logfc.threshold=0, only.pos=TRUE, verbose=FALSE)
         if (nrow(block)) results[[i]] <- block
       }
       res <- do.call(rbind, results)
       if (is.null(res) || !nrow(res)) next
+      res$p_val_adj <- p.adjust(res$p_val, method="bonferroni", n=length(genes))
       res <- res[order(res$p_val, -res$avg_log2FC, rownames(res)),,drop=FALSE]
       tab <- data.frame(resolution=resolution, group_id=gid,
         gene_index=as.integer(sub("^G", "", rownames(res))), res[,c("avg_log2FC","pct.1","pct.2","p_val","p_val_adj")])

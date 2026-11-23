@@ -288,7 +288,7 @@ def test_marker_blocks_equal_a_full_assay_wilcoxon(tmp_path):
     suppressPackageStartupMessages(library(Seurat))
     suppressPackageStartupMessages(library(Matrix))
     set.seed(71)
-    g <- 2600L
+    g <- 5000L
     n <- 1800L
     x <- sparseMatrix(i=rep(c(2L, 2300L, 2500L, 2600L), each=300L),
                       j=c(sample(1:900,300), sample(301:n,300), sample(1:n,300), sample(1:n,300)),
