@@ -232,7 +232,7 @@ def process_message(ctrl, message, turn):
                     logical = fingerprint(["draft_choice", result["selected_ids"]])
                 elif command.get("action") == "apply_boundary":
                     logical = fingerprint(["boundary", result["evidence_id"], result["membership_hash"]])
-                elif command.get("action") in {"get_evidence", "list_candidates", "preview_submission"}:
+                elif command.get("action") in {"get_evidence", "list_candidates", "list_ontology_pools", "preview_submission"}:
                     # Reading rows is distinct from computing their underlying observation.
                     # Equal pages also stay equal when expressed with different paging arguments.
                     page = {k: v for k, v in result.items() if k not in {"offset", "limit"}}

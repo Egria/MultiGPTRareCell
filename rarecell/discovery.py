@@ -3,7 +3,7 @@ import csv
 from functools import cached_property
 from pathlib import Path
 
-from .contrast_panels import GUIDANCE as PANEL_GUIDANCE, SOURCE as PAIRED_CONTRAST
+from .contrast_panels import GUIDANCE as PANEL_GUIDANCE, SOURCE as PAIRED_CONTRAST, ontology_seed_pools
 from . import __version__, adaptive, exhaustive, seed_review
 from .base_evidence import FrozenSeurat, annotation_parents, prepared_page
 from .config import ACTIVE_MODES, ADAPTIVE_MODE, ANNOTATED_MODES, contract, fingerprint, json_bytes, read_json, read_lines
@@ -38,7 +38,7 @@ GOAL = (
 def prompt_version(mode, exhaustive_review=False):
     version = "discovery/adaptive-5" if mode == ADAPTIVE_MODE else "discovery/1.5"
     if mode in ANNOTATED_MODES:
-        version += "/panels-2"
+        version += "/ontology-pools-1"
     return version + ("/exhaustive-1" if exhaustive_review else "")
 
 
@@ -96,6 +96,7 @@ class Controller:
         self.by_set.setdefault(candidate["set_hash"], set()).add(candidate["id"])
 
     def _load_candidates(self):
+        self.__dict__.pop("pool_candidates", None)
         self.candidates.clear()
         self.by_set.clear()
         for item in self.state.all("Candidate"):
@@ -180,6 +181,15 @@ class Controller:
                 row = dict(ann, evidence_id=eid, id=aid)
                 self.state.put("Annotation", aid, row)
                 self.labels.setdefault(c["id"], {})[eid] = row
+            if self.labeled:
+                annotations = (row for items in self.labels.values() for row in items.values())
+                for term, label, parents, eids, counts in ontology_seed_pools(self.seed_ids, annotations):
+                    members = [self.candidate(cid)["members"][0] for cid in parents]
+                    basis = {"ontology_id": term, "marker_seed_counts": counts}
+                    eid = self.evidence(term, "interpretation", eids, "input_expression", fingerprint(sorted(members)),
+                                        {"ontology_id": term, "n_seeds": len(parents), "n_genes": len(counts)},
+                                        [self.state.artifact(basis)], method="global-CL-seed-pool/1")
+                    self.make_revision(members, parents, label, "provisional", [eid], "ontology_seed_pool", basis)
             self.state.put("Task", "discovery", {"id": "discovery", "goal": self.goal, "mode": self.mode})
             self.state.set_meta("initialized", True)
             self.state.event("initialized", {"mode": self.mode, "candidates": len(self.candidates)})
@@ -236,9 +246,24 @@ class Controller:
         if label:
             card.update(tentative_label=label["label"], tentative_alternatives=label["labels"],
                         annotation_sources=label["sources"])
+        if "ontology_pool" in c:
+            card["parents"] = c["parents"][:5]
+            card.update(self.pool_card(c))
         if not c["initial"]:
             card["proposed_label"] = c["proposed_label"]
         return card
+
+    @cached_property
+    def pool_candidates(self):
+        return sorted((c for c in self.candidates.values() if "ontology_pool" in c),
+                      key=lambda c: (len(c["parents"]), c["ontology_pool"]["ontology_id"]))
+
+    @staticmethod
+    def pool_card(c):
+        pool = c["ontology_pool"]
+        return {"candidate_id": c["id"], "ontology_id": pool["ontology_id"], "label": c["proposed_label"],
+                "n_seeds": len(c["parents"]), "n_markers": len(pool["marker_counts"]),
+                "marker_seed_counts": dict(pool["marker_counts"][:6])}
 
     def priority(self, c):
         first_barcode = min(self.barcodes[cell] for cell in c["members"])
@@ -303,7 +328,7 @@ class Controller:
         if self.state.get_meta("closing_turn") is not None:
             return True
         return self.state.get_meta("stall", 0) >= self.budget["stall_turns"] and (
-            bool(self.state.get_meta("selected", [])) or any(not c["initial"] for c in self.candidates.values()))
+            bool(self.state.get_meta("selected", [])) or any(not c["initial"] and "ontology_pool" not in c for c in self.candidates.values()))
 
     def expansion_links(self, receipts):
         # Reconstruct from persisted investigations on every turn, also after resume.
@@ -322,6 +347,11 @@ class Controller:
             if batch:
                 return s.read_artifact(batch["context_ref"])
         actions = {k: v for k, v in CATALOGUE.items() if self.active or k not in SCIENTIFIC}
+        if self.labeled and self.pool_candidates:
+            actions["list_ontology_pools"] = ("offset, limit. Page provisional pools of singleton seeds with the same "
+                "global CL ID. marker_seed_counts counts distinct seed panels containing a gene. "
+                "get_evidence(candidate_id, offset, limit) pages the full marker union and seed IDs. "
+                "Use a pool ID directly to investigate membership, revise it or submit it.")
         if self.exhaustive:
             actions["list_seed_reviews"] = "offset, limit. Read written seed assessments, follow-up and retained seeds first."
         if self.adaptive:
@@ -431,6 +461,26 @@ class Controller:
                 ctx[key].pop()
                 return False
             return True
+        if self.labeled and self.pool_candidates:
+            ctx["ontology_pool_count"] = len(self.pool_candidates)
+            visible = ctx["ontology_seed_pools"] = []
+            # Reserve space for scientific receipts as well as the first-page pool index.
+            available = min(limit // 4, max(0, (limit - len(json_bytes(ctx))) // 2))
+            for candidate in self.pool_candidates:
+                entry = self.pool_card(candidate)
+                available -= len(json_bytes(entry)) + 1
+                if available < 0 or not append_if_fits("ontology_seed_pools", entry):
+                    break
+            # Show complete dictionaries for smaller seed pools when their union fits.
+            for entry in visible:
+                counts = self.candidate(entry["candidate_id"])["ontology_pool"]["marker_counts"]
+                if len(counts) <= len(entry["marker_seed_counts"]):
+                    continue
+                complete = dict(counts)
+                extra = len(json_bytes(complete)) - len(json_bytes(entry["marker_seed_counts"]))
+                if extra <= available:
+                    entry["marker_seed_counts"] = complete
+                    available -= extra
         if self.exhaustive:
             ctx["written_seed_reviews"] = []
             for item in exhaustive.page(self, 0, 8)["reviews"]:
@@ -701,6 +751,9 @@ class Controller:
                   "proposed_label": label, "status": status, "markers": []}
         if biological_rarity:
             record["biological_rarity"] = biological_rarity
+        if kind == "ontology_seed_pool":
+            counts = sorted(basis["marker_seed_counts"].items(), key=lambda item: (-item[1], item[0]))
+            record["ontology_pool"] = {"ontology_id": basis["ontology_id"], "marker_counts": counts}
         if kind == "boundary":
             record["boundary_rule"] = basis
         self.save_candidate(record)
@@ -835,6 +888,9 @@ class Controller:
             page = {"candidate": self.card(c), "offset": offset, "total": len(c["members"]),
                     "members": c["members"][offset:offset+limit],
                     "markers": compact(c.get("markers", [])[offset:offset+limit], limit)}
+            if "ontology_pool" in c:
+                page["seed_candidate_ids"] = c["parents"][offset:offset+limit]
+                page["marker_seed_counts"] = dict(c["ontology_pool"]["marker_counts"][offset:offset+limit])
             if self.adaptive:
                 reviews = [r for r in self.state.all("BoundaryReview")
                            if c["id"] in (r["anchor_id"], r["requested"]["candidate_id"], r.get("wider", {}).get("candidate_id"))]
@@ -902,6 +958,11 @@ class Controller:
         for key, expected in bindings.items():
             if key in args and args.pop(key) != expected:
                 raise ValueError("Conflicting explicit " + key)
+        if self.labeled and action == "list_ontology_pools":
+            start = args.get("offset", 0)
+            size = min(25, args.get("limit", 8))
+            return {"total": len(self.pool_candidates), "offset": start,
+                    "ontology_seed_pools": [self.pool_card(c) for c in self.pool_candidates[start:start+size]]}
         if self.exhaustive and action == "review_seed":
             return exhaustive.record(self, message_id, args)
         if self.exhaustive and action == "list_seed_reviews":

@@ -17,6 +17,7 @@
 | 动作 | 请求参数 | 语义和边界 |
 |---|---|---|
 | `list_candidates` | 可选 `offset,limit` | 候选按稳定顺序分页。offset 从 0 起计，limit 为正整数。 |
+| `list_ontology_pools` | 可选 `offset,limit` | 分页查看同一全局 CL ID 的单细胞种子候选群。用候选 ID 调用 `get_evidence` 可分页读取完整 marker 并集的逐 seed 频次和种子 ID。 |
 | `get_evidence` | 可选 `candidate_id` 或 `evidence_ids`，以及 `offset,limit` | 按候选读成员页与 marker，或按证据 ID 读证据卡。省略选择器时浏览已登记证据。 |
 | `compare_groups` | `candidate_id` 或 `members`。可选 `background_id` 或 `background`、`genes` | background 是明确的 cell_id 集合，background_id 引用候选。省略背景时取 foreground 的补集。空对照由科学工具标记。 |
 | `coexpress` | `candidate_id`、`members`、`scope="all"` 三选一，`genes` 必填。可选 `logic`、`threshold` | 逻辑为 AND（默认）或 OR。每个指定基因的 log1p 表达须严格大于阈值（默认 0）。 |
