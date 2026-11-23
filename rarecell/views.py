@@ -2,6 +2,7 @@
 import csv
 import random
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 
@@ -183,9 +184,32 @@ def run_r(mode, work, cfg, *args):
     script = Path(__file__).resolve().parent / "r" / "seurat.R"
     command = [r, "--vanilla", str(script), mode, str(work), *map(str, args)]
     # R process sees its own configured environment, independent of discovery-provider secrets.
-    result = subprocess.run(command, text=True, capture_output=True, timeout=cfg["r_timeout"])
-    if result.returncode != 0:
-        raise RuntimeError(f"Seurat {mode}: " + (result.stderr or result.stdout)[-1600:].strip())
+    try:
+        result = subprocess.run(command, text=True, errors="replace", capture_output=True,
+                                timeout=cfg["r_timeout"])
+    except subprocess.TimeoutExpired as exc:
+        detail = f"timed out after {cfg['r_timeout']}s"
+        stdout, stderr = exc.stdout, exc.stderr
+    else:
+        if result.returncode == 0:
+            return
+        detail = f"exit code {result.returncode}"
+        if result.returncode < 0:
+            number = -result.returncode
+            detail = f"terminated by signal {number}"
+            try:
+                detail += f" ({signal.Signals(number).name})"
+            except ValueError:
+                pass
+        stdout, stderr = result.stdout, result.stderr
+    messages = []
+    for label, value in (("stdout", stdout), ("stderr", stderr)):
+        if isinstance(value, bytes):
+            value = value.decode(errors="replace")
+        if value and value.strip():
+            messages.append(f"{label}: {value.strip()[-1600:]}")
+    output = "\n".join(messages) or "R emitted no diagnostic output"
+    raise RuntimeError(f"Seurat {mode}: {detail}\n{output}")
 
 
 def seurat_pca(ds, cfg, work, dest, output):
