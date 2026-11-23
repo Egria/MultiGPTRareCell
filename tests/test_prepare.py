@@ -258,3 +258,60 @@ def test_fractional_linear_assay_is_normalised_without_count_layer(tmp_path):
     ds = read_dataset(fixture(tmp_path / "linear", values, spec={"layer": "linear_expression"}))
     assert ds.raw is None
     np.testing.assert_allclose(ds.x.toarray(), [[np.log1p(2500), np.log1p(7500)], [0., 0.]])
+
+
+@pytest.mark.parametrize(("script", "expected"), [
+    ("kill -KILL $$", ("signal 9 (SIGKILL)", "no diagnostic output")),
+    ("echo 'reading RNA' ; echo ' ' >&2 ; exit 23", ("exit code 23", "stdout: reading RNA")),
+    ("echo 'block 2/5' >&2 ; exec sleep 5", ("timed out after 1s", "stderr: block 2/5")),
+])
+def test_seurat_failure_keeps_exit_status_and_output(tmp_path, script, expected):
+    from rarecell.views import run_r
+
+    bridge = tmp_path / "Rscript"
+    bridge.write_text("#!/bin/sh\n" + script + "\n")
+    bridge.chmod(0o755)
+    with pytest.raises(RuntimeError) as err:
+        run_r("markers", tmp_path, {"rscript": str(bridge), "r_timeout": 1})
+    assert all(part in str(err.value) for part in expected)
+
+
+@pytest.mark.skipif(not shutil.which(os.environ.get("RARECELL_RSCRIPT", "Rscript")),
+                    reason="requires the pinned R/Seurat environment")
+def test_marker_blocks_equal_a_full_assay_wilcoxon(tmp_path):
+    import subprocess
+    from rarecell.views import run_r
+
+    rscript = os.environ.get("RARECELL_RSCRIPT", "Rscript")
+    # The full shape crosses a block boundary. Keep informative genes on both sides.
+    setup = """
+    suppressPackageStartupMessages(library(Seurat))
+    suppressPackageStartupMessages(library(Matrix))
+    set.seed(71)
+    g <- 5000L
+    n <- 1800L
+    x <- sparseMatrix(i=rep(c(2L, 2300L, 2500L, 2600L), each=300L),
+                      j=c(sample(1:900,300), sample(301:n,300), sample(1:n,300), sample(1:n,300)),
+                      x=runif(1200), dims=c(g,n),
+                      dimnames=list(paste0("G",1:g),paste0("C",1:n)))
+    saveRDS(x, "marker_data.rds")
+    assay <- CreateAssay5Object(data=x)
+    a <- colnames(x)[1:900]
+    b <- colnames(x)[901:n]
+    res <- FindMarkers(assay, cells.1=a, cells.2=b, test.use="wilcox", min.pct=.01,
+                       logfc.threshold=0, only.pos=TRUE, verbose=FALSE)
+    res <- res[order(res$p_val,-res$avg_log2FC,rownames(res)),,drop=FALSE]
+    write.table(res, "reference.tsv", sep="\t", quote=FALSE, col.names=NA)
+    write.table(data.frame(index=1:n, resolution=1, group_id=rep(c("A","B"), each=900)),
+                "marker_partitions.tsv", sep="\t", quote=FALSE, row.names=FALSE)
+    """
+    subprocess.run([rscript, "--vanilla", "-e", setup], cwd=tmp_path, check=True)
+    run_r("markers", tmp_path, {"rscript": rscript, "r_timeout": 120})
+    with (tmp_path / "reference.tsv").open() as handle:
+        reference = list(csv.DictReader(handle, delimiter="\t"))
+    with (tmp_path / "markers_out.tsv").open() as handle:
+        actual = [r for r in csv.DictReader(handle, delimiter="\t") if r["group_id"] == "A"]
+    assert actual and ["G" + r["gene_index"] for r in actual] == [r[""] for r in reference]
+    for key in ["avg_log2FC", "pct.1", "pct.2", "p_val", "p_val_adj"]:
+        np.testing.assert_allclose([float(r[key]) for r in actual], [float(r[key]) for r in reference],
+                                   rtol=1e-12, atol=0)

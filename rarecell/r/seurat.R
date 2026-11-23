@@ -45,7 +45,7 @@ if (mode == "pca") {
   packages <- c("Seurat","SeuratObject","Matrix","irlba","leidenbase","RANN")
   emit(data.frame(package=c("R",packages),version=c(as.character(getRversion()),
        vapply(packages,function(n) as.character(packageVersion(n)),""))),"versions.tsv", TRUE)
-  saveRDS(obj, path("seurat.rds"), compress=FALSE)
+  saveRDS(LayerData(obj[["RNA"]], layer="data"), path("marker_data.rds"), compress=FALSE)
 } else if (mode == "graph") {
   z <- as.matrix(read.table(path("embedding.tsv"), header=FALSE, sep="\t"))
   rownames(z) <- paste0("C", seq_len(nrow(z)))
@@ -58,11 +58,16 @@ if (mode == "pca") {
     n.iter=10L, group.singletons=FALSE, verbose=FALSE)
   emit(groups[rownames(z), , drop=FALSE], "groups.tsv")
 } else if (mode == "markers") {
-  obj <- readRDS(path("seurat.rds"))
+  message("Reading normalized RNA for Wilcoxon markers")
+  rna <- readRDS(path("marker_data.rds"))
   parts <- read.delim(path("marker_partitions.tsv"), stringsAsFactors=FALSE, colClasses="character")
   outfile <- path("markers_out.tsv")
   cat("resolution\tgroup_id\tgene_index\tavg_log2FC\tpct.1\tpct.2\tp_val\tp_val_adj\n", file=outfile)
-  pooled <- colnames(obj)
+  pooled <- colnames(rna)
+  genes <- rownames(rna)
+  # Bound each block across all cells; adjust against the full gene count below.
+  block_size <- max(1L, floor(32 * 1024^2 / (8 * length(pooled))))
+  blocks <- unname(split(genes, ceiling(seq_along(genes) / block_size)))
   if (as.character(packageVersion("SeuratObject")) != "5.2.0") {
     stop("Seurat 5.3.0 Wilcoxon marker bridge requires pinned SeuratObject 5.2.0")
   }
@@ -72,9 +77,18 @@ if (mode == "pca") {
       members <- paste0("C", r$index[r$group_id == gid])
       background <- setdiff(pooled, members)
       if (length(members) < 3 || length(background) < 3) next
-      res <- FindMarkers(obj[["RNA"]], cells.1=members, cells.2=background, test.use="wilcox",
-        min.pct=0.01, logfc.threshold=0, only.pos=TRUE, verbose=FALSE)
-      if (!nrow(res)) next
+      results <- vector("list", length(blocks))
+      for (i in seq_along(blocks)) {
+        message(sprintf("markers resolution=%s group=%s cells=%d vs %d block=%d/%d",
+                        resolution, gid, length(members), length(background), i, length(blocks)))
+        assay <- CreateAssay5Object(data=rna[blocks[[i]], , drop=FALSE])
+        block <- FindMarkers(assay, cells.1=members, cells.2=background,
+          test.use="wilcox", min.pct=0.01, logfc.threshold=0, only.pos=TRUE, verbose=FALSE)
+        if (nrow(block)) results[[i]] <- block
+      }
+      res <- do.call(rbind, results)
+      if (is.null(res) || !nrow(res)) next
+      res$p_val_adj <- p.adjust(res$p_val, method="bonferroni", n=length(genes))
       res <- res[order(res$p_val, -res$avg_log2FC, rownames(res)),,drop=FALSE]
       tab <- data.frame(resolution=resolution, group_id=gid,
         gene_index=as.integer(sub("^G", "", rownames(res))), res[,c("avg_log2FC","pct.1","pct.2","p_val","p_val_adj")])
