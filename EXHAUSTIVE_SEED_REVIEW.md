@@ -13,3 +13,25 @@
 默认每批最多 4 个，可用 `budget.seed_review_batch_size` 调整。对 19 个种子，批次装得下且模型一次写完整时，需要 19 次本地逻辑查询和 5 次模型回复，然后才进入常规调查。专项查询额度随种子数增加，批次回复单独计轮，并额外开放一层扩展深度。常规查询、调查轮数和最终决策轮仍然可用。配置中的 `max_reported_tokens` 对整个运行生效。普通模式使用原有预算，命令行可用 `--no-exhaustive-seed-review` 覆盖已启用的 YAML。
 
 需要在评估后核对某一真值类型的上游注释时，可运行 `.venv/bin/python scripts/audit_seed_annotations.py --task "$old" --gt /path/to/gt.tsv --label "$target_label"`。输出按细胞和 V_HVG 分辨率列出所属群、该群的真实 OntoAnno 标签及当时送入模型的 marker；空标签表示缺少对应注释，明确返回的 unknown 按原文显示。
+
+### 从种子评语交接到候选池调查
+
+在 A3 和 A3_adaptive 的强制逐种子模式中，同一全局 CL 标签形成的种子池，只要有一个成员被标为 `follow_up`，就会在常规调查前得到一次池级调查机会。单细胞扩展加入 0 个细胞也保留该机会。池按种子数从小到大处理，同大小按 CL ID 排序。
+
+每批给模型显示池的 marker 出现次数和书面待查理由。模型可以选 1 至 6 个基因，比较整个池与其余细胞，也可以指定至少几个基因同时检出，在全体细胞中寻找成员。具备原始计数时，按基因对照还提供深度校正的负二项混合结果。若回复漏掉该池或基因无法解析，控制器用池中最多四个反复出现、可解析的 marker 补做描述性对照，记录来源为 `controller_fallback`。后续模型可以将拟合高表达组或共检出组作为候选边界，再决定是否提交。
+
+每个池最多占用一次常规逻辑查询。交接批次单独计模型轮数，共享全程 token 预算。查询额度用完时，未处理的池保留为 `pending`。每个池的请求来源、待查种子、状态、观测和证据 ID 导出在 `pool_followups.jsonl` 中。`run_summary.json` 的 `pool_followup_coverage` 单列未形成共享 CL 池的待查种子数。
+
+已有 Baron 任务可复用同一任务配套的快照、注释和数值查询缓存。更新后端后，在仓库根目录运行以下命令。新发现运行会重新调用模型做逐种子判断。新运行被暂停或可恢复地中断时，可在相同代码版本下执行 `.venv/bin/rarecell resume --run "$run"`。
+
+```bash
+old="$PWD/work/tasks/b6a3a2506a344cdcb1fc757d29470038"
+field() {
+  .venv/bin/python -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$old/run/checkpoint.json" "$1"
+}
+run=$(mktemp -d "$old/discovery-handoff.XXXXXX")
+echo "$run"
+.venv/bin/rarecell discover --config "$old/settings.yaml" --mode A3_adaptive --policy live \
+  --exhaustive-seed-review --snapshot "$(field snapshot)" --annotations "$(field annotations)" \
+  --cache "$(field cache)" --run "$run"
+```

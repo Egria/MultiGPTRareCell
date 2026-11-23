@@ -3,7 +3,7 @@ import csv
 import io
 from collections import defaultdict
 
-from . import exhaustive
+from . import exhaustive, pool_followup
 from .config import atomic, fingerprint, hash_file, json_bytes, write_json
 from .discovery import rows
 
@@ -170,12 +170,21 @@ def export(ctrl, status, detail, policy, annotation_status):
                        "reason": note.get("reason")}
         tsv(run / "seed_reviews.tsv", ["seed_id", "cell_id", "candidate_id", "measurement_status", "query_key",
             "evidence_id", "measurement_error", "proposal_id", "message_id", "disposition", "reason", "final_group"], review_rows())
+    if ctrl.exhaustive and ctrl.labeled:
+        summary["pool_followup_coverage"] = pool_followup.coverage(ctrl)
+        pool_rows = []
+        for c, notes in pool_followup.queue(ctrl):
+            row = s.get_optional("PoolFollowup", c["id"]) or {"candidate_id": c["id"], "label": c["proposed_label"], "status": "pending"}
+            pool_rows.append(dict(row, follow_up_seed_ids=[r["candidate_id"] for r in notes]))
+        jsonlines(run / "pool_followups.jsonl", pool_rows)
     write_json(run / "run_summary.json", summary)
     files = ["run_summary.json", "usage.json", "manifest.json", "config_resolved.yaml", "project_contract.yaml",
              "partition.tsv", "groups.tsv", "conflicts.jsonl", "candidate_tasks.tsv", "candidate_members.tsv", "candidates.jsonl", "seeds.tsv",
              "annotations.tsv", "decisions.jsonl", "evidence.jsonl"]
     if ctrl.exhaustive:
         files.append("seed_reviews.tsv")
+    if ctrl.exhaustive and ctrl.labeled:
+        files.append("pool_followups.jsonl")
     files.extend(str(p.relative_to(run)) for p in sorted((run / "artifacts").glob("*")) if p.is_file())
     freeze = {"version": 1, "snapshot_hash": ctrl.snapshot_hash, "files": {name: hash_file(run / name) for name in files}}
     write_json(run / "frozen.json", freeze)

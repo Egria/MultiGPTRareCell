@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
-VERSION = "soft-protocol-1.5"
+VERSION = "soft-protocol-1.6"
 MAX_CHARS = 512_000
 MAX_ACTIONS = 128
 
@@ -35,6 +35,7 @@ def _alias_map(groups):
 
 ACTIONS = _alias_map({
     "review_seed": ("assess_seed", "record_seed_review", "调查种子"),
+    "investigate_pool": ("investigate seed pool",),
     "list_seed_reviews": ("list seed assessments",),
     "list_ontology_pools": ("list seed pools",),
     "apply_boundary": (),
@@ -55,7 +56,7 @@ SEED_DISPOSITIONS = _alias_map({"follow_up": ("investigate", "followup", "深入
 FIELDS = _alias_map({
     "disposition": ("recommendation", "outcome", "结论"),
     "seed_id": (),
-    "metric": (), "matched_evidence_id": (), "min_detected": (), "exclude_candidate_ids": (), "reference_id": (),
+    "metric": (), "matched_evidence_id": (), "nb_high_gene": (), "min_detected": (), "exclude_candidate_ids": (), "reference_id": (),
     "background_mode": (), "biological_rarity": (), "rarity_reason": (),
     "action": ("operation", "tool", "动作", "操作"),
     "args": ("arguments", "parameters", "params", "参数"),
@@ -89,6 +90,7 @@ SCOPES = {"candidate_id", "members", "scope"}
 BACKGROUNDS = {"background", "background_id"}
 ALLOWED = {
     "review_seed": {"candidate_id", "disposition", "reason", "evidence_ids"},
+    "investigate_pool": {"candidate_id", "genes", "min_detected", "reason"},
     "list_seed_reviews": {"offset", "limit"},
     "list_ontology_pools": {"offset", "limit"},
     "select_boundary": {"candidate_id", "reason"},
@@ -217,7 +219,7 @@ def _group(value):
             clean = _ids(val, key, allow_empty=True)
         elif key in {"members", "candidate_ids", "exclude_candidate_ids"}:
             clean = _ids(val, key)
-        elif key == "matched_evidence_id":
+        elif key in {"matched_evidence_id", "nb_high_gene"}:
             clean = _string(val, key)
         elif key == "candidate_id":
             key, clean = "candidate_ids", [_string(val, key)]
@@ -230,6 +232,8 @@ def _group(value):
         else:
             raise ProtocolError(f"unsupported group field: {key}")
         _merge(out, key, clean)
+    if "nb_high_gene" in out and "matched_evidence_id" not in out:
+        raise ProtocolError("nb_high_gene requires a matched_evidence_id")
     if not ({"members", "candidate_ids", "matched_evidence_id"} & out.keys()):
         raise ProtocolError("each group requires members, candidate_ids or matched_evidence_id")
     return out
@@ -270,6 +274,8 @@ def _value(key, value):
 
 def _validate(action, args):
     present = args.keys()
+    if action == "investigate_pool" and not {"candidate_id", "genes", "reason"} <= present:
+        raise ProtocolError("investigate_pool needs the assigned pool, genes and reason")
     if action == "review_seed" and not {"candidate_id", "disposition", "reason"} <= present:
         raise ProtocolError("review_seed needs a seed candidate_id, disposition, and written reason")
     if len(SCOPES & present) > 1 or len((BACKGROUNDS | {"background_mode"}) & present) > 1:

@@ -1,5 +1,6 @@
 """Evidence-bound membership decisions for the opt-in adaptive discovery arm."""
 from .config import fingerprint
+from .protocol import resolve_genes
 
 GOAL = (
     " Favor discovery of plausible rare memberships, including unnamed provisional groups. Investigate promising "
@@ -50,6 +51,25 @@ def coexpression_members(ctrl, eid):
     if observation["evidence_id"] != eid or query["canonical"]["action"] != "coexpress":
         raise ValueError("matched_evidence_id requires a measured coexpress observation")
     return ctrl.state.read_artifact(ctrl.state.result_ref(key))["matched_members"]
+
+
+def nb_high_members(ctrl, eid, gene):
+    ctrl.checked_evidence([eid])
+    key = ctrl.state.get("Evidence", eid)["object"]
+    obs = ctrl.state.get_optional("QueryObservation", key)
+    if not obs or obs["evidence_id"] != eid or ctrl.state.get("CanonicalQuery", key)["canonical"]["action"] != "compare_groups":
+        raise ValueError("nb_high_gene requires a measured contrast")
+    gene, = resolve_genes([gene], ctrl.genes, species=ctrl.manifest.get("species"))
+    result = ctrl.state.read_artifact(ctrl.state.result_ref(key))
+    fit = result["summary"].get("nb_mixture", {})
+    split = fit.get("genes", {}).get(gene, {})
+    if "minor_members" not in split:
+        raise ValueError("No fitted two-component split for " + gene)
+    if split["minor_mean_per_10k"] > split["major_mean_per_10k"]:
+        return split["minor_members"]
+    scope = result["selection_history"]
+    return sorted((set(scope["members"]) | set(scope["background"])) - set(fit.get("excluded_zero_depth", []))
+                  - set(split["minor_members"]))
 
 
 def apply_boundary(ctrl, args):
