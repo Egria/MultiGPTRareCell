@@ -1,5 +1,6 @@
 """Turn written singleton follow-ups into bounded measurements of exact-CL pools."""
 import re
+from collections import Counter
 
 from .config import contract, json_bytes
 from .protocol import ProtocolError, resolve_genes
@@ -7,9 +8,18 @@ from .state import BudgetExhausted, QueryBlocked
 
 
 def queue(ctrl):
-    notes = {r["candidate_id"]: r for r in ctrl.state.all("SeedAssessment") if r["disposition"] == "follow_up"}
-    return [(c, [notes[p] for p in c["parents"] if p in notes]) for c in ctrl.pool_candidates
-            if any(p in notes for p in c["parents"])]
+    notes = {r["candidate_id"]: r for r in ctrl.state.all("SeedAssessment")}
+    planned = []
+    for c in ctrl.pool_candidates:
+        eligible = [notes[p] for p in c["parents"] if p in notes and (
+            notes[p]["disposition"] == "follow_up" or guided_by(notes[p], c["proposed_label"]))]
+        if eligible:
+            planned.append((c, eligible))
+    return planned
+
+
+def guided_by(note, name):
+    return note.get("label_reliability") == "supported" and (note.get("guide_label") or "").casefold() == name.casefold()
 
 
 def conflict_cases(ctrl):
@@ -44,16 +54,47 @@ def conflict_cases(ctrl):
     return cases
 
 
+def independent_cases(ctrl):
+    cases = conflict_cases(ctrl)
+    covered = {(parent, c["proposed_label"].casefold()) for c in ctrl.pool_candidates for parent in c["parents"]}
+    covered.update((case["anchor_id"], case["label"].casefold()) for case in cases.values())
+    for note in ctrl.state.all("SeedAssessment"):
+        anchor, name = note["candidate_id"], note.get("guide_label")
+        if not name or not guided_by(note, name) or (anchor, name.casefold()) in covered:
+            continue
+        sources = {eid: r for eid, r in ctrl.labels.get(anchor, {}).items()
+                   if r.get("label", "").casefold() == name.casefold() and r.get("status") == "annotated"}
+        if not sources:
+            continue
+        marker_genes = sorted({g for r in sources.values() for g in r.get("selection_history", {}).get("genes", [])})
+        members = ctrl.candidate(anchor)["members"]
+        cases[anchor] = dict(kind="guided_named_seed", candidate_id=anchor, anchor_id=anchor, label=name,
+            n_seeds=len(members), members=members, retrieval_genes=marker_genes,
+            marker_seed_counts=dict.fromkeys(marker_genes, 1), annotations={eid: {"label": name, "evidence_id": eid} for eid in sources},
+            expansion_evidence_id=note.get("evidence_id"), written_questions=[{"seed": anchor, "reason": note["reason"]}])
+    return cases
+
+
 def coverage(ctrl):
     planned = queue(ctrl)
-    cases = conflict_cases(ctrl)
+    cases = independent_cases(ctrl)
     rows = ctrl.state.all("PoolFollowup")
     independent = [r for r in rows if r["candidate_id"] in cases]
     rows = [r for r in rows if r["candidate_id"] not in cases]
-    covered = {r["candidate_id"] for _, notes in planned for r in notes}
+    covered = {r["candidate_id"] for _, notes in planned for r in notes if r["disposition"] == "follow_up"}
+    reviews = ctrl.state.all("ExpansionReview")
+    eligible_reviews = sum(bool(r.get("boundaries")) for r in rows + independent)
     total = sum(r["disposition"] == "follow_up" for r in ctrl.state.all("SeedAssessment"))
-    return {"eligible_conflict_expansions": len(cases), "conflict_measured": sum(r["status"] == "ok" for r in independent),
-            "conflict_blocked": sum(r["status"] != "ok" for r in independent), "conflict_pending": len(cases)-len(independent),
+    guided = {cid for cid, case in cases.items() if case["kind"] == "guided_named_seed"}
+    guided_done = [r for r in independent if r["candidate_id"] in guided]
+    independent = [r for r in independent if r["candidate_id"] not in guided]
+    conflict_n = len(cases) - len(guided)
+    return {"eligible_expansion_reviews": eligible_reviews, "expansion_reviews_pending": eligible_reviews - len(reviews),
+            "unreviewed_expansions": sum(r["choice"] == "unreviewed" for r in reviews),
+            "guided_seeds": len(guided), "guided_pending": len(guided) - len(guided_done),
+            "guided_blocked": sum(r["status"] != "ok" for r in guided_done),
+            "eligible_conflict_expansions": conflict_n, "conflict_measured": sum(r["status"] == "ok" for r in independent),
+            "conflict_blocked": sum(r["status"] != "ok" for r in independent), "conflict_pending": conflict_n-len(independent),
             "eligible_pools": len(planned), "measured": sum(r["status"] == "ok" for r in rows),
             "blocked": sum(r["status"] != "ok" for r in rows), "pending": len(planned) - len(rows),
             "pooled_follow_up_seeds": len(covered), "unpooled_follow_up_seeds": total - len(covered),
@@ -68,13 +109,23 @@ def prepare_batch(ctrl, mid):
         return False
     completed = {r["candidate_id"] for r in s.all("PoolFollowup")}
     remaining = ctrl.query_limit - s.usage()["new_queries"]
-    size = min(ctrl.budget["max_actions_per_turn"], ctrl.budget.get("seed_review_batch_size", 4))
-    cases = conflict_cases(ctrl)
+    size = min(ctrl.budget["max_actions_per_turn"], ctrl.budget["seed_review_batch_size"])
+    cases = independent_cases(ctrl)
     todo = [(ctrl.candidate(cid), []) for cid in sorted(cases) if cid not in completed]
     independent = bool(todo)
+    reserved_pools = set()
     if not independent:
-        size = min(remaining, size)
-        todo = [(c, notes) for c, notes in queue(ctrl) if c["id"] not in completed]
+        todo = []
+        for c, notes in queue(ctrl):
+            if c["id"] in completed:
+                continue
+            if any(guided_by(r, c["proposed_label"]) for r in notes):
+                reserved_pools.add(c["id"])
+            elif remaining > 0:
+                remaining -= 1
+            else:
+                continue
+            todo.append((c, notes))
     if not todo or size <= 0:
         s.set_meta("pool_phase_complete", True)
         return False
@@ -94,9 +145,15 @@ def prepare_batch(ctrl, mid):
             "the neighbor panel or retrieval genes. Choose additional support and counter genes. One local "
             "query measures all cutoffs across the dataset. The pool foreground is the expansion; its anchor "
             "is a search lead and may itself belong to the alternative lineage.")
+    ctx["turn_instruction"] += (" For a supported seed name use your biological knowledge of the tissue and lineage "
+        "to nominate positive markers including new support genes, and markers of plausible alternatives. "
+        "For guided_named_seed the foreground is the named singleton. Check actual member evidence before widening.")
     for c, notes in todo[:size]:
         if independent:
             item = dict(cases[c["id"]])
+            note = s.get("SeedAssessment", item["anchor_id"])
+            item["seed_name_assessment"] = {k: note.get(k) for k in ("guide_label", "label_reliability")}
+            item["seed_name_assessment"]["reason"] = note["reason"][:480]
             if len(item["members"]) > 50:
                 item["members"] = item["members"][:50]
                 item["members_paged"] = True
@@ -105,6 +162,9 @@ def prepare_batch(ctrl, mid):
             item = ctrl.pool_card(c)
             item["marker_seed_counts"] = dict(c["ontology_pool"]["marker_counts"][:48])
             item["n_follow_up"] = len(notes)
+            item["seed_name_assessments"] = dict(Counter((r.get("label_reliability", "unassessed")
+                if not r.get("guide_label") or r["guide_label"].casefold() == item["label"].casefold()
+                else "other_name") for r in (s.get("SeedAssessment", p) for p in c["parents"])))
             item["written_questions"] = [{"seed": r["candidate_id"], "reason": r["reason"][:480]} for r in notes[:4]]
         ctx["pools"].append(item)
         if len(json_bytes(ctx)) > ctrl.budget["context_bytes"]:
@@ -114,6 +174,7 @@ def prepare_batch(ctrl, mid):
             break
     s.put("PoolBatch", mid, {"candidate_ids": [c["candidate_id"] for c in ctx["pools"]],
                              "conflict_cases": {item["candidate_id"]: item for item in ctx["pools"] if independent},
+                             "guided_pool_ids": [item["candidate_id"] for item in ctx["pools"] if item["candidate_id"] in reserved_pools],
                              "context_ref": s.artifact(ctx)})
     return True
 
@@ -191,17 +252,22 @@ def run_query(ctrl, mid, args, *, fallback=False):
     row = {"candidate_id": cid, "label": c["proposed_label"], "n_seeds": len(c["members"]),
            "source": "controller_fallback" if fallback else "discovery_agent", "reason": args["reason"],
            "message_id": mid, "action": action, "genes": genes}
+    item = next(p for p in s.read_artifact(batch["context_ref"])["pools"] if p["candidate_id"] == cid) if batch.get("context_ref") else {}
+    if item.get("seed_name_assessment"):
+        row["seed_name_assessments"] = item["seed_name_assessment"]
+    elif item.get("seed_name_assessments"):
+        row["seed_name_assessments"] = item["seed_name_assessments"]
     if not case and c["ontology_pool"].get("ontology_id"):
         row["ontology_id"] = c["ontology_pool"]["ontology_id"]
     if case:
         row["n_foreground"] = len(c["members"])
         row.update({k: case[k] for k in ("kind", "anchor_id", "label", "annotations", "written_questions", "expansion_evidence_id")})
-        params["evidence_ids"] = sorted(set(params["evidence_ids"]) | {case["expansion_evidence_id"]} |
+        params["evidence_ids"] = sorted(set(params["evidence_ids"]) | ({case["expansion_evidence_id"]} if case["expansion_evidence_id"] else set()) |
                                         {v["evidence_id"] for v in case["annotations"].values()})
     if "min_detected" in args:
         row["min_detected"] = args["min_detected"]
     try:
-        obs = ctrl.scientific(action, params, conflict_slot=cid if case else None)
+        obs = ctrl.scientific(action, params, conflict_slot=cid if case or cid in batch.get("guided_pool_ids", ()) else None)
     except (QueryBlocked, BudgetExhausted) as exc:
         row.update(status="blocked", error=str(exc)[:300])
     else:
@@ -223,7 +289,15 @@ def run_query(ctrl, mid, args, *, fallback=False):
                     entry.update(high_seeds=diag["high_foreground"], high_outside=diag["high_background"],
                                  means_per_10k=[round(v, 4) for v in diag["means_per_10k"]])
                 row["contrasts"][gene] = entry
-    s.put("PoolFollowup", cid, row)
+    try:
+        with s.transaction():
+            if ctrl.adaptive and row["status"] == "ok":
+                from . import expansion_review
+                row["boundaries"] = expansion_review.register(ctrl, row, data)
+            s.put("PoolFollowup", cid, row)
+    except BaseException:
+        ctrl._load_candidates()
+        raise
     return row
 
 
@@ -254,15 +328,19 @@ def finish_batch(ctrl, mid, batch):
                   "message_id": mid, "source": "controller_fallback", "error": "No unambiguous pool marker resolves."})
 
 
+def program_curves(row):
+    return {name: {"genes": p["genes"], "seed_hits_by_k": [x["seed_hits"] for x in p["curve"]],
+                   "outside_hits_by_k": [x["outside_hits"] for x in p["curve"]]}
+            for name, p in row.get("programs", {}).items()}
+
+
 def card(row, compact=False):
     item = {k: v for k, v in row.items() if k not in {"query_key", "message_id", "reason"}}
     if compact and "written_questions" in item:
         item["written_questions"] = [{"seed": q["seed"], "reason": q["reason"][:240]} for q in item["written_questions"]]
     if compact and row.get("programs"):
         # Keep the full counts in get_evidence, with a small all-cutoffs index in each turn.
-        item["programs"] = {name: {"genes": p["genes"], "seed_hits_by_k": [x["seed_hits"] for x in p["curve"]],
-                                   "outside_hits_by_k": [x["outside_hits"] for x in p["curve"]]}
-                            for name, p in row["programs"].items()}
+        item["programs"] = program_curves(row)
         item["contrasts"] = {g: {k: v for k, v in stat.items() if k in ("effect", "high_seeds", "high_outside", "means_per_10k")}
                              for g, stat in row["contrasts"].items()}
     return item

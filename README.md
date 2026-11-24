@@ -195,7 +195,7 @@ rarecell evaluate --run work/comparison/fixed --gt fixtures/pbmc_tcr/gt.tsv \
 
 ## 调查、预算和恢复
 
-每次模型调用使用重新组装的完整契约、当前状态摘要、近期工具回执和剩余预算。模型只看到工具名和已登记的实体。科学计算读取本地稀疏矩阵，较长的细胞列表和数值只能分页获取。首次科学请求默认最多 25 个，最多 12 个模型回合，每轮至多 12 个动作，每条谱系默认仅一轮扩展。连续三个无进展回合结束。context_bytes 控制序列化上下文的字节预算。可设 max_reported_tokens 为正整数，收到的累计 token 用量达此值时停止下一次调用；单次回复有可能跨过该值。启用此预算且服务未报告总用量时停止。数值 0 关闭累计 token 检查。精确的扩展阈值和空背景处理见 [ALGORITHMS.md](ALGORITHMS.md)。
+每次模型调用使用重新组装的完整契约、当前状态摘要、近期工具回执和剩余预算。模型只看到工具名和已登记的实体。科学计算读取本地稀疏矩阵，较长的细胞列表和数值只能分页获取。首次科学请求默认最多 25 个，最多 18 个常规模型回合，每轮至多 12 个动作，每条谱系默认仅一轮扩展。连续三个无进展回合结束。context_bytes 控制序列化上下文的字节预算。可设 max_reported_tokens 为正整数，收到的累计 token 用量达此值时停止下一次调用；单次回复有可能跨过该值。启用此预算且服务未报告总用量时停止。数值 0 关闭累计 token 检查。精确的扩展阈值和空背景处理见 [ALGORITHMS.md](ALGORITHMS.md)。
 
 ```bash
 rarecell discover --snapshot work/prepared --mode A2 --config real.yaml \

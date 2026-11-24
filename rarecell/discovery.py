@@ -40,9 +40,9 @@ def prompt_version(mode, exhaustive_review=False):
     if mode in ANNOTATED_MODES:
         version += "/ontology-pools-1"
     if exhaustive_review:
-        version += "/exhaustive-1"
+        version += "/exhaustive-2"
         if mode in ANNOTATED_MODES:
-            version += "/pool-followup-3"
+            version += "/pool-followup-4"
     return version
 
 
@@ -358,7 +358,7 @@ class Controller:
         s = self.state
         if self.exhaustive:
             mid = "%s:T%04d" % (s.get_meta("run_id"), turn)
-            batch = s.get_optional("SeedBatch", mid) or s.get_optional("PoolBatch", mid)
+            batch = s.get_optional("SeedBatch", mid) or s.get_optional("PoolBatch", mid) or s.get_optional("ExpansionBatch", mid)
             if batch:
                 return s.read_artifact(batch["context_ref"])
         actions = {k: v for k, v in CATALOGUE.items() if self.active or k not in SCIENTIFIC}
@@ -465,7 +465,7 @@ class Controller:
             ctx["turn_instruction"] += (" Use pool_followups to decide which measured groups to revise, submit or "
                                         "defer. Inspect competing programs and explain promising deferrals. "
                                         "get_evidence(candidate_id) retrieves the full result. Consult requested_evidence for returned pages. "
-                                        "Conflicting seed expansions have their own member boundary and competing annotations.")
+                                        "Use recorded expansion reviews to compare the core with the added cells. Cite evidence in the additions when narrowing. Conflicting seed expansions have their own member boundary and competing annotations.")
         if self.adaptive and self.budget.get("max_reported_tokens"):
             consumed = [m["usage"].get("total_tokens") for m in s.all("Message")]
             if all(n is not None for n in consumed):
@@ -927,6 +927,7 @@ class Controller:
             self.state.set_meta("submission_status", decision["status"])
         return {"decision_id": did, "action": action, "selected_count": len(selected),
                 "candidate_ids": sorted(selected)[:15],
+                **({"revised_candidate_ids": chosen} if action == "propose_revision" else {}),
                 **({"claim_resolution": decision["claim_resolution"]} if resolution is not None else {})}
 
     def read_tool(self, action, args):
@@ -947,6 +948,9 @@ class Controller:
             followup = self.state.get_optional("PoolFollowup", c["id"])
             if followup:
                 page["pool_followup"] = pool_followup.card(followup)
+                review = self.state.get_optional("ExpansionReview", c["id"])
+                if review:
+                    page["pool_followup"]["expansion_review"] = review
             if "ontology_pool" in c:
                 page["seed_candidate_ids"] = c["parents"][offset:offset+limit]
                 page["marker_seed_counts"] = dict(c["ontology_pool"]["marker_counts"][offset:offset+limit])
@@ -1022,6 +1026,14 @@ class Controller:
             size = min(25, args.get("limit", 8))
             return {"total": len(self.pool_candidates), "offset": start,
                     "ontology_seed_pools": [self.pool_card(c) for c in self.pool_candidates[start:start+size]]}
+        if self.exhaustive and self.adaptive and action == "review_expansion":
+            from . import expansion_review
+            try:
+                with self.state.transaction():
+                    return expansion_review.record(self, message_id, args)
+            except BaseException:
+                self._load_candidates()
+                raise
         if self.exhaustive and self.labeled and action == "investigate_pool":
             return pool_followup.run_query(self, message_id, args)
         if self.exhaustive and action == "review_seed":

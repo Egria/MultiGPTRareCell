@@ -179,7 +179,7 @@ def test_dual_panels_reach_discovery_and_recover_partial(tmp_path):
         assert shown["annotation_sources"] == card["annotation_sources"]
         label_eid = shown["annotation_sources"][0]["evidence_id"]
         result = exhaustive.record(ctrl, "T1", dict(candidate_id="Ha", evidence_ids=[label_eid],
-                                   disposition="follow_up", reason="Resolve the conflicting labels"))
+                                   disposition="follow_up", label_reliability="uncertain", reason="Resolve the conflicting labels"))
         assert result["evidence_id"] == "obs" and result["annotation_evidence_ids"] == [label_eid]
     finally:
         ctrl.state.close()
