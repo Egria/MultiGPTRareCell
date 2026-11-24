@@ -105,6 +105,12 @@ def parser():
     resume_cmd = cmd("resume", False)
     resume_cmd.add_argument("--run", type=Path, required=True)
     resume_cmd.add_argument("--retry-unknown", action="store_true", help="allow one extra attempt for an incomplete external call")
+    replay = cmd("replay-submit", False)
+    replay.add_argument("--run", type=Path, required=True)
+    replay.add_argument("--out", type=Path, required=True)
+    replay.add_argument("--prefer", action="append", default=[], help="preferred candidate in the selection (repeatable)")
+    replay.add_argument("--candidate-id", action="append", help="explicit replacement for the historical selection (repeatable)")
+    replay.add_argument("--gt", type=Path, help="optional reference for scoring after partition export")
     e = cmd("evaluate", False)
     e.add_argument("--run", type=Path, required=True)
     e.add_argument("--gt", type=Path, required=True)
@@ -131,6 +137,9 @@ def dispatch(a, default_model=""):
     if cmd == "ui":
         from .dashboard_reload import serve
         return serve(a.workspace, a.port)
+    if cmd == "replay-submit":
+        from .replay import replay_submit
+        return replay_submit(a.run, a.out, a.prefer, a.candidate_id, a.gt)
     if cmd == "resume":
         return resume(a.run, a.retry_unknown)
     if cmd == "evaluate":

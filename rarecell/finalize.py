@@ -32,7 +32,15 @@ def membership_claims(ctrl, selected):
 
 
 def assignments(ctrl):
-    claims = membership_claims(ctrl, ctrl.state.get_meta("selected", []))
+    selected = ctrl.state.get_meta("selected", [])
+    resolution = None
+    if ctrl.adaptive:
+        from .claim_resolution import plan
+        resolution = plan(ctrl, selected)
+        claims = {cell: {cid} for cell, cid in resolution["owners"].items()}
+        claims.update(resolution["unresolved"])
+    else:
+        claims = membership_claims(ctrl, selected)
     baselines = rows(ctrl.snapshot / "baselines.tsv")
     recipes = {(b["view"], b["resolution"]) for b in baselines}
     priority = ["V_HVG", "V_LINEAR", "V_GINI", "V_TENSOR2"]
@@ -40,9 +48,10 @@ def assignments(ctrl):
     fallback = {b["cell_id"]: b["group_id"] for b in baselines if (b["view"], b["resolution"]) == base}
     if base and set(fallback) != ctrl.cell_set:
         raise ValueError("Incomplete fallback partition")
+    provisional = set(resolution["provisional_cells"]) if resolution else set()
     partition, conflicts = [], []
     for cell in sorted(ctrl.cells):
-        rivals = sorted(claims[cell])
+        rivals = sorted(claims.get(cell, ()))
         if len(rivals) == 1:
             cid = rivals[0]
             c = ctrl.candidate(cid)
@@ -51,6 +60,10 @@ def assignments(ctrl):
             if label == "unknown" and c["initial"]:
                 label = ctrl.current_label(cid).get("label", "unknown")
             status, reason = c["status"], "selected"
+            if cell in provisional:
+                status, reason = "provisional", "overlap_priority"
+            if resolution and resolution["alternative_labels"].get(cid) and cid not in resolution["preferred"]:
+                label, status = "unknown", "provisional"
         else:
             cid, label, status = "", "unknown", "unresolved"
             reason = "competing_claims" if rivals else "unclaimed"

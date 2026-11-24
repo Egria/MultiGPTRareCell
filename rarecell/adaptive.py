@@ -30,7 +30,7 @@ TOOLS = {
         "anchor and preserve other disjoint selections. Use propose_revision to resolve cross-anchor overlaps.",
     "preview_submission": "candidate_ids (proposed selection; omit for current selection), optional candidate_id "
         "(hypothesis to track, even when omitted from selection), optional reference_id (reference candidate). "
-        "Reports exclusive claims, conflicts, unclaimed cells, and local/global fractions before final assignment.",
+        "Optional ordered preferred_candidate_ids. Reports resolved, held and unresolved overlapping claims before export.",
 }
 
 
@@ -51,6 +51,19 @@ def coexpression_members(ctrl, eid):
     if observation["evidence_id"] != eid or query["canonical"]["action"] != "coexpress":
         raise ValueError("matched_evidence_id requires a measured coexpress observation")
     return ctrl.state.read_artifact(ctrl.state.result_ref(key))["matched_members"]
+
+
+def program_members(ctrl, eid, name, k):
+    ctrl.checked_evidence([eid])
+    key = ctrl.state.get("Evidence", eid)["object"]
+    obs = ctrl.state.get_optional("QueryObservation", key)
+    if not obs or obs["evidence_id"] != eid:
+        raise ValueError("A program boundary requires a measured pool observation")
+    result = ctrl.state.read_artifact(ctrl.state.result_ref(key))
+    program = result.get("programs", {}).get(name)
+    if not program or not 1 <= k <= len(program["genes"]):
+        raise ValueError("Unknown program or cutoff for this pool observation")
+    return sorted(cell for count, cells in program["members_by_count"].items() if int(count) >= k for cell in cells)
 
 
 def nb_high_members(ctrl, eid, gene):
@@ -141,6 +154,8 @@ def apply_boundary(ctrl, args):
         first = not any(r["anchor_id"] == seed["id"] for r in reviews)
         selected = ctrl.state.get_meta("selected", [])
         if first and not any(members.intersection(ctrl.candidate(i)["members"]) for i in selected):
+            from .claim_resolution import commit
+            commit(ctrl, [*selected, cid])
             ctrl.state.set_meta("selected", sorted([*selected, cid]))
     return dict(response, status="proposed" if added else "no_expansion", candidate_id=cid,
                 boundary_review=review_card(ctrl, review))
@@ -153,23 +168,21 @@ def other_selections(ctrl, anchor_id):
 
 
 def review_card(ctrl, review):
-    from .finalize import membership_claims
+    from .claim_resolution import plan
     other = other_selections(ctrl, review["anchor_id"])
-    claims = membership_claims(ctrl, other)
-    existing_conflicts = sum(len(owners) > 1 for owners in claims.values())
+    selected = ctrl.state.get_meta("selected", [])
     result = dict(review)
     for role in ("requested", "wider"):
         if role not in review:
             continue
         item = review[role]
         cid = item["candidate_id"]
-        members = ctrl.candidate(cid)["members"]
-        overlap = sum(cell in claims for cell in members)
-        new_conflicts = sum(len(claims.get(cell, ())) == 1 for cell in members)
-        result[role] = dict(item, selected=cid in ctrl.state.get_meta("selected", []),
-                            exclusive_members=len(members)-overlap,
-                            partition_conflicts=existing_conflicts+new_conflicts,
-                            partition_unclaimed=len(ctrl.cells)-len(claims)-len(members)+overlap)
+        # select_boundary explicitly prefers the requested option over competing drafts.
+        assignment = plan(ctrl, [*other, cid], [cid])
+        result[role] = dict(item, selected=cid in selected,
+                            exclusive_members=sum(owner == cid for owner in assignment["owners"].values()),
+                            partition_conflicts=len(assignment["unresolved"]),
+                            partition_unclaimed=len(ctrl.cells)-len(assignment["owners"])-len(assignment["unresolved"]))
     return result
 
 
@@ -179,30 +192,31 @@ def select_boundary(ctrl, args):
     if not c.get("boundary_rule"):
         raise ValueError("Choose a candidate_id from a boundary review")
     other = other_selections(ctrl, c["parents"][0])
-    members = set(c["members"])
-    if any(members.intersection(ctrl.candidate(i)["members"]) for i in other):
-        raise ValueError("Overlapping selections from another group. Use propose_revision to allocate them.")
+    from .claim_resolution import commit
     chosen = sorted([*other, cid])
+    commit(ctrl, chosen, [cid])
     ctrl.state.set_meta("selected", chosen)
     return {"action": "select_boundary", "candidate_id": cid, "selected_ids": chosen, "reason": args["reason"]}
 
 
 def preview(ctrl, args):
-    from .finalize import membership_claims
+    from .claim_resolution import plan, summary
     selected = args.get("candidate_ids", ctrl.state.get_meta("selected", []))
-    claims = membership_claims(ctrl, selected)
-    exclusive = {cell for cell, owners in claims.items() if len(owners) == 1}
+    resolution = plan(ctrl, selected, args.get("preferred_candidate_ids", ()))
+    owners = resolution["owners"]
+    conflicts = resolution["unresolved"]
+    exclusive = set(owners)
     focus_ids = [args["candidate_id"]] if "candidate_id" in args else selected
     reference = set(ctrl.candidate(args["reference_id"])["members"]) if "reference_id" in args else None
     report = []
     for cid in focus_ids:
         members = set(ctrl.candidate(cid)["members"])
         unique = members & exclusive
-        retained = {cell for cell in unique if cid in claims[cell]}
+        retained = {cell for cell in unique if owners[cell] == cid}
         row = {"candidate_id": cid, "selected": cid in selected, "retained": len(retained),
                "assigned_to_other": len(unique) - len(retained),
-               "conflicts": sum(len(claims.get(cell, ())) > 1 for cell in members),
-               "unclaimed": sum(cell not in claims for cell in members),
+               "conflicts": sum(cell in conflicts for cell in members),
+               "unclaimed": sum(cell not in owners and cell not in conflicts for cell in members),
                "proposed_global": abundance(len(members), len(ctrl.cells)),
                "retained_global": abundance(len(retained), len(ctrl.cells))}
         if reference is not None:
@@ -210,5 +224,6 @@ def preview(ctrl, args):
                        retained_local=abundance(len(retained & reference), len(reference)))
         report.append(row)
     return {"action": "preview_submission", "exclusive_cells": len(exclusive),
-            "conflicted_cells": len(claims) - len(exclusive), "unclaimed_cells": len(ctrl.cell_set)-len(claims),
+            "claim_resolution": summary(resolution), "conflicted_cells": len(conflicts),
+            "unclaimed_cells": len(ctrl.cell_set) - len(exclusive) - len(conflicts),
             "candidates_reviewed": report}

@@ -143,7 +143,7 @@ def test_minimal_sparse_adaptive_seed_to_final_partition(tmp_path, three_views):
         assert rejected["candidates_reviewed"][0]["assigned_to_other"] == 8
         preview = act(ctrl, "preview_submission", candidate_ids=[small,*broad], candidate_id=small, reference_id=broad[0])
         item = preview["candidates_reviewed"][0]
-        assert preview["conflicted_cells"] == 8 and item["retained"] == 0
+        assert preview["conflicted_cells"] == 0 and item["retained"] == 8
         assert item["proposed_local"]["n"] == 4 and item["proposed_local"]["denominator"] == 80
         co = act(ctrl, "coexpress", genes=expansion["summary"]["positive_genes"], scope="all", logic="AND")
         groups = [{"matched_evidence_id":co["evidence_id"], "status":"provisional",

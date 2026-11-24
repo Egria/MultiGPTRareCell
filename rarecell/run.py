@@ -24,7 +24,7 @@ def code_fingerprint():
     module = Path(__file__).parent
     files = ("discovery.py", "run.py", "protocol.py", "science.py", "state.py", "providers.py",
              "config.py", "seed_review.py", "exhaustive.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py",
-             "contrast_panels.py", "singleton_markers.py", "pool_followup.py", "nb_mixture.py")
+             "contrast_panels.py", "singleton_markers.py", "pool_followup.py", "nb_mixture.py", "claim_resolution.py")
     return fingerprint({name: hash_file(module / name) for name in files})
 
 

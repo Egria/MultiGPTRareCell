@@ -112,3 +112,17 @@ GUI、命令行和事后注释核对的用法见 [强制逐种子明文调查](E
 对 N 个种子，查询上限为原配置加 N，扩展深度上限增加一层。批量大小受 seed_review_batch_size、单轮动作数和上下文字节上限共同约束。模型可部分作答。后续批次优先展示尚未分配过的种子，再轮流重试缺失项。专项轮数最多 N + stall_turns；进入全部为重试项的批次后，连续 stall_turns 轮没有新增明文也会结束。暂停后按原批次和已付费的回复恢复。所有种子得到观测和明文后才开始原预算内的常规调查。没有种子时直接进入常规调查。
 
 未完成的调查会冻结已完成进度并列出缺项。未写完标记 seed_review_incomplete，数值查询实际失败标记 seed_measurement_blocked；全局 token 预算或服务端中断保留各自的原始原因。no_expansion、no_signature 等计算结果可由模型明确评估。数值查询失败即使有文字记录也无法满足完整提交条件。
+
+### A3_adaptive 重叠提交与离线复核
+
+每次修订记录已分配成员。完全相同的候选共用一份成员边界，提交日志保留双方 ID 和名称分歧。对同名候选的包含关系或双方成员均超过一半的重叠，保留一个完整边界。同一 anchor 的备选边界也只保留一个。优先顺序是显式 `preferred_candidate_ids`、上一份有效分配，再按较小集合和候选 ID 打破平局。不同假设的独有成员各自保留。共享成员优先沿用明确选择或之前的归属。首次遇到双方均过半的竞争，或某方没有任何独有成员时，按上述顺序保留可行归属，并标为 provisional。其他无依据的局部交集可保留为 unresolved。
+
+`preview_submission` 和 `submit` 接受相同的选择和有序偏好，返回 `claim_resolution.retained`、替代边界及冲突数。修订可使用 `intersect_candidate_ids` 和 `exclude_candidate_ids` 限定成员。成员相同但解读相异时会记录 `alternative_labels`，未显式指定解释则导出为 provisional/unknown。
+
+已有冻结的 A3_adaptive 提交可直接从冻结目录离线重放。指定一个新的输出目录，可反复使用不同的目录比较方案。
+
+```bash
+.venv/bin/rarecell replay-submit --run "$run" --out "${run}.resolved" --gt "$gt"
+```
+
+默认重放历史修订并提交原来选中的全部候选。`--prefer ID` 给已选候选优先权，可重复。`--candidate-id ID` 可指定要单独或共同提交的候选。输出 `partition.tsv` 和 `replay.json`，提供 GT 时在分区写出并计算哈希后生成 `targets.tsv`。该命令不调用模型。

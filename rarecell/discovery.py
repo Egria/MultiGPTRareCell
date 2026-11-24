@@ -36,13 +36,13 @@ GOAL = (
 
 
 def prompt_version(mode, exhaustive_review=False):
-    version = "discovery/adaptive-5" if mode == ADAPTIVE_MODE else "discovery/1.5"
+    version = "discovery/adaptive-6" if mode == ADAPTIVE_MODE else "discovery/1.5"
     if mode in ANNOTATED_MODES:
         version += "/ontology-pools-1"
     if exhaustive_review:
         version += "/exhaustive-1"
         if mode in ANNOTATED_MODES:
-            version += "/pool-followup-1"
+            version += "/pool-followup-2"
     return version
 
 
@@ -370,9 +370,12 @@ class Controller:
             actions["list_seed_reviews"] = "offset, limit. Read written seed assessments, follow-up and retained seeds first."
         if self.adaptive:
             actions.update(adaptive.TOOLS)
+            actions["submit"] += (" candidate_ids is the exact list to publish. For overlapping drafts, optionally "
+                                  "supply ordered preferred_candidate_ids from this list. Use parents in a revision "
+                                  "to replace older drafts. Check retained and held memberships before submission.")
             actions["get_evidence"] += " For a single expansion evidence_id, page the ranking, optionally sorted by metric."
             actions["coexpress"] += " Alternatively specify min_detected=k of the distinct genes, with optional expression threshold."
-            actions["propose_revision"] += " Optional group biological_rarity (yes/no/uncertain) and rarity_reason record context-specific interpretation. Use matched_evidence_id for exact coexpress hits, or use matched_evidence_id plus nb_high_gene for all fitted high-state cells of that gene in a compare_groups result. Each group can subtract exclude_candidate_ids from its union (e.g. remove a rare candidate from a broad group)."
+            actions["propose_revision"] += " Optional group biological_rarity (yes/no/uncertain) and rarity_reason record context-specific interpretation. Use matched_evidence_id for exact coexpress hits, or use matched_evidence_id plus nb_high_gene for all fitted high-state cells of that gene in a compare_groups result. For a measured pool program use matched_evidence_id, program and min_detected to bind exact global matches. Each group can restrict its union using intersect_candidate_ids and subtract exclude_candidate_ids from its union (e.g. remove a rare candidate from a broad group)."
         recent = s.get_meta("receipts", [])
         queries = s.all("CanonicalQuery")
         usage = s.usage()
@@ -488,7 +491,7 @@ class Controller:
             for c in self.pool_candidates:
                 row = s.get_optional("PoolFollowup", c["id"])
                 if row:
-                    card = pool_followup.card(row)
+                    card = pool_followup.card(row, compact=True)
                     allowance -= len(json_bytes(card)) + 1
                     if allowance < 0 or not append_if_fits("pool_followups", card):
                         break
@@ -612,6 +615,8 @@ class Controller:
             raise ValueError("Reference background intersects foreground")
         if "genes" in args:
             bound["genes"] = sorted(set(resolve_genes(args["genes"], self.genes, species=self.manifest.get("species"))))
+        if "pool_programs" in args:
+            bound["pool_programs"] = args["pool_programs"]
         if action == "coexpress":
             bound["threshold"] = float(args.get("threshold", 0))
             if "min_detected" in args:
@@ -629,6 +634,8 @@ class Controller:
                      "parameters": self.cfg["search"], "layer": "log1p"}
         if action == "compare_groups" and bound.get("genes"):
             canonical["method_version"].append("nb-mixture/2")
+            if "pool_programs" in bound:
+                canonical["method_version"].append("pool-programs/1")
         if self.adaptive and action == "expand_candidate":
             canonical["method_version"].append("ranked-expansion/1")
         signature = fingerprint(canonical)
@@ -806,13 +813,10 @@ class Controller:
         selected = set(self.state.get_meta("selected", []))
         evidence_ids = self.checked_evidence(args.get("evidence_ids", []))
         reason = args.get("reason", "Submit current provisional assignment")
+        if "preferred_candidate_ids" in args and not self.adaptive:
+            raise ValueError("preferred_candidate_ids requires A3_adaptive")
         if action == "submit":
             selected = set(args.get("candidate_ids", selected))
-            if self.adaptive:
-                anchors = [self.candidate(cid)["parents"][0] for cid in selected
-                           if self.candidate(cid).get("boundary_rule")]
-                if len(anchors) != len(set(anchors)):
-                    raise ValueError("Choose one boundary per anchor or revise the alternatives into disjoint groups")
             for cid in selected:
                 evidence_ids = evidence_ids + self.candidate(cid)["evidence_ids"]
                 evidence_ids = evidence_ids + self.current_label(cid).get("evidence_ids", [])
@@ -850,23 +854,30 @@ class Controller:
                 if matched:
                     if not self.adaptive:
                         raise ValueError("matched_evidence_id requires A3_adaptive")
-                    if "nb_high_gene" in group:
+                    if "program" in group:
+                        measured = adaptive.program_members(self, matched, group["program"], group["min_detected"])
+                    elif "nb_high_gene" in group:
                         measured = adaptive.nb_high_members(self, matched, group["nb_high_gene"])
                     else:
                         measured = adaptive.coexpression_members(self, matched)
                     member_set.update(measured)
                     measured_evidence.add(matched)
                 member_set |= explicit
+                intersections = group.get("intersect_candidate_ids", [])
+                if intersections and not self.adaptive:
+                    raise ValueError("intersect_candidate_ids requires A3_adaptive")
+                for other_id in intersections:
+                    member_set.intersection_update(self.candidate(other_id)["members"])
                 exclusions = group.get("exclude_candidate_ids", [])
                 if exclusions and not self.adaptive:
                     raise ValueError("exclude_candidate_ids requires A3_adaptive")
                 for excluded in exclusions:
                     other = self.candidate(excluded)
                     member_set.difference_update(other["members"])
-                if occupied.intersection(member_set):
+                if not self.adaptive and occupied.intersection(member_set):
                     raise ValueError("New groups in a single revision overlap")
                 occupied.update(member_set)
-                inherited = set(parents) | {c["id"] for c in refs} | set(exclusions)
+                inherited = set(parents) | {c["id"] for c in refs} | set(exclusions) | set(intersections)
                 chosen.append(self.make_revision(member_set, inherited, group.get("proposed_label", "unknown"),
                                                  group.get("status", "provisional"), group_evidence + ([matched] if matched else []),
                                                  "revision", group_reason, biological_rarity=rarity)["id"])
@@ -880,8 +891,17 @@ class Controller:
             selected.difference_update(parents)
             selected.update(chosen)
             evidence_ids = list(evidence_ids) + sorted(measured_evidence) + [eid for cid in chosen for eid in self.candidate(cid)["evidence_ids"]]
+        resolution = None
+        if self.adaptive:
+            from . import claim_resolution
+            resolution = claim_resolution.commit(self, selected, args.get("preferred_candidate_ids", ()))
         decision = {"action": action, "reason": reason, "evidence_ids": sorted(set(evidence_ids)),
                     "selected": sorted(selected), "message_id": message_id, "args_hash": fingerprint(args)}
+        if args.get("preferred_candidate_ids"):
+            decision["preferred_candidate_ids"] = args["preferred_candidate_ids"]
+        if resolution is not None:
+            decision["claim_resolution"] = claim_resolution.summary(resolution)
+            decision["claim_plan_ref"] = self.state.get_meta("claim_plan_ref")
         if action == "propose_revision" and not args.get("parents"):
             decision["parents_from_candidate_ids"] = parents
         if action == "submit":
@@ -907,7 +927,8 @@ class Controller:
             self.state.set_meta("submitted", True)
             self.state.set_meta("submission_status", decision["status"])
         return {"decision_id": did, "action": action, "selected_count": len(selected),
-                "candidate_ids": sorted(selected)[:15]}
+                "candidate_ids": sorted(selected)[:15],
+                **({"claim_resolution": decision["claim_resolution"]} if resolution is not None else {})}
 
     def read_tool(self, action, args):
         if "metric" in args:
