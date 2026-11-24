@@ -22,12 +22,16 @@
 
 旧式请求只给 `genes` 时，程序补算种子 marker 程序，并列出所提名基因中 effect 为正的一组。若旧式请求显式给出 `genes + min_detected`，沿用全局共检出查询。漏答或基因无法解析时，回退查询保留来源记录。正式做成员修订时可引用 `matched_evidence_id + program + min_detected`，直接取得选定程序在该 k 下的全体成员，也可以用 `matched_evidence_id + nb_high_gene` 取得指定基因的拟合高表达组。
 
-每个池最多占用一次常规逻辑查询。交接批次单独计模型轮数，共享全程 token 预算。查询额度用完时，未处理的池保留为 `pending`。每个池的请求来源、待查种子、状态、观测和证据 ID 导出在 `pool_followups.jsonl` 中。`run_summary.json` 的 `pool_followup_coverage` 单列未形成共享 CL 池的待查种子数。
+每个全局 CL 池最多占用一次常规逻辑查询。交接批次单独计模型轮数，共享全程 token 预算。查询额度用完时，未处理的池保留为 `pending`。每个池的请求来源、待查种子、状态、观测和证据 ID 导出在 `pool_followups.jsonl` 中。`run_summary.json` 的 `pool_followup_coverage` 单列未形成共享 CL 池的待查种子数。
+
+当同一个种子的全局与邻居注释给出不同 CL、已扩展到其他细胞、且种子评语标为 `follow_up`，会单列一次调查。模型收到两个 CL、各自的证据 ID、原评语、扩展候选 ID、成员和邻居基因。候选超过 50 个成员时，卡片显示前 50 个，测量使用完整成员。每个符合条件的扩展最多新增一次专用本地查询，按现有批大小投递给发现模型，共享全程 token 上限。可以在 `pool_followups.jsonl` 按 `kind=conflicting_seed_expansion` 核对。此类记录的 `n_foreground` 以及各程序的 `seed_hits` 对应整个扩展组，其中包含原种子。
+
+普通发现轮优先发送模型主动请求的证据。上下文中的 `requested_evidence` 关联原始回执 ID。较大的结果可压缩显示，在返回可用结果前会保留待交付记录，已提交的判断和完整成员可以追溯。查询候选后，其池级测量优先进入后续调查目录。`get_evidence(candidate_id)` 同样适用于上述独立扩展。
 
 已有 Baron 任务可复用同一任务配套的快照、注释和数值查询缓存。更新后端后，在仓库根目录运行以下命令。新发现运行会重新调用模型做逐种子判断。新运行被暂停或可恢复地中断时，可在相同代码版本下执行 `.venv/bin/rarecell resume --run "$run"`。
 
 ```bash
-old="$PWD/work/tasks/b6a3a2506a344cdcb1fc757d29470038"
+old="$PWD/work/tasks/30fabf9eaefb4b3f96af186a72c72741"
 field() {
   .venv/bin/python -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$old/run/checkpoint.json" "$1"
 }

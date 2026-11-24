@@ -4,7 +4,7 @@ from functools import cached_property
 from pathlib import Path
 
 from .contrast_panels import GUIDANCE as PANEL_GUIDANCE, SOURCE as PAIRED_CONTRAST, ontology_seed_pools
-from . import __version__, adaptive, exhaustive, pool_followup, seed_review
+from . import __version__, adaptive, exhaustive, handoff, pool_followup, seed_review
 from .base_evidence import FrozenSeurat, annotation_parents, prepared_page
 from .config import ACTIVE_MODES, ADAPTIVE_MODE, ANNOTATED_MODES, contract, fingerprint, json_bytes, read_json, read_lines
 from .protocol import ProtocolError, resolve_genes
@@ -36,13 +36,13 @@ GOAL = (
 
 
 def prompt_version(mode, exhaustive_review=False):
-    version = "discovery/adaptive-6" if mode == ADAPTIVE_MODE else "discovery/1.5"
+    version = "discovery/adaptive-7" if mode == ADAPTIVE_MODE else "discovery/1.6"
     if mode in ANNOTATED_MODES:
         version += "/ontology-pools-1"
     if exhaustive_review:
         version += "/exhaustive-1"
         if mode in ANNOTATED_MODES:
-            version += "/pool-followup-2"
+            version += "/pool-followup-3"
     return version
 
 
@@ -301,7 +301,8 @@ class Controller:
 
     @property
     def query_limit(self):
-        return self.budget["max_new_queries"] + (len(self.seed_ids) if self.exhaustive else 0)
+        dedicated = len(self.seed_ids) + len(self.state.all("ConflictQuerySlot")) if self.exhaustive else 0
+        return self.budget["max_new_queries"] + dedicated
 
     @property
     def depth_limit(self):
@@ -458,12 +459,13 @@ class Controller:
             if not closing:
                 field = "pending_initial_expansions" if self.exhaustive else "pending_followup"
                 ctx["seed_review"][field] = len(queue)
-        if self.exhaustive and self.labeled and self.pool_candidates:
+        if self.exhaustive and self.labeled:
             ctx["pool_followup_coverage"] = pool_followup.coverage(self)
             ctx["pool_followups"] = []
             ctx["turn_instruction"] += (" Use pool_followups to decide which measured groups to revise, submit or "
                                         "defer. Inspect competing programs and explain promising deferrals. "
-                                        "get_evidence(candidate_id) retrieves the pool result.")
+                                        "get_evidence(candidate_id) retrieves the full result. Consult requested_evidence for returned pages. "
+                                        "Conflicting seed expansions have their own member boundary and competing annotations.")
         if self.adaptive and self.budget.get("max_reported_tokens"):
             consumed = [m["usage"].get("total_tokens") for m in s.all("Message")]
             if all(n is not None for n in consumed):
@@ -485,16 +487,10 @@ class Controller:
                 ctx[key].pop()
                 return False
             return True
+        # Optional catalogue keys are added below even if their arrays are empty.
+        delivered = handoff.requested(ctx, s, limit - 256)
         if "pool_followups" in ctx:
-            # Keep room for the agent's subsequent measurements and selection feedback.
-            allowance = (limit - len(json_bytes(ctx))) // 2
-            for c in self.pool_candidates:
-                row = s.get_optional("PoolFollowup", c["id"])
-                if row:
-                    card = pool_followup.card(row, compact=True)
-                    allowance -= len(json_bytes(card)) + 1
-                    if allowance < 0 or not append_if_fits("pool_followups", card):
-                        break
+            handoff.directory(ctx, s, limit)
         if self.labeled and self.pool_candidates:
             ctx["ontology_pool_count"] = len(self.pool_candidates)
             visible = ctx["ontology_seed_pools"] = []
@@ -552,7 +548,7 @@ class Controller:
             ctx["global_feature_selection"] = []
             if not append_if_fits("global_feature_selection", hvg):
                 ctx.pop("global_feature_selection")
-        seen_receipts = set()
+        seen_receipts = {fingerprint(s.get("Receipt", rid)["result"]) for rid in delivered}
         shown = set()
         for receipt in reversed(recent[-12:]):
             key = fingerprint(receipt)
@@ -587,7 +583,7 @@ class Controller:
             raise ValueError("Missing scope or unknown exact cell ID")
         return sorted(set(members))
 
-    def scientific(self, action, args):
+    def scientific(self, action, args, *, conflict_slot=None):
         if not self.active:
             raise ValueError("New scientific queries are disabled in " + self.mode)
         self.checked_evidence(args.get("evidence_ids", []))
@@ -651,7 +647,7 @@ class Controller:
             if self.science is None:
                 self.science = Science(self.snapshot, self.cfg, adaptive=self.adaptive)
             return self.science.execute(action, bound)
-        result, key = self.state.query(canonical, self.query_limit, compute)
+        result, key = self.state.query(canonical, self.query_limit, compute, conflict_slot=conflict_slot)
         ref = self.state.result_ref(key)
         try:
             with self.state.transaction():
@@ -698,6 +694,9 @@ class Controller:
         self.state.put("QueryUse", use_id, dict(use, id=use_id))
         response = {"action": action, "query_key": key, "evidence_id": eid, "query_use_id": use_id,
                     "status": result.get("status", "ok"), "summary": summary, "artifact_ref": ref}
+        if result.get("nb_diagnostics"):
+            response["nb_high_counts"] = {g: {"high_foreground": d["high_foreground"], "high_background": d["high_background"]}
+                                          for g, d in result["nb_diagnostics"].items() if "high_foreground" in d}
         if action != "expand_candidate":
             return response
 
@@ -945,10 +944,10 @@ class Controller:
             page = {"candidate": self.card(c), "offset": offset, "total": len(c["members"]),
                     "members": c["members"][offset:offset+limit],
                     "markers": compact(c.get("markers", [])[offset:offset+limit], limit)}
+            followup = self.state.get_optional("PoolFollowup", c["id"])
+            if followup:
+                page["pool_followup"] = pool_followup.card(followup)
             if "ontology_pool" in c:
-                followup = self.state.get_optional("PoolFollowup", c["id"])
-                if followup:
-                    page["pool_followup"] = pool_followup.card(followup)
                 page["seed_candidate_ids"] = c["parents"][offset:offset+limit]
                 page["marker_seed_counts"] = dict(c["ontology_pool"]["marker_counts"][offset:offset+limit])
             if self.adaptive:

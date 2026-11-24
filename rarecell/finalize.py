@@ -189,6 +189,9 @@ def export(ctrl, status, detail, policy, annotation_status):
         for c, notes in pool_followup.queue(ctrl):
             row = s.get_optional("PoolFollowup", c["id"]) or {"candidate_id": c["id"], "label": c["proposed_label"], "status": "pending"}
             pool_rows.append(dict(row, follow_up_seed_ids=[r["candidate_id"] for r in notes]))
+        for cid, case in pool_followup.conflict_cases(ctrl).items():
+            row = s.get_optional("PoolFollowup", cid) or dict(case, status="pending")
+            pool_rows.append(dict(row, follow_up_seed_ids=[case["anchor_id"]]))
         jsonlines(run / "pool_followups.jsonl", pool_rows)
     write_json(run / "run_summary.json", summary)
     files = ["run_summary.json", "usage.json", "manifest.json", "config_resolved.yaml", "project_contract.yaml",
