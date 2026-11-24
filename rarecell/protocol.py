@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
-VERSION = "soft-protocol-1.6"
+VERSION = "soft-protocol-1.7"
 MAX_CHARS = 512_000
 MAX_ACTIONS = 128
 
@@ -36,6 +36,7 @@ def _alias_map(groups):
 ACTIONS = _alias_map({
     "review_seed": ("assess_seed", "record_seed_review", "调查种子"),
     "investigate_pool": ("investigate seed pool",),
+    "review_expansion": ("assess_expansion",),
     "list_seed_reviews": ("list seed assessments",),
     "list_ontology_pools": ("list seed pools",),
     "apply_boundary": (),
@@ -56,7 +57,7 @@ SEED_DISPOSITIONS = _alias_map({"follow_up": ("investigate", "followup", "深入
 FIELDS = _alias_map({
     "preferred_candidate_ids": (), "intersect_candidate_ids": (), "seed_genes": (), "support_genes": (), "counter_genes": (), "program": (),
     "disposition": ("recommendation", "outcome", "结论"),
-    "seed_id": (),
+    "seed_id": (), "guide_label": (), "label_reliability": (), "choice": (), "include_core": (),
     "metric": (), "matched_evidence_id": (), "nb_high_gene": (), "min_detected": (), "exclude_candidate_ids": (), "reference_id": (),
     "background_mode": (), "biological_rarity": (), "rarity_reason": (),
     "action": ("operation", "tool", "动作", "操作"),
@@ -90,7 +91,8 @@ BINDINGS = {"run_id", "task_id", "data_version", "contract_version", "message_id
 SCOPES = {"candidate_id", "members", "scope"}
 BACKGROUNDS = {"background", "background_id"}
 ALLOWED = {
-    "review_seed": {"candidate_id", "disposition", "reason", "evidence_ids"},
+    "review_seed": {"candidate_id", "disposition", "reason", "evidence_ids", "guide_label", "label_reliability"},
+    "review_expansion": {"candidate_id", "choice", "reason", "include_core"},
     "investigate_pool": {"candidate_id", "genes", "seed_genes", "support_genes", "counter_genes", "min_detected", "reason"},
     "list_seed_reviews": {"offset", "limit"},
     "list_ontology_pools": {"offset", "limit"},
@@ -250,6 +252,14 @@ def _value(key, value):
         return _ids(value, key, allow_empty=True)
     if key in {"preferred_candidate_ids", "genes", "members", "background", "evidence_ids", "candidate_ids", "parents"}:
         return _ids(value, key, allow_empty=key in {"evidence_ids", "candidate_ids", "parents", "preferred_candidate_ids"})
+    if key == "include_core":
+        if isinstance(value, bool):
+            return value
+        return _choice(value, key, {"yes": True, "true": True, "no": False, "false": False})
+    if key == "label_reliability":
+        return _choice(value, key, _alias_map({"supported": ("reliable", "confirmed"), "uncertain": ("ambiguous", "mixed"), "contradicted": ("unsupported", "rejected", "unreliable")}))
+    if key in {"guide_label", "choice"}:
+        return _string(value, key)
     if key == "disposition":
         return _choice(value, key, SEED_DISPOSITIONS)
     if key == "metric":
@@ -282,6 +292,8 @@ def _value(key, value):
 
 def _validate(action, args):
     present = args.keys()
+    if action == "review_expansion" and not {"candidate_id", "choice", "reason"} <= present:
+        raise ProtocolError("review_expansion needs the assigned ID, choice and reason")
     if action == "investigate_pool" and (not {"candidate_id", "reason"} <= present or
                                        not any(args.get(k) for k in ("genes", "seed_genes", "support_genes"))):
         raise ProtocolError("investigate_pool needs the assigned pool, genes and reason")

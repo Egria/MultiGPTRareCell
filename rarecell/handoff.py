@@ -1,12 +1,12 @@
 """Pack model-requested observations and the measured handoff index before optional context."""
 from .config import json_bytes
-from .pool_followup import card
+from .pool_followup import card, program_curves
 
 
 def index(row):
     brief = {k: row[k] for k in ("candidate_id", "label", "evidence_id", "status", "n_seeds", "n_background",
                                  "anchor_id", "kind", "n_foreground", "expansion_evidence_id", "matching_seeds", "n_matching") if k in row}
-    if row.get("written_questions") and row.get("annotations"):
+    if row.get("written_questions") and "global" in row.get("annotations", {}):
         brief["follow_up_reason"] = row["written_questions"][0]["reason"][:350]
         brief["global_alternative"] = row["annotations"]["global"]["label"]
     # Put one directly addressable enriched boundary in the directory. The complete
@@ -17,6 +17,11 @@ def index(row):
                       (row["n_seeds"] + item[1]["high_seeds"] + item[1]["high_outside"]))
         brief["nb_high_gene"] = gene
         brief.update({k: f[k] for k in ("high_seeds", "high_outside", "means_per_10k")})
+    if row.get("programs"):
+        brief["programs"] = program_curves(row)
+    if row.get("expansion_review"):
+        review = row["expansion_review"]
+        brief["expansion_review"] = {k: review[k] for k in ("choice", "working_candidate_id", "include_core") if k in review}
     return brief
 
 
@@ -105,12 +110,16 @@ def directory(ctx, state, limit):
     rows = state.all("PoolFollowup")
     if not rows:
         return
+    reviews = {r["candidate_id"]: r for r in state.all("ExpansionReview")}
+    for row in rows:
+        if row["candidate_id"] in reviews:
+            row["expansion_review"] = reviews[row["candidate_id"]]
     # Give every measured case an entry before spending the remainder on larger cards.
     # Rows with an alternative lineage absent from the global pools lead the directory.
     types = {r.get("ontology_id") for r in rows if not r.get("kind")}
     focus = state.get_meta("recent_followup_ids", [])
     rows.sort(key=lambda r: (focus.index(r["candidate_id"]) if r["candidate_id"] in focus else len(focus),
-                             not (r.get("annotations") and r["annotations"]["neighbor"]["ontology_id"] not in types),
+                             not ("neighbor" in r.get("annotations", {}) and r["annotations"]["neighbor"]["ontology_id"] not in types),
                              r.get("n_seeds", 0), r["candidate_id"]))
     available = (limit - len(json_bytes(ctx))) // 2
     entries = ctx["pool_followups"]

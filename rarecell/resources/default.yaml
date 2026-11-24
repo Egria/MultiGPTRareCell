@@ -31,14 +31,14 @@ search:
   max_cells: 50
   block_size: 1024
 budget:
-  max_agent_turns: 12
+  max_agent_turns: 18
   max_reported_tokens: 0
   max_new_queries: 25
   max_seed_followups: 3
-  seed_review_batch_size: 4
+  seed_review_batch_size: 2
   max_expansion_depth: 1
   stall_turns: 3
-  context_bytes: 36000
+  context_bytes: 72000
   max_actions_per_turn: 12
 provider:
   kind: openai_compatible

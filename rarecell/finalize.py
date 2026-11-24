@@ -180,18 +180,23 @@ def export(ctrl, status, detail, policy, annotation_status):
                        "query_key": measurement.get("query_key"), "evidence_id": measurement.get("evidence_id"),
                        "measurement_error": measurement.get("error"), "proposal_id": measurement.get("proposal_id"),
                        "message_id": note.get("message_id"), "disposition": note.get("disposition"),
+                       "guide_label": note.get("guide_label"), "label_reliability": note.get("label_reliability"),
                        "reason": note.get("reason")}
         tsv(run / "seed_reviews.tsv", ["seed_id", "cell_id", "candidate_id", "measurement_status", "query_key",
-            "evidence_id", "measurement_error", "proposal_id", "message_id", "disposition", "reason", "final_group"], review_rows())
+            "evidence_id", "measurement_error", "proposal_id", "message_id", "disposition", "guide_label", "label_reliability", "reason", "final_group"], review_rows())
     if ctrl.exhaustive and ctrl.labeled:
         summary["pool_followup_coverage"] = pool_followup.coverage(ctrl)
         pool_rows = []
         for c, notes in pool_followup.queue(ctrl):
             row = s.get_optional("PoolFollowup", c["id"]) or {"candidate_id": c["id"], "label": c["proposed_label"], "status": "pending"}
             pool_rows.append(dict(row, follow_up_seed_ids=[r["candidate_id"] for r in notes]))
-        for cid, case in pool_followup.conflict_cases(ctrl).items():
+        for cid, case in pool_followup.independent_cases(ctrl).items():
             row = s.get_optional("PoolFollowup", cid) or dict(case, status="pending")
             pool_rows.append(dict(row, follow_up_seed_ids=[case["anchor_id"]]))
+        reviews = {r["candidate_id"]: r for r in s.all("ExpansionReview")}
+        for row in pool_rows:
+            if row["candidate_id"] in reviews:
+                row["expansion_review"] = reviews[row["candidate_id"]]
         jsonlines(run / "pool_followups.jsonl", pool_rows)
     write_json(run / "run_summary.json", summary)
     files = ["run_summary.json", "usage.json", "manifest.json", "config_resolved.yaml", "project_contract.yaml",

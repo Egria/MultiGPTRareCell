@@ -30,7 +30,8 @@ def strict(**budget):
 
 
 def written(row):
-    return {"seed_id": row["seed_id"], "recommendation": "follow up", "explanation":
+    assessment = {"label_reliability": "uncertain"} if row.get("annotation_sources") else {}
+    return {**assessment, "seed_id": row["seed_id"], "recommendation": "follow up", "explanation":
             f"Measured {row['measurement']['status']} for {row['candidate_id']}. Compare its peer before selection."}
 
 
@@ -260,6 +261,9 @@ def test_pool_followups_run_before_closeout_and_survive_resume(frozen, tmp_path,
             if query_budget == 2:
                 out.append(dict(action="investigate_pool", candidate_id=ctx["pools"][1]["candidate_id"],
                                 genes=["nonexistent_gene"], reason="Invalid nomination exercises fallback"))
+        elif ctx["phase"] == "expansion_review":
+            out = [dict(action="review_expansion", candidate_id=r["candidate_id"], choice="defer",
+                        reason="Added cells have unresolved counter signals") for r in ctx["cases"]]
         else:
             coverage = ctx["pool_followup_coverage"]
             assert coverage["eligible_pools"] == 2 and coverage["pooled_follow_up_seeds"] == 2

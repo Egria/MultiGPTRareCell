@@ -134,7 +134,7 @@ def test_requested_pool_result_reaches_next_dispatch_before_catalogue(ctrl):
     # Force the full page above the context cap. A compressed numeric result must arrive.
     original = ctrl.read_tool
     def padded(action, args):
-        return dict(original(action, args), full_payload="a"*60000)
+        return dict(original(action, args), full_payload="a" * (ctrl.budget["context_bytes"] + 1000))
     with patch.object(ctrl, "read_tool", padded):
         process_message(ctrl, {"message_id": "test:T0001", "raw": json.dumps(
             {"action": "get_evidence", "candidate_id": "anchor"})}, 1)
@@ -220,3 +220,57 @@ def test_deferred_scientific_receipt_survives_small_context_and_reopen(ctrl, tmp
         assert item["receipt_id"] == rid and next_context["pending_evidence_count"] == 0
         assert item["result"]["evidence_id"] == reopened.state.get("Receipt",rid)["result"]["evidence_id"]
         assert set(item["result"]["nb_high_counts"]) == {"g020","g021"}
+
+
+def test_named_seed_guides_search_and_reviews_exact_additions(ctrl, tmp_path):
+    from rarecell import exhaustive, expansion_review, handoff, pool_followup
+    from rarecell.run import process_message
+
+    s = ctrl.state
+    s.set_meta("run_id", "named")
+    ctrl.budget["max_new_queries"] = 0
+    seed = read_json(ctrl.snapshot.parent / "evaluation_fixture" / "truth.json")["seed"]
+    anchor = draft(ctrl, "unknown", [seed], "singleton to audit")
+    ctrl.seed_ids[anchor] = "seed"
+    obs = ctrl.candidate(anchor)["evidence_ids"][0]
+    ctrl.labels[anchor] = {obs: {"candidate_id": anchor, "label": "named lineage",
+        "evidence_id": obs, "status": "annotated", "background_type": "global",
+        "selection_history": {"genes": ["g020"]}}}
+    s.put("SeedMeasurement", anchor, {"candidate_id": anchor, "evidence_id": obs, "status": "no_expansion"})
+    s.put("SeedBatch", "assessment", {"candidate_ids": [anchor]})
+    note = dict(candidate_id=anchor, disposition="retain", reason="The measured genes support this name")
+    with pytest.raises(ValueError, match="label_reliability"):
+        exhaustive.record(ctrl, "assessment", note)
+    with pytest.raises(ValueError, match="proposed names"):
+        exhaustive.record(ctrl, "assessment", dict(note, guide_label="invented", label_reliability="supported"))
+    exhaustive.record(ctrl, "assessment", dict(note, guide_label="Named Lineage", label_reliability="supported"))
+    assert pool_followup.prepare_batch(ctrl, "named:T0001")
+    case, = ctrl.context(1)["pools"]
+    assert case["kind"] == "guided_named_seed" and case["seed_name_assessment"]["label_reliability"] == "supported"
+    def send(i, cmd):
+        mid = f"named:T{i:04d}"
+        process_message(ctrl, {"message_id": mid, "raw": json.dumps(cmd)}, i)
+        return s.get("Receipt", mid + "/0")["result"]
+
+    receipt = send(1, dict(action="investigate_pool", candidate_id=anchor, seed_genes=["g020"],
+        support_genes=["g020", "g021"], counter_genes=["g006"], reason="Compare additional cells across the dataset"))
+    assert receipt["status"] == "ok"
+    option = next(b for b in receipt["boundaries"] if {"program": "seed", "min_detected": 1} in b["rules"])
+    assert option["n_added"] == 3 and option["added_hits_by_k"]["counter"] == [3]
+    assert handoff.index(receipt)["programs"]["seed"]["outside_hits_by_k"] == [3]
+    assert not s.get_meta("selected", [])
+    assert expansion_review.prepare_batch(ctrl, "named:T0002")
+    packet = ctrl.context(2)
+    assert packet["cases"][0]["boundaries"] == receipt["boundaries"]
+    reopened = Controller(ctrl.snapshot, ctrl.run, tmp_path/"cache", ctrl.cfg, ADAPTIVE_MODE)
+    with closing(reopened.state):
+        assert reopened.context(2) == packet
+    bad = send(2, dict(action="review_expansion", candidate_id=anchor, choice="foreign", reason="Unbound choice"))
+    assert bad["status"] == "needs_clarification" and not s.get_optional("ExpansionReview", anchor)
+    assert expansion_review.prepare_batch(ctrl, "named:T0003")
+    saved = send(3, dict(action="review_expansion", candidate_id=anchor, choice=option["candidate_id"],
+        include_core=True, reason="The added cells share the positive markers despite counter signal"))
+    assert saved["choice"] == option["candidate_id"] and saved["include_core"]
+    assert ctrl.candidate(saved["working_candidate_id"])["members"] == ctrl.candidate(option["candidate_id"])["members"]
+    assert not expansion_review.prepare_batch(ctrl, "named:T0004")
+    assert ctrl.read_tool("get_evidence", {"candidate_id":anchor})["pool_followup"]["expansion_review"]["choice"] == saved["choice"]

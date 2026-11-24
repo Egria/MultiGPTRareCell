@@ -48,8 +48,12 @@ def prepare_batch(ctrl, mid, queue):
                "controller binds the measurement shown. A disposition is a recommendation for later discovery.",
                "previous_errors": [str(r["error"])[:200] for r in previous if "error" in r][:3], "seeds": []}
     if ctrl.labeled:
-        context["turn_instruction"] += " " + PANEL_GUIDANCE
-    size = min(ctrl.budget.get("seed_review_batch_size", 4), ctrl.budget["max_actions_per_turn"])
+        context["actions"]["review_seed"] += " For named seeds give guide_label and label_reliability (supported, uncertain, contradicted)."
+        context["turn_instruction"] += (" For EACH named seed audit the seed cell itself against its proposed names. "
+            "Use tissue/species and your biological knowledge to interpret measured positive and competing markers, "
+            "sparsity and plausible alternatives. State which name the cell supports, or why it is ambiguous. "
+            "Knowledge can suggest new tests. A supported name guides an all-cell search; justify additions separately. " + PANEL_GUIDANCE)
+    size = min(ctrl.budget["seed_review_batch_size"], ctrl.budget["max_actions_per_turn"])
     for seed in queue[:size]:
         cid = seed["candidate_id"]
         anchor = ctrl.candidate(cid)
@@ -91,6 +95,19 @@ def record(ctrl, mid, args):
     assessment = {"source": "discovery_agent", "candidate_id": cid, "seed_id": ctrl.seed_ids[cid], "message_id": mid,
                   "evidence_id": eid, "measurement_status": obs["status"], "proposal_id": obs.get("proposal_id"),
                   "disposition": args["disposition"], "reason": args["reason"].strip()}
+    names = ctrl.current_label(cid).get("labels", [])
+    names = {name.casefold(): name for name in names if name.casefold() != "unknown"}
+    if names:
+        label = args.get("guide_label", "").strip().casefold()
+        name = names.get(label)
+        if not label and len(names) == 1:
+            name = next(iter(names.values()))
+        reliability = args.get("label_reliability", "unassessed")
+        if reliability == "unassessed" and sum(cid in b["candidate_ids"] for b in s.all("SeedBatch")) < 2:
+            raise ProtocolError("Review the named seed using label_reliability, guide_label and your measured rationale")
+        if reliability == "supported" and not name:
+            raise ProtocolError("Identify one of the proposed names supported by this seed, or mark it uncertain")
+        assessment.update(guide_label=name, label_reliability=reliability)
     if citations & label_ids:
         assessment["annotation_evidence_ids"] = sorted(citations & label_ids)
     old = s.get_optional("SeedAssessment", cid)
@@ -113,7 +130,8 @@ def coverage(ctrl):
     assessed = s.all("SeedAssessment")
     completed = sum(r["measurement_status"] != "blocked" for r in assessed)
     total = len(ctrl.seed_ids)
-    return {"total": total, "measured": len(observations) - blocked, "measurement_blocked": blocked,
+    names = Counter(r["label_reliability"] for r in assessed if "label_reliability" in r)
+    return {"named_seed_assessments": dict(names), "total": total, "measured": len(observations) - blocked, "measurement_blocked": blocked,
             "written": len(assessed), "completed": completed, "remaining": total - completed,
             "review_turns": s.get_meta("seed_review_turns", 0), "query_limit": ctrl.query_limit,
             "ordinary_turns": ctrl.budget["max_agent_turns"]}
