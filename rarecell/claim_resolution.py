@@ -48,7 +48,7 @@ def plan(ctrl, requested, preferred=()):
             if exact or shared_anchor or (same_label and (nested or mutual_majority)):
                 held[cid] = {"representative": rep, "intersection": overlap, "draft_n": len(sets[cid]),
                              "representative_n": len(sets[rep]), "rule": "identical" if exact else "alternative_boundary"}
-                if exact and labels[cid] != "unknown" and labels[cid] != labels[rep]:
+                if exact and labels[cid].casefold() != "unknown" and labels[cid].casefold() != labels[rep].casefold():
                     alternatives[rep].append(labels[cid])
                 break
             if mutual_majority:
