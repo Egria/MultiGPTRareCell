@@ -359,7 +359,7 @@ class State:
             with _lock(self.cache / "locks" / (key + ".lock"), **options) as shared:
                 yield shared
 
-    def _admit(self, key, canonical, budget):
+    def _admit(self, key, canonical, budget, conflict_slot=None):
         if not isinstance(budget, int) or isinstance(budget, bool) or budget < 0:
             raise ValueError("logical query budget must be a nonnegative integer")
         body = _dump(canonical)
@@ -370,6 +370,9 @@ class State:
                     raise IntegrityError("canonical request hash collision")
                 return
             n = self.db.execute("SELECT count(*) FROM query").fetchone()[0]
+            if conflict_slot is not None:
+                self._put("ConflictQuerySlot", conflict_slot, {"candidate_id": conflict_slot, "query_key": key})
+                budget += 1
             if n >= budget:
                 raise BudgetExhausted("max_new_queries reached")
             self.db.execute("INSERT INTO query(key,canonical,status) VALUES (?,?,'pending')", (key, body))
@@ -426,14 +429,14 @@ class State:
                             (key,))
             self.event("query_interrupted", {"canonical_query_key": key})
 
-    def query(self, canonical, budget, compute, max_attempts=2):
+    def query(self, canonical, budget, compute, max_attempts=2, *, conflict_slot=None):
         """Admit, resolve cache, or run a deterministic local callable. Never call external APIs here."""
         if self.db.in_transaction:
             raise ValueError("run scientific query outside controller write transaction")
         if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
         key = key_for(canonical)
-        self._admit(key, canonical, budget)
+        self._admit(key, canonical, budget, conflict_slot)
         with self._query_lock(key):
             current = self.get("CanonicalQuery", key)
             if current["status"] == "success":

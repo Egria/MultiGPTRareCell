@@ -24,7 +24,7 @@ def code_fingerprint():
     module = Path(__file__).parent
     files = ("discovery.py", "run.py", "protocol.py", "science.py", "state.py", "providers.py",
              "config.py", "seed_review.py", "exhaustive.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py",
-             "contrast_panels.py", "singleton_markers.py", "pool_followup.py", "nb_mixture.py", "claim_resolution.py")
+             "contrast_panels.py", "singleton_markers.py", "pool_followup.py", "nb_mixture.py", "claim_resolution.py", "handoff.py")
     return fingerprint({name: hash_file(module / name) for name in files})
 
 
@@ -118,6 +118,8 @@ def obtain(ctrl, policy, turn, retry_unknown):
             raw, complete = "", False
             usage = getattr(exc, "usage", {"provider": "openai_compatible", "api_calls": 1})
     item = {"message_id": mid, "complete": complete, "raw": raw, "usage": usage, "context_hash": fingerprint(context)}
+    if context.get("requested_evidence") and complete:
+        item["delivered_receipts"] = [r["receipt_id"] for r in context["requested_evidence"]]
     s.put("Message", mid, item)
     return item
 
@@ -275,6 +277,20 @@ def process_message(ctrl, message, turn):
                                  peer=followup["peer"], shared_markers=followup["shared_markers"]))
             progress |= "query_key" in followup["result"]
     with s.transaction():
+        if not seed_batch and not pool_batch:
+            delivered = set(message.get("delivered_receipts", []))
+            pending = [rid for rid in s.get_meta("requested_receipts", []) if rid not in delivered]
+            focus = s.get_meta("recent_followup_ids", [])
+            for i, (command, result) in enumerate(zip(parsed, receipts)):
+                if result.get("pool_followup") and command.get("action") == "get_evidence":
+                    cid = result["pool_followup"]["candidate_id"]
+                    focus = [cid] + [entry for entry in focus if entry != cid]
+                if command.get("action") in SCIENTIFIC | {"get_evidence"} and "error" not in result:
+                    rid = "%s/%d" % (mid, i)
+                    if rid not in pending:
+                        pending.append(rid)
+            s.set_meta("recent_followup_ids", focus[:8])
+            s.set_meta("requested_receipts", pending)
         s.set_meta("receipts", receipts[-12:])
         s.set_meta("finished_turn", turn)
         stall_counter = "seed_review_stall" if seed_batch else "stall"
@@ -313,7 +329,7 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
     s.set_meta("policy", policy)
     status, detail = "partial", "max_agent_turns"
     review_limit = len(ctrl.seed_ids) + ctrl.budget["stall_turns"] if ctrl.exhaustive else 0
-    hard_limit = ctrl.budget["max_agent_turns"] + review_limit + (len(ctrl.pool_candidates) if ctrl.exhaustive else 0)
+    hard_limit = ctrl.budget["max_agent_turns"] + review_limit + (len(ctrl.pool_candidates) + len(ctrl.seed_ids) if ctrl.exhaustive and ctrl.labeled else 0)
     for turn in range(s.get_meta("finished_turn", 0) + 1, hard_limit + 1):
         mid = "%s:T%04d" % (s.get_meta("run_id"), turn)
         queue = []
@@ -476,6 +492,7 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
         else:
             status, detail = explore(ctrl, spec["policy"], pause_after, retry_unknown)
         if detail == "submitted":
+            coverage = pool_followup.coverage(ctrl) if ctrl.exhaustive and ctrl.labeled else {}
             exhausted = ctrl.active and s.usage()["new_queries"] >= ctrl.query_limit
             checked = {r["candidate_id"] for r in s.all("Investigation")}
             pending = any(c["initial"] and c["id"] not in checked for c in ctrl.candidates.values())
@@ -483,9 +500,9 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
                 status, detail = "partial", "submitted_with_blocked_prepare"
             elif astatus == "partial":
                 status, detail = "partial", "submitted_with_partial_annotations"
-            elif ctrl.exhaustive and ctrl.labeled and pool_followup.coverage(ctrl)["pending"]:
+            elif coverage.get("pending") or coverage.get("conflict_pending"):
                 status, detail = "partial", "submitted_with_pending_pool_followup"
-            elif ctrl.exhaustive and ctrl.labeled and pool_followup.coverage(ctrl)["blocked"]:
+            elif coverage.get("blocked") or coverage.get("conflict_blocked"):
                 status, detail = "partial", "submitted_with_blocked_pool_followup"
             elif s.get_meta("denied_budget", False) or (exhausted and pending):
                 status, detail = "partial", "submitted_after_budget_exhaustion"
