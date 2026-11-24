@@ -109,7 +109,7 @@ class Science:
             action = "expand_candidate"
         allowed = {
             "coexpress": {"members", "genes", "logic", "threshold", "layer"},
-            "compare_groups": {"members", "background", "genes", "layer"},
+            "compare_groups": {"members", "background", "genes", "layer", "pool_programs"},
             "expand_candidate": {"members", "background", "layer"},
         }
         if self.adaptive:
@@ -152,8 +152,54 @@ class Science:
         }
 
         if genes:
-            self._add_nb_splits(result, group, self._indices(background), genes)
+            outside = self._indices(background)
+            self._add_nb_splits(result, group, outside, genes)
+            if "pool_programs" in args:
+                self._measure_programs(result, group, outside, args["pool_programs"])
         return result
+
+    def _measure_programs(self, result, group, background, panels):
+        # The legacy unsigned panel can contain competing lineage markers. Only count
+        # enriched genes in its inferred support program and expose that selection.
+        positive = {r["gene_id"] for r in result["statistics"] if r["effect"] > 0}
+        rows = np.concatenate((group, background))
+        n = len(group)
+        curves, evidence = {}, {}
+        strata = None
+        if self.raw_counts is not None:
+            # Use raw library-size strata and standardize outside detection to the
+            # seed depth distribution on common, positive-depth support.
+            depth = self.library_sizes[rows]
+            strata = np.floor(np.log2(np.maximum(depth, 1))).astype(int)
+            strata[depth <= 0] = -1
+        union = sorted({g for genes in panels.values() for g in genes})
+        cols = [self.gene_index[g] for g in union]
+        # At most six genes per role. Read their columns together, never densify the RNA matrix.
+        hits = (self.data[:, cols][rows] > 0).toarray()
+        for name, panel in panels.items():
+            genes = [g for g in panel if name != "inferred_support" or g in positive]
+            counts = hits[:, [union.index(g) for g in genes]].sum(axis=1)
+            bins, curve = {}, []
+            for k in range(1, len(genes) + 1):
+                bins[str(k)] = self.cells[rows[counts == k]].tolist()
+                inside, outside = counts[:n] >= k, counts[n:] >= k
+                point = {"k": k, "seed_hits": int(inside.sum()), "outside_hits": int(outside.sum())}
+                if strata is not None:
+                    expected, covered = 0., 0
+                    for level in np.unique(strata[:n]):
+                        bg = strata[n:] == level
+                        if level >= 0 and bg.any():
+                            weight = int((strata[:n] == level).sum())
+                            covered += weight
+                            expected += weight * outside[bg].mean()
+                    point["depth_matched_outside_rate"] = round(expected / covered, 6) if covered else None
+                    point["matched_seed_depths_n"] = covered
+                curve.append(point)
+            curves[name] = {"status": "measured" if genes else "no_positive_genes", "genes": genes, "curve": curve}
+            evidence[name] = dict(curves[name], members_by_count=bins)
+        result["programs"] = evidence
+        result["summary"]["programs"] = curves
+        result["summary"]["depth_matching"] = "log2_library_size" if strata is not None else "raw_counts_unavailable"
 
     def _add_nb_splits(self, result, group, background, genes):
         path = self.snapshot / "raw.npz"

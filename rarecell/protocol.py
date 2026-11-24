@@ -54,6 +54,7 @@ SEED_DISPOSITIONS = _alias_map({"follow_up": ("investigate", "followup", "深入
                                 "defer": ("uncertain", "待定"), "decline": ("reject", "exclude", "排除")})
 
 FIELDS = _alias_map({
+    "preferred_candidate_ids": (), "intersect_candidate_ids": (), "seed_genes": (), "support_genes": (), "counter_genes": (), "program": (),
     "disposition": ("recommendation", "outcome", "结论"),
     "seed_id": (),
     "metric": (), "matched_evidence_id": (), "nb_high_gene": (), "min_detected": (), "exclude_candidate_ids": (), "reference_id": (),
@@ -90,19 +91,19 @@ SCOPES = {"candidate_id", "members", "scope"}
 BACKGROUNDS = {"background", "background_id"}
 ALLOWED = {
     "review_seed": {"candidate_id", "disposition", "reason", "evidence_ids"},
-    "investigate_pool": {"candidate_id", "genes", "min_detected", "reason"},
+    "investigate_pool": {"candidate_id", "genes", "seed_genes", "support_genes", "counter_genes", "min_detected", "reason"},
     "list_seed_reviews": {"offset", "limit"},
     "list_ontology_pools": {"offset", "limit"},
     "select_boundary": {"candidate_id", "reason"},
     "apply_boundary": {"candidate_id", "evidence_ids", "metric", "threshold", "reason"},
-    "preview_submission": {"candidate_ids", "candidate_id", "reference_id"},
+    "preview_submission": {"preferred_candidate_ids", "candidate_ids", "candidate_id", "reference_id"},
     "list_candidates": {"offset", "limit"},
     "get_evidence": {"candidate_id", "evidence_ids", "metric", "offset", "limit"},
     "compare_groups": SCOPES | BACKGROUNDS | {"genes", "layer", "evidence_ids"},
     "coexpress": SCOPES | {"min_detected", "genes", "logic", "threshold", "layer", "evidence_ids"},
     "expand_candidate": {"candidate_id", "background_mode"} | BACKGROUNDS | {"layer", "evidence_ids"},
-    "propose_revision": {"groups", "parents", "reason", "evidence_ids"},
-    "submit": {"candidate_ids", "reason", "evidence_ids", "status"},
+    "propose_revision": {"groups", "parents", "reason", "evidence_ids", "preferred_candidate_ids"},
+    "submit": {"preferred_candidate_ids", "candidate_ids", "reason", "evidence_ids", "status"},
 }
 
 
@@ -170,7 +171,7 @@ def _ids(value, key, *, allow_empty=False):
         raise ProtocolError(f"{key} requires an explicit ID or list")
     if any(not isinstance(item, str) or not item.strip() for item in value):
         raise ProtocolError(f"{key} contains an invalid ID")
-    return sorted(set(value))
+    return list(dict.fromkeys(value)) if key == "preferred_candidate_ids" else sorted(set(value))
 
 
 def _number(value, key, *, integer=False):
@@ -217,9 +218,11 @@ def _group(value):
         key = _field(raw)
         if key == "evidence_ids":
             clean = _ids(val, key, allow_empty=True)
-        elif key in {"members", "candidate_ids", "exclude_candidate_ids"}:
+        elif key in {"members", "candidate_ids", "exclude_candidate_ids", "intersect_candidate_ids"}:
             clean = _ids(val, key)
-        elif key in {"matched_evidence_id", "nb_high_gene"}:
+        elif key == "min_detected":
+            clean = _value(key, val)
+        elif key in {"matched_evidence_id", "nb_high_gene", "program"}:
             clean = _string(val, key)
         elif key == "candidate_id":
             key, clean = "candidate_ids", [_string(val, key)]
@@ -232,6 +235,9 @@ def _group(value):
         else:
             raise ProtocolError(f"unsupported group field: {key}")
         _merge(out, key, clean)
+    if {"program", "min_detected"} & out.keys():
+        if not {"program", "min_detected", "matched_evidence_id"} <= out.keys() or "nb_high_gene" in out:
+            raise ProtocolError("A program boundary needs program, min_detected and matched_evidence_id")
     if "nb_high_gene" in out and "matched_evidence_id" not in out:
         raise ProtocolError("nb_high_gene requires a matched_evidence_id")
     if not ({"members", "candidate_ids", "matched_evidence_id"} & out.keys()):
@@ -240,8 +246,10 @@ def _group(value):
 
 
 def _value(key, value):
-    if key in {"genes", "members", "background", "evidence_ids", "candidate_ids", "parents"}:
-        return _ids(value, key, allow_empty=key in {"evidence_ids", "candidate_ids", "parents"})
+    if key in {"seed_genes", "support_genes", "counter_genes"}:
+        return _ids(value, key, allow_empty=True)
+    if key in {"preferred_candidate_ids", "genes", "members", "background", "evidence_ids", "candidate_ids", "parents"}:
+        return _ids(value, key, allow_empty=key in {"evidence_ids", "candidate_ids", "parents", "preferred_candidate_ids"})
     if key == "disposition":
         return _choice(value, key, SEED_DISPOSITIONS)
     if key == "metric":
@@ -274,7 +282,8 @@ def _value(key, value):
 
 def _validate(action, args):
     present = args.keys()
-    if action == "investigate_pool" and not {"candidate_id", "genes", "reason"} <= present:
+    if action == "investigate_pool" and (not {"candidate_id", "reason"} <= present or
+                                       not any(args.get(k) for k in ("genes", "seed_genes", "support_genes"))):
         raise ProtocolError("investigate_pool needs the assigned pool, genes and reason")
     if action == "review_seed" and not {"candidate_id", "disposition", "reason"} <= present:
         raise ProtocolError("review_seed needs a seed candidate_id, disposition, and written reason")

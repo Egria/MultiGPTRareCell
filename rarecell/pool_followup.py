@@ -37,14 +37,12 @@ def prepare_batch(ctrl, mid):
     ctx = {"phase": "pool_follow_up", "mode": ctrl.mode, "prompt_version": ctrl.prompt, "contract": contract(),
            "species": ctrl.manifest.get("species"), "tissue": ctrl.manifest.get("tissue"),
            "population_size": len(ctrl.cells), "pools": [],
-           "actions": {"investigate_pool": "candidate_id, genes (1 to 6), reason; optional min_detected."},
-           "turn_instruction": "Return one investigate_pool per listed pool. Use its written questions and marker "
-           "panels to choose a discriminating test, including held-out genes when appropriate. Default: compare "
-           "this entire seed pool to all other cells on the named genes, including depth-adjusted NB splits when "
-           "raw counts exist. For dataset-wide co-detection instead, specify min_detected (how many panel genes "
-           "must be detected). Counts and exact memberships will be available in discovery. Labels are hypotheses."}
-    if not ctrl.adaptive:
-        ctx["turn_instruction"] += " For co-detection in this mode choose one required gene or require all panel genes."
+           "actions": {"investigate_pool": "candidate_id, reason, seed_genes, optional support_genes and counter_genes (up to six per role)."},
+           "turn_instruction": "Choose a discriminating seed_genes program from this pool's observed marker union, "
+           "including specific markers seen on different seeds. Name additional positive markers in support_genes "
+           "and competing-lineage genes in counter_genes. One local query measures contrast and all k-of-m joint "
+           "detection boundaries separately for each program. Inspect pool and outside hits, depth-matched background "
+           "when raw counts exist, and competing explanations. Existing genes/min_detected requests are also accepted."}
     for c, notes in todo[:size]:
         item = ctrl.pool_card(c)
         item["marker_seed_counts"] = dict(c["ontology_pool"]["marker_counts"][:48])
@@ -71,15 +69,56 @@ def run_query(ctrl, mid, args, *, fallback=False):
     if saved:
         return saved
     c = ctrl.candidate(cid)
-    if not 1 <= len(args["genes"]) <= 6:
-        raise ProtocolError("choose one to six genes for this pool")
-    genes = resolve_genes(args["genes"], ctrl.genes, species=ctrl.manifest.get("species"))
+    panels = {}
     k = args.get("min_detected")
-    params = {"genes": genes, "evidence_ids": c["evidence_ids"]}
+    role_fields = ("seed_genes", "support_genes", "counter_genes")
+    nominated = any(args.get(field) for field in role_fields)
+    if any(len(args.get(field, [])) > 6 for field in (*role_fields, "genes")):
+        raise ProtocolError("choose up to six genes per role")
+    def resolve(tokens):
+        return resolve_genes(tokens, ctrl.genes, species=ctrl.manifest.get("species")) if tokens else []
+    base = resolve(args.get("genes", []))
+    # A signed request already measures every cutoff, including a supplied hint.
+    if nominated:
+        k = None
     if k is None:
+        observed = dict(c["ontology_pool"]["marker_counts"])
+        for field in role_fields:
+            tokens = args.get(field, [])
+            if not tokens:
+                continue
+            panels[field[:-6]] = resolve(tokens)
+        if "seed" in panels:
+            known = set(observed)
+            genes_by_id = {r["gene_id"]: r.get("symbol") for r in ctrl.genes}
+            if any(g not in known and genes_by_id.get(g) not in known for g in panels["seed"]):
+                raise ProtocolError("seed_genes must come from this pool's marker union")
+        if not panels.get("seed"):
+            seed = []
+            for symbol in observed:
+                try:
+                    seed.extend(resolve([symbol]))
+                except ProtocolError:
+                    continue
+                if len(set(seed)) >= 6:
+                    break
+            if seed:
+                panels["seed"] = sorted(set(seed))
+        counter = set(panels.get("counter", []))
+        if counter.intersection(panels.get("support", [])) or counter.intersection(panels.get("seed", [])):
+            if args.get("seed_genes") or counter.intersection(panels.get("support", [])):
+                raise ProtocolError("Counter genes cannot also nominate positive support")
+            panels["seed"] = [g for g in panels["seed"] if g not in counter]
+        if base and "support" not in panels:
+            panels["inferred_support"] = sorted(set(base) - counter)
+        genes = sorted(set(base).union(*panels.values()))
+        if not genes:
+            raise ProtocolError("choose at least one measurable gene")
         action = "compare_groups"
-        params["candidate_id"] = cid
+        params = {"candidate_id": cid, "genes": genes, "pool_programs": panels, "evidence_ids": c["evidence_ids"]}
     else:
+        genes = base
+        params = {"genes": genes, "evidence_ids": c["evidence_ids"]}
         action = "coexpress"
         params["scope"] = "all"
         if k == len(genes) or k == 1:
@@ -91,8 +130,8 @@ def run_query(ctrl, mid, args, *, fallback=False):
     row = {"candidate_id": cid, "label": c["proposed_label"], "n_seeds": len(c["members"]),
            "source": "controller_fallback" if fallback else "discovery_agent", "reason": args["reason"],
            "message_id": mid, "action": action, "genes": genes}
-    if k is not None:
-        row["min_detected"] = k
+    if "min_detected" in args:
+        row["min_detected"] = args["min_detected"]
     try:
         obs = ctrl.scientific(action, params)
     except (QueryBlocked, BudgetExhausted) as exc:
@@ -104,7 +143,9 @@ def run_query(ctrl, mid, args, *, fallback=False):
             hits = data["matched_members"]
             row.update(n_matching=len(hits), matching_seeds=len(set(hits).intersection(c["members"])))
         else:
-            row.update(n_background=data["summary"]["n_background"], contrasts={})
+            row.update(n_background=data["summary"]["n_background"], contrasts={},
+                       programs=data["summary"].get("programs", {}), depth_matching=data["summary"].get("depth_matching"),
+                       seed_panel_source="agent" if args.get("seed_genes") else "pool_frequency_fallback")
             for stat in data.get("statistics", []):
                 gene = stat["gene_id"]
                 entry = {key: round(stat[key], 4) for key in ("effect", "fraction_query", "fraction_background")}
@@ -141,5 +182,13 @@ def finish_batch(ctrl, mid, batch):
                   "message_id": mid, "source": "controller_fallback", "error": "No unambiguous pool marker resolves."})
 
 
-def card(row):
-    return {k: v for k, v in row.items() if k not in {"query_key", "message_id", "reason"}}
+def card(row, compact=False):
+    item = {k: v for k, v in row.items() if k not in {"query_key", "message_id", "reason"}}
+    if compact and row.get("programs"):
+        # Keep the full counts in get_evidence, with a small all-cutoffs index in each turn.
+        item["programs"] = {name: {"genes": p["genes"], "seed_hits_by_k": [x["seed_hits"] for x in p["curve"]],
+                                   "outside_hits_by_k": [x["outside_hits"] for x in p["curve"]]}
+                            for name, p in row["programs"].items()}
+        item["contrasts"] = {g: {k: v for k, v in stat.items() if k in ("effect", "high_seeds", "high_outside")}
+                             for g, stat in row["contrasts"].items()}
+    return item

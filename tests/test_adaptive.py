@@ -143,7 +143,7 @@ def test_minimal_sparse_adaptive_seed_to_final_partition(tmp_path, three_views):
         assert rejected["candidates_reviewed"][0]["assigned_to_other"] == 8
         preview = act(ctrl, "preview_submission", candidate_ids=[small,*broad], candidate_id=small, reference_id=broad[0])
         item = preview["candidates_reviewed"][0]
-        assert preview["conflicted_cells"] == 8 and item["retained"] == 0
+        assert preview["conflicted_cells"] == 0 and item["retained"] == 8
         assert item["proposed_local"]["n"] == 4 and item["proposed_local"]["denominator"] == 80
         co = act(ctrl, "coexpress", genes=expansion["summary"]["positive_genes"], scope="all", logic="AND")
         groups = [{"matched_evidence_id":co["evidence_id"], "status":"provisional",
@@ -198,8 +198,9 @@ def test_adaptive_review_and_stall_submission(tmp_path, three_views, ending, exp
         if ending != "no_turn":
             assert phase == "paused" and set(ctrl.context(7)["actions"]) == {"submit", "propose_revision", "select_boundary"}
         assert ctrl.context(7)["recent_evidence_pages"][0]["offset"] == 0
-        with pytest.raises(ValueError, match="one boundary"):
-            act(ctrl, "submit", candidate_ids=[core["candidate_id"], wider["candidate_id"]])
+        preview = act(ctrl, "preview_submission", candidate_ids=[core["candidate_id"], wider["candidate_id"]])
+        assert preview["claim_resolution"]["retained"] == {core["candidate_id"]: 3, wider["candidate_id"]: 0}
+        assert preview["conflicted_cells"] == 0
     # Reopen SQLite so the draft and the comparison must survive a process boundary.
     ctrl = Controller(three_views, run, cache, cfg, ADAPTIVE_MODE)
     with closing(ctrl.state):
