@@ -52,25 +52,33 @@ run=$(mktemp -d "$task/discovery-routed.XXXXXX")
 
 流程先保留每颗 seed，并要求模型结合表达与提名逐颗判断名字是否可信。同一 Cell Ontology 编号下的提名只发起一次全局名字调查。模型在隔离上下文中只收到组织、物种、假设名字、细胞总数、工具说明及本次调查的问答。它可以选基因、查强度分布、比较多个表达边界、找群内富集基因，最后冻结确切成员和 0–100 的 RNA 支持分，也可以弃权。这个分数是模型的证据判断，未经概率校准。
 
-缺乏支持或未命名的 seed 各自从自己的成员和多视图检索结果开始外扩。即使 seed 本身身份存疑，已有注释中的具体名字仍可进入盲搜队列。使用双背景的历史注释时，邻居独有的提名也可进入。可选的顶层 YAML 列表 `potential_names` 可以提供额外假设。默认的 `routed_conflict_policy: single` 固定所有谱系提名后统一裁决。有交集且名字可靠的同义群可以合并。两个名字均可靠时，模型先只根据名字、组织和物种提出各类别的表达模块，也可以为具体的竞争类别另外指定判别基因，再根据每对候选的实测值判定争议细胞。至少一侧名字存疑时，直接比较两侧独有成员的表达重心。每个细胞只在原来提名它的候选间投票，多方循环平局依次比较各对几何支持度之和与稳定 ID。最终每个被提名的细胞恰有一个谱系归属。状态类提交可叠加于谱系分群，其成员可由 candidate ID 在 `candidate_members.tsv` 中查到。
+缺乏支持或未命名的 seed 各自从自己的成员和多视图检索结果开始外扩。即使 seed 本身身份存疑，已有注释中的具体名字仍可进入盲搜队列。使用双背景的历史注释时，邻居独有的提名也可进入。可选的顶层 YAML 列表 `potential_names` 可以提供额外假设。默认的 `routed_conflict_policy: single` 固定所有谱系提名后统一裁决。有交集且名字可靠的同义群可以合并。两个名字均可靠时，模型先只根据名字、组织和物种提出各类别的表达模块，也可以为具体的竞争类别另外指定判别基因，再根据每对候选的实测值判定争议细胞。至少一侧名字存疑时，直接比较两侧独有成员的表达重心。初次裁决只考虑已提名该细胞的候选，多方平局依次比较各对几何支持度之和与稳定 ID。最终每个被提名的细胞恰有一个谱系归属。状态类提交可叠加于谱系分群，其成员可由 candidate ID 在 `candidate_members.tsv` 中查到。
 
 `seed_routes.jsonl` 保存逐颗分流，`route_jobs.jsonl` 保存提名来源，`route_claims.jsonl` 保存成员规则、支持分及弃权，旧策略的 `route_resolutions.jsonl` 保存逐对裁决。强制单选的细胞级证据和每对投票保存在 `run_summary.json` 的 `forced_choice.artifact_ref` 所指文件。使用 `--routed-conflict-policy legacy` 可复现旧流程。`partition.tsv` 为最终分群。`budget.queries_per_route` 默认 8 次探索性表达查询；冻结成员与多视图检索也计入全局查询预算。复用旧 `settings.yaml` 时，显式指定上述预算可覆盖旧配置的较低上限。
 
-已有冻结候选和对应的模型复核记录时，下列命令可在新目录单独重算裁决。
+新运行的强制单选分三步完成。
+
+1. 模型根据名字和组织指出严格的父子关系，以及各候选所属的广义谱系。若父类在有可靠子类提名的细胞上胜出，程序移除父类，在其余候选间重新计票。可靠的跨谱系类别使用五折留出估计各表达模块的区分度。每一侧至少有三个训练细胞时，两个最强命中模块的平均对数富集差超过 ln(3) 才覆盖原始投票。
+2. 控制器在每个谱系任务已经测过的表达规则中查找同时覆盖核心细胞和未认领细胞的边界。复核卡列出匹配数量、被其他候选提名的数量、示例细胞，以及该次查询中基因在核心和新增成员的高表达数。模型可以接受整组、指定成员或搁置。有多个候选获准补收同一个细胞时，再单独裁决这些争议成员。原始计票与补查均有逐细胞记录。
+3. 在有原始计数的快照上，模型可以通过 `{"nb_high":"GENE"}` 查询本数据集带测序深度偏置项的负二项混合高表达成分。没有两成分支持时，该边界返回零个成员。在仅有线性表达量的快照上，可使用共表达或 Otsu 规则。具体基因及判别面板由当前任务提出。
+
+`run_summary.json` 的 `forced_choice` 列出父类让位细胞数、补查选项数、获准新增和新增争议细胞数。新运行将决定保存为 `forced_review_book.json`。下列命令在新目录按已保存的决定回放，无需重新调用模型。
 
 ```bash
 .venv/bin/rarecell reconcile-routed --run "$run" --snapshot "$task/snapshot" \
-  --review-book review_book.json --out "${run}.single"
+  --out "${run}.single"
 .venv/bin/rarecell evaluate --run "${run}.single" --gt "$gt" --out "${run}.single.evaluation"
 ```
 
-回放校验原任务、谱系成员和模型看到的表达摘要。持有匹配的原始 counts、genes、cells 与 dataset.yaml 时，也可使用 `--dataset` 替代 `--snapshot`。缺少原始 baseline 的导出仍支持提交分群评估。
+旧运行请显式提供与原策略对应的 `--review-book review_book.json`。回放校验原任务、谱系成员和模型看到的表达摘要。持有匹配的原始 counts、genes、cells 与 dataset.yaml 时，也可使用 `--dataset` 替代 `--snapshot`。缺少原始 baseline 的导出仍支持提交分群评估。
 
 如果 PR #24 的 `A3_routed` 在生成 `frozen.json` 之前报 `Expansion depth exhausted for this lineage`，更新到包含修复的代码后，在原目录执行 `.venv/bin/rarecell resume --run "$run"`。兼容升级保留已完成的回复与查询，升级前后的代码指纹和完成轮数记在 `run_summary.json` 的 `code_upgrade` 中。等 `jq -e '.submitted == true' "$run/run_summary.json"` 成功后，再评估该次提交。
 
 如果旧版本在 `pair/…` 边界复核报 `routed_action_blocked`，同一条 `resume` 命令也能打开原先标为不可续跑的冻结目录。旧导出留在 `history/`。模型可以一轮提交多个只读查询，再根据测量结果单独裁决。某一对反复返回无效动作时，控制器记录 `defer_to_submission`，继续检查其他候选。其余裁决预算用尽时，剩下的候选对同样交给现有的提交重叠规则。发生回退的提交标为 `provisional`；在 `run_summary.json` 用 `routing.reviews` 和 `routing.deferred_pairs` 分别检查模型裁决数和程序转交数。
 
 ## A3_adaptive：由模型选择稀有群成员边界
+
+当一个已测共表达查询同时命中候选核心与未认领细胞时，发现模型的上下文会列出 `unclaimed_evidence`。模型可在修订中引用 `evidence_ids`，用 `candidate_ids` 保留核心，以 `matched_evidence_id` 和 `unclaimed_only: true` 补入确切的未认领命中，也可以维持原边界。
 
 在 GUI「新建任务」的实验臂选择 **A3_adaptive · 模型选择稀有群边界**。已经完成准备和 OntoAnno 注释的任务可以选「从快照发现」，填写旧任务的 `snapshot`、`annotations` 和配置文件，再创建新任务。在 DCC 仓库根目录，命令行与 Slurm 的 `discover` 使用相同参数。例如，将变量指向已有任务，再运行：
 

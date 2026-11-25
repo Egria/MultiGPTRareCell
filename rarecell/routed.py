@@ -13,6 +13,7 @@ from .state import BudgetExhausted, IntegrityError, QueryBlocked
 RULES = (
     'A rule is "gene" (detected), ["gene",cutoff] (log1p expression >= cutoff), '
     '{"otsu":"gene"} (high side of a positive-expression Otsu split), {"k":[2,["A","B","C"]]}, '
+    '{"nb_high":"gene"} (local two-component negative-binomial high state on raw counts, empty if unsupported), '
     '{"all":[rules]}, {"any":[rules]} or {"not":rule}. {"scope":"alias"} is allowed only for listed scopes.'
 )
 TOOLS = {
@@ -243,7 +244,9 @@ class RoutedDiscovery:
             context["instruction"] = (
                 "Use biological knowledge to choose genes and evaluate competing explanations. "
                 "Compare expression intensity and joint detection across the whole sample, inspect neighboring cutoffs, "
-                "and check genes outside the selection rule. Freeze exact membership or abstain."
+                "and check genes outside the selection rule. Measure plausible alternate boundaries via views, including "
+                "with and without a competing-marker veto. On raw counts consider a local nb_high state. "
+                "Previously measured overlapping alternatives can be reviewed for unclaimed hits. Freeze exact membership or abstain."
             )
         if scopes:
             context["scopes"] = {k: len(v) for k, v in scopes.items()}

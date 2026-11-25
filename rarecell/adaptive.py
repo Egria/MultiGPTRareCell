@@ -53,6 +53,35 @@ def coexpression_members(ctrl, eid):
     return ctrl.state.read_artifact(ctrl.state.result_ref(key))["matched_members"]
 
 
+def unclaimed_coexpression(ctrl):
+    """Pair a saved group's core with exact, previously measured outside hits."""
+    observations = ctrl.state.all("CoexpressionHits")
+    if not observations:
+        return []
+    selected = set(ctrl.state.get_meta("selected", []))
+    occupied = {c for cid in selected for c in ctrl.candidate(cid)["members"]}
+    candidates = set(selected)
+    for review in ctrl.state.all("BoundaryReview"):
+        candidates.update(review[k]["candidate_id"] for k in ("requested", "wider") if k in review)
+    rows = []
+    for obs in observations:
+        hits = set(obs["members"])
+        unclaimed = hits - occupied
+        if not unclaimed:
+            continue
+        for cid in sorted(candidates):
+            core = set(ctrl.candidate(cid)["members"])
+            overlap = len(hits & core)
+            extra = sorted(unclaimed - core)
+            if overlap and extra:
+                rows.append(dict(candidate_id=cid, evidence_id=obs["evidence_id"], genes=obs["genes"],
+                                 min_detected=obs["min_detected"], threshold=obs["threshold"],
+                                 core_hits=overlap, n_hits=len(hits), n_unclaimed=len(extra),
+                                 other_claimed_hits=len(hits & (occupied - core)), examples=extra[:8]))
+    return sorted(rows, key=lambda v:(v["n_unclaimed"], v["other_claimed_hits"], -v["core_hits"],
+                                       v["evidence_id"], v["candidate_id"]))
+
+
 def program_members(ctrl, eid, name, k):
     ctrl.checked_evidence([eid])
     key = ctrl.state.get("Evidence", eid)["object"]

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from scipy import sparse
 
 from .config import fingerprint, hash_file, read_json, read_lines, write_json
-from .data import read_dataset
+from .data import digest, read_dataset, write_tsv
 from .discovery import rows
 from .finalize import jsonlines, tsv
 from .forced_routing import adjudicate
@@ -21,7 +21,11 @@ def replay(source, snapshot, dataset, book_path, out, cfg):
     summary = read_json(source / "run_summary.json")
     if summary["mode"] != "A3_routed" or not summary["submitted"]:
         raise ValueError("Expected a submitted routed source run")
+    book_path = book_path or source / "forced_review_book.json"
     book = read_json(book_path)
+    version = book.get("version", 1)
+    if version not in (1, 2):
+        raise ValueError("Unsupported forced review book version")
     if (book["snapshot_hash"] != summary["snapshot_hash"] or book["run_id"] != summary["run_id"]
             or book["route_claims_sha256"] != hash_file(source / "route_claims.jsonl")):
         raise ValueError("Review book does not match this frozen source")
@@ -51,14 +55,20 @@ def replay(source, snapshot, dataset, book_path, out, cfg):
             spec = yaml.safe_load(path.read_text())
             inputs = {key: hash_file(path.parent / spec[key]) for key in ("counts", "genes", "cells")}
             inputs["dataset"] = hash_file(path)
-            if book.get("input_sha256") != inputs:
+            if (version == 1 or "input_sha256" in book) and book.get("input_sha256") != inputs:
                 raise ValueError("Review book is not bound to these dataset files")
             ds = read_dataset(path, book["target_sum"])
             snap = Path(temp) / "expression"
             snap.mkdir()
-            sparse.save_npz(snap / "data.npz", ds.x, compressed=False)
-            tsv(snap / "cells.tsv", ds.cells[0].keys(), ds.cells)
-            tsv(snap / "genes.tsv", ds.genes[0].keys(), ds.genes)
+            sparse.save_npz(snap / "data.npz", ds.x, compressed=version == 2)
+            if ds.raw is not None:
+                sparse.save_npz(snap / "raw.npz", ds.raw, compressed=version == 2)
+            write_tsv(snap / "cells.tsv", ds.cells[0].keys(), ds.cells)
+            write_tsv(snap / "genes.tsv", ds.genes[0].keys(), ds.genes)
+            if version == 2:
+                files = {p.name: hash_file(p) for p in snap.iterdir()}
+                if digest([ds.info, files]) != summary["data_version"]:
+                    raise ValueError("Reconstructed expression differs from the frozen prepare data version")
             manifest = dict(ds.info, snapshot_hash=summary["snapshot_hash"])
             del ds
             baseline = source / "artifacts/baselines.tsv"
@@ -71,6 +81,12 @@ def replay(source, snapshot, dataset, book_path, out, cfg):
                              genes=rows(snap / "genes.tsv"), cells=cells, budget=cfg["budget"])
         returned = {}
         def answer(ctx, validate):
+            if version == 2:
+                reply = book["answers"].get(fingerprint(ctx))
+                if reply is None:
+                    raise ValueError("Measured review context differs from the archived review")
+                validate(reply)
+                return reply
             phase = ctx["phase"]
             if phase == "conflict_label_audit":
                 reply = {"reviews": {k: book["reviews"][k] for k in ctx["candidates"]}}
@@ -81,11 +97,20 @@ def replay(source, snapshot, dataset, book_path, out, cfg):
                 reply = {"rules": {k: book["rules"][k] for k in ctx["pairs"]}}
             validate(reply)
             return reply
-        result = adjudicate(ctrl, claims, answer)
+        queries = []
+        if version == 2:
+            ctrl.budget = dict(ctrl.budget, context_bytes=book["context_bytes"])
+            queries = list(read_lines(source / "route_measured_rules.jsonl"))
+            if fingerprint(queries) != book["evidence_queries_sha256"]:
+                raise ValueError("Measured rule ledger differs from archived source")
+        result = adjudicate(ctrl, claims, answer, queries, version)
+        returned = result["measurements"] if version == 2 else returned
         if (fingerprint(returned) != book["measurements_sha256"]
                 or fingerprint(result["frozen_claims"]) != book["members_sha256"]):
             raise ValueError("Measurements or original memberships changed since model review")
         assignments = {cell: group["id"] for group in result["groups"] for cell in group["members"]}
+        if version == 2 and fingerprint(result.get("unclaimed_conflicts", {})) != book["unclaimed_conflicts_sha256"]:
+            raise ValueError("Unclaimed conflicts differ from archived adjudication")
         if fingerprint(assignments) != book["assignments_sha256"]:
             raise ValueError("Final owners differ from the archived adjudication")
         artifacts = stage / "artifacts"

@@ -215,6 +215,25 @@ def export(ctrl, status, detail, policy, annotation_status):
             summary["forced_choice"] = dict(artifact_ref=forced_ref, n_claimed=detail_record["n_claimed"],
                                              comparisons=len(detail_record["pair_votes"]),
                                              n_wins_tied=detail_record["n_wins_tied"])
+            if detail_record["method"] == "routed_single_choice/2":
+                queries = detail_record["evidence_queries"]
+                route_files["route_measured_rules.jsonl"] = queries
+                jsonlines(run / "route_measured_rules.jsonl", queries)
+                answers = {r["context_ref"].split("/")[-1].split(".")[0]: r["reply"] for r in s.all("ForcedReview")}
+                owners = {c:g["id"] for g in detail_record["groups"] for c in g["members"]}
+                book = dict(version=2, target_sum=ctrl.manifest.get("prepare", {}).get("target_sum", 10000.),
+                            unclaimed_conflicts_sha256=fingerprint(detail_record.get("unclaimed_conflicts", {})),
+                            run_id=summary["run_id"], snapshot_hash=ctrl.snapshot_hash,
+                            route_claims_sha256=hash_file(run / "route_claims.jsonl"), answers=answers,
+                            context_bytes=ctrl.budget["context_bytes"], evidence_queries_sha256=fingerprint(queries),
+                            members_sha256=fingerprint(detail_record["frozen_claims"]),
+                            measurements_sha256=fingerprint(detail_record["measurements"]),
+                            assignments_sha256=fingerprint(owners))
+                write_json(run / "forced_review_book.json", book)
+                summary["forced_choice"].update(parent_fallback_cells=len(detail_record["parent_fallbacks"]),
+                    unclaimed_options=len(detail_record["unclaimed_reviews"]),
+                    unclaimed_accepted=detail_record["n_unclaimed_accepted"],
+                    unclaimed_competing=detail_record["n_unclaimed_competing"])
         resolutions = route_files["route_resolutions.jsonl"]
         deferred = sum(row["choice"] == "defer_to_submission" for row in resolutions)
         summary["routing"] = {"reviewed_seeds": len(route_files["seed_routes.jsonl"]),
@@ -232,6 +251,8 @@ def export(ctrl, status, detail, policy, annotation_status):
         files.append("pool_followups.jsonl")
     if ctrl.routed:
         files.extend(route_files)
+        if "route_measured_rules.jsonl" in route_files:
+            files.append("forced_review_book.json")
     files.extend(str(p.relative_to(run)) for p in sorted((run / "artifacts").glob("*")) if p.is_file())
     freeze = {"version": 1, "snapshot_hash": ctrl.snapshot_hash, "files": {name: hash_file(run / name) for name in files}}
     write_json(run / "frozen.json", freeze)

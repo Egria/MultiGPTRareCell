@@ -495,6 +495,23 @@ class Controller:
                 return False
             return True
         # Optional catalogue keys are added below even if their arrays are empty.
+        if self.adaptive:
+            offers = adaptive.unclaimed_coexpression(self)
+            if offers:
+                ctx["unclaimed_evidence"] = []
+                headroom = limit - 256
+                for offer in offers:
+                    if len(json_bytes(ctx)) + len(json_bytes(offer)) + 256 > headroom:
+                        break
+                    ctx["unclaimed_evidence"].append(offer)
+                    if len(json_bytes(ctx["unclaimed_evidence"])) > limit // 5:
+                        break
+                if ctx["unclaimed_evidence"]:
+                    ctx["turn_instruction"] += (" Review unclaimed_evidence before submission. To retain a core and add its "
+                        "supported unclaimed hits, cite the evidence_id in evidence_ids and revise with candidate_ids:[core], matched_evidence_id and unclaimed_only:true. "
+                        "Consider competing expression and defer nonspecific matches.")
+                else:
+                    del ctx["unclaimed_evidence"]
         delivered = handoff.requested(ctx, s, limit - 256)
         if "pool_followups" in ctx:
             handoff.directory(ctx, s, limit)
@@ -712,6 +729,11 @@ class Controller:
         if result.get("nb_diagnostics"):
             response["nb_high_counts"] = {g: {"high_foreground": d["high_foreground"], "high_background": d["high_background"]}
                                           for g, d in result["nb_diagnostics"].items() if "high_foreground" in d}
+        if self.adaptive and action == "coexpress" and result.get("matched_members"):
+            genes = bound["genes"]
+            minimum = bound.get("min_detected", len(genes) if bound.get("logic") == "AND" else 1)
+            self.state.put("CoexpressionHits", key, dict(evidence_id=eid, genes=genes,
+                           min_detected=minimum, threshold=bound["threshold"], members=result["matched_members"]))
         if action != "expand_candidate":
             return response
 
@@ -876,6 +898,9 @@ class Controller:
                         measured = adaptive.nb_high_members(self, matched, group["nb_high_gene"])
                     else:
                         measured = adaptive.coexpression_members(self, matched)
+                    if group.get("unclaimed_only"):
+                        occupied_now = {m for cid in self.state.get_meta("selected", []) for m in self.candidate(cid)["members"]}
+                        measured = set(measured) - occupied_now
                     member_set.update(measured)
                     measured_evidence.add(matched)
                 member_set |= explicit
