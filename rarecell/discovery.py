@@ -74,6 +74,10 @@ def observation_summary(result):
     return summary
 
 
+class ExpansionDepthExhausted(ValueError):
+    """The configured retrieval depth has already been spent."""
+
+
 class Controller:
     def __init__(self, snapshot, run, cache, cfg, mode, annotations=()):
         self.snapshot, self.run = Path(snapshot), Path(run)
@@ -586,6 +590,14 @@ class Controller:
             raise ValueError("Missing scope or unknown exact cell ID")
         return sorted(set(members))
 
+    def expansion_depth(self, candidate, roots, depths):
+        if self.routed and candidate["id"] in self.seed_ids and candidate["initial"]:
+            # An independent seed gets its own first retrieval. Older checkpoints
+            # already record exact anchor/query pairs, even when roots were shared.
+            return len({row["query_key"] for row in self.state.all("Investigation")
+                        if row["candidate_id"] == candidate["id"]})
+        return max((depths.get(root, 0) for root in roots), default=0)
+
     def scientific(self, action, args, *, conflict_slot=None):
         if not self.active:
             raise ValueError("New scientific queries are disabled in " + self.mode)
@@ -644,8 +656,8 @@ class Controller:
         if action == "expand_candidate":
             if c is None:
                 raise ValueError("Expansion needs an exact lineage anchor")
-            if signature not in seen and max(depths.get(r, 0) for r in self.lineage_roots(c)) >= self.depth_limit:
-                raise ValueError("Expansion depth exhausted for this lineage")
+            if signature not in seen and self.expansion_depth(c, self.lineage_roots(c), depths) >= self.depth_limit:
+                raise ExpansionDepthExhausted("Expansion depth exhausted for this lineage")
         def compute():
             if self.science is None:
                 self.science = Science(self.snapshot, self.cfg, adaptive=self.adaptive)
@@ -706,16 +718,16 @@ class Controller:
         roots = self.lineage_roots(c)
         depths = self.state.get_meta("depths", {})
         seen = self.state.get_meta("expansions", {})
-        depth = max(depths.get(r, 0) for r in roots)
+        depth = self.expansion_depth(c, roots, depths)
         if signature in seen:
             used_depth = max(depth, seen[signature])
         else:
             if depth >= self.depth_limit:
-                raise ValueError("Expansion depth exhausted for this lineage")
+                raise ExpansionDepthExhausted("Expansion depth exhausted for this lineage")
             used_depth = depth + 1
             seen[signature] = used_depth
         for root in roots:
-            depths[root] = used_depth
+            depths[root] = max(depths.get(root, 0), used_depth)
         self.state.set_meta("depths", depths)
         self.state.set_meta("expansions", seen)
         if result["added_members"]:

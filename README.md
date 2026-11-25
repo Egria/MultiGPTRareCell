@@ -56,6 +56,10 @@ run=$(mktemp -d "$task/discovery-routed.XXXXXX")
 
 `seed_routes.jsonl` 保存逐颗分流，`route_jobs.jsonl` 保存提名来源，`route_claims.jsonl` 保存成员规则、支持分及弃权，`route_resolutions.jsonl` 保存边界裁决。`partition.tsv` 为最终分群。`budget.queries_per_route` 默认 8 次探索性表达查询；冻结成员与多视图检索也计入全局查询预算。复用旧 `settings.yaml` 时，显式指定上述预算可覆盖旧配置的较低上限。
 
+如果 PR #24 的 `A3_routed` 在生成 `frozen.json` 之前报 `Expansion depth exhausted for this lineage`，更新到包含修复的代码后，在原目录执行 `.venv/bin/rarecell resume --run "$run"`。兼容升级保留已完成的回复与查询，升级前后的代码指纹和完成轮数记在 `run_summary.json` 的 `code_upgrade` 中。等 `jq -e '.submitted == true' "$run/run_summary.json"` 成功后，再评估该次提交。
+
+如果旧版本在 `pair/…` 边界复核报 `routed_action_blocked`，同一条 `resume` 命令也能打开原先标为不可续跑的冻结目录。旧导出留在 `history/`。模型可以一轮提交多个只读查询，再根据测量结果单独裁决。某一对反复返回无效动作时，控制器记录 `defer_to_submission`，继续检查其他候选。其余裁决预算用尽时，剩下的候选对同样交给现有的提交重叠规则。发生回退的提交标为 `provisional`；在 `run_summary.json` 用 `routing.reviews` 和 `routing.deferred_pairs` 分别检查模型裁决数和程序转交数。
+
 ## A3_adaptive：由模型选择稀有群成员边界
 
 在 GUI「新建任务」的实验臂选择 **A3_adaptive · 模型选择稀有群边界**。已经完成准备和 OntoAnno 注释的任务可以选「从快照发现」，填写旧任务的 `snapshot`、`annotations` 和配置文件，再创建新任务。在 DCC 仓库根目录，命令行与 Slurm 的 `discover` 使用相同参数。例如，将变量指向已有任务，再运行：
