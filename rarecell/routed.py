@@ -1,15 +1,14 @@
 """Seed triage, isolated expression searches and reconciliation of frozen memberships."""
 
 from itertools import combinations
-import json
 import math
 
 from . import providers
 from .config import fingerprint, json_bytes
 from .discovery import ExpansionDepthExhausted
-from .protocol import MAX_CHARS, _json_region, _trim_trailing_commas
+from .protocol import MAX_ACTIONS, MAX_CHARS, _decode, _materialize, _json_region, _trim_trailing_commas
 from .rule_search import ExpressionSearch
-from .state import BudgetExhausted, QueryBlocked
+from .state import BudgetExhausted, IntegrityError, QueryBlocked
 
 RULES = (
     'A rule is "gene" (detected), ["gene",cutoff] (log1p expression >= cutoff), '
@@ -53,14 +52,25 @@ def support_score(value):
 def response(raw):
     if len(raw) > MAX_CHARS:
         raise ValueError("Model action too large")
-    data = json.loads(_trim_trailing_commas(_json_region(raw)))
+    data = _materialize(_decode(_trim_trailing_commas(_json_region(raw))))
     if isinstance(data, dict) and set(data) == {"actions"}:
         data = data["actions"]
-    if isinstance(data, list) and len(data) == 1:
-        data = data[0]
-    if not isinstance(data, dict):
-        raise ValueError("Return one JSON action object")
-    return data
+    items = data if isinstance(data, list) else [data]
+    if not 1 <= len(items) <= MAX_ACTIONS or not all(isinstance(item, dict) for item in items):
+        raise ValueError("Supply one action object or a nonempty list of query objects")
+    for item in items:
+        for wrapper in ("args", "arguments"):
+            if wrapper in item:
+                args = item.pop(wrapper)
+                if not isinstance(args, dict) or item.keys() & args.keys() or {"action", "op", "operation"} & args.keys():
+                    raise ValueError("Action arguments must be an object with unambiguous fields")
+                item.update(args)
+        names = [item[key] for key in ("action", "op", "operation") if key in item]
+        if names:
+            if not all(isinstance(name, str) and name == names[0] for name in names):
+                raise ValueError("Specify a single unambiguous action name")
+            item["action"] = names[0]
+    return items[0] if len(items) == 1 else items
 
 
 class RoutedDiscovery:
@@ -275,20 +285,26 @@ class RoutedDiscovery:
             return None, self.triage_context(pending)
         frozen = {r["job"] for r in self.s.all("RouteFreeze")}
         job = next((j for j in self.jobs() if j["id"] not in frozen), None)
-        if job is None:
-            reviewed = {r["job"] for r in self.s.all("RouteResolution")}
-            for a, b in combinations(sorted(self.s.get_meta("route_active", [])), 2):
-                jid = "pair/" + a + "/" + b
-                if jid in reviewed:
-                    continue
-                left, right = self.ctrl.candidate(a), self.ctrl.candidate(b)
-                same = label(left["proposed_label"]) and self.key(left["proposed_label"]) == self.key(
-                    right["proposed_label"]
-                )
-                if same or not set(left["members"]).isdisjoint(right["members"]):
-                    job = dict(id=jid, kind="pair", name="Compare submitted boundaries", parents=[a, b])
-                    break
-        return job, None
+        return job or next(self.pending_pairs(), None), None
+
+    def pending_pairs(self):
+        reviewed = {r["job"] for r in self.s.all("RouteResolution")}
+        for a, b in combinations(sorted(self.s.get_meta("route_active", [])), 2):
+            jid = "pair/" + a + "/" + b
+            if jid in reviewed:
+                continue
+            left, right = self.ctrl.candidate(a), self.ctrl.candidate(b)
+            same = label(left["proposed_label"]) and self.key(left["proposed_label"]) == self.key(right["proposed_label"])
+            if same or not set(left["members"]).isdisjoint(right["members"]):
+                yield dict(id=jid, kind="pair", name="Compare submitted boundaries", parents=[a, b])
+
+    def defer_pair(self, job, reason, mid=None):
+        # Keep both original versions active. Final assignment will use the normal
+        # overlap policy on the surviving drafts; no new biological decision is inferred.
+        self.s.put("RouteResolution", job["id"], dict(
+            job=job["id"], choice="defer_to_submission", source="controller", reason=reason,
+            message_id=mid, retained=job["parents"],
+        ))
 
     def measured(self, req, scopes):
         op = req["action"]
@@ -368,7 +384,7 @@ class RoutedDiscovery:
         a, b = self.ctrl.candidate(left), self.ctrl.candidate(right)
         evidence = sorted(set(a["evidence_ids"] + b["evidence_ids"]))
         basis = dict(
-            job=job["id"],
+            job=job["id"], source="discovery_agent",
             choice=choice,
             reason=why,
             message_id=mid,
@@ -442,6 +458,9 @@ class RoutedDiscovery:
         return dict(action="resolve", retained=chosen)
 
     def apply(self, job, ctx, scopes, req, mid):
+        if isinstance(req, list):
+            self.apply_query_batch(job, ctx, scopes, req, mid)
+            return
         op = req.get("action", req.get("op"))
         if not isinstance(op, str) or op not in ctx["actions"]:
             raise ValueError("Choose a listed action for the current task")
@@ -490,6 +509,30 @@ class RoutedDiscovery:
             with self.s.transaction():
                 self.complete_turn(mid, self.resolve(job, req, scopes, splits, mid, split_keys))
 
+    def apply_query_batch(self, job, ctx, scopes, items, mid):
+        ops = [item.get("action", item.get("op")) for item in items]
+        if not all(isinstance(op, str) and op in ctx["actions"] for op in ops):
+            raise ValueError("Every item must use a listed action for this task")
+        queries = items[:-1] if ops[-1] in {"resolve", "freeze"} else items
+        if not queries or any(op not in TOOLS for op in ops[:len(queries)]):
+            raise ValueError("Send one decision per reply. Only read-only queries can be batched.")
+        room = min(ctx["remaining_queries"], self.ctrl.budget["max_actions_per_turn"])
+        if not room:
+            raise ValueError("No queries remaining; send one decision")
+        exchanges = []
+        for item, op in zip(queries[:room], ops):
+            request = dict(item, action=op)
+            result, key = self.measured(request, scopes)
+            exchanges.append(dict(request=request, response=result, query_key=key))
+        deferred = ops[len(exchanges):]
+        if deferred:
+            exchanges[-1]["not_executed"] = deferred
+        with self.s.transaction():
+            for i, exchange in enumerate(exchanges):
+                self.s.put("RouteExchange", f"{mid}/{i}", dict(job=job["id"], exchange=exchange))
+            self.complete_turn(mid, dict(action="query_batch", query_keys=[e["query_key"] for e in exchanges],
+                                         not_executed=deferred))
+
     def complete_turn(self, mid, receipt):
         self.s.put(
             "Receipt",
@@ -510,24 +553,30 @@ class RoutedDiscovery:
             job, ctx = self.next_task()
             if job is None and ctx is None:
                 with self.s.transaction():
-                    self.ctrl.decide(
-                        "submit",
-                        dict(
-                            candidate_ids=self.s.get_meta("route_active", []),
-                            reason="Publish independently frozen lineages after review of overlap and same-name fragments.",
-                        ),
-                        None,
-                    )
+                    deferred = any(r["choice"] == "defer_to_submission" for r in self.s.all("RouteResolution"))
+                    args = dict(candidate_ids=self.s.get_meta("route_active", []),
+                                reason="Publish frozen lineages after boundary review.")
+                    if deferred:
+                        args.update(status="provisional", reason="Apply the existing overlap policy to surviving drafts, including pairs deferred by the controller.")
+                    self.ctrl.decide("submit", args, None, source="controller_routed" if deferred else "agent")
                 return "complete", "submitted"
             turn = self.s.get_meta("finished_turn", 0) + 1
             mid = f"{self.s.get_meta('run_id')}:T{turn:04d}"
+            stopping = None
             if turn > budget["max_agent_turns"]:
-                self.s.set_meta("current_issue", "Routed tasks pending; total turn budget reached")
-                return "partial", "routed_turn_budget"
-            if budget.get("max_reported_tokens") and self.s.get_optional("Message", mid) is None:
+                stopping = "routed_turn_budget"
+            elif budget.get("max_reported_tokens") and self.s.get_optional("Message", mid) is None:
                 counts = [m["usage"].get("total_tokens") for m in self.s.all("Message")]
                 if any(v is None for v in counts) or sum(counts) >= budget["max_reported_tokens"]:
-                    return "partial", "token_usage_unreported" if None in counts else "max_reported_tokens"
+                    stopping = "token_usage_unreported" if None in counts else "max_reported_tokens"
+            if stopping:
+                if job and job["kind"] == "pair":
+                    with self.s.transaction():
+                        for pair in self.pending_pairs():
+                            self.defer_pair(pair, stopping)
+                    continue
+                self.s.set_meta("current_issue", "Routed tasks pending: " + stopping)
+                return "partial", stopping
             scopes = {}
             if job:
                 try:
@@ -547,6 +596,9 @@ class RoutedDiscovery:
             while len(json_bytes(ctx)) > budget["context_bytes"] and ctx.get("history"):
                 ctx["history"].pop(0)
             if len(json_bytes(ctx)) > budget["context_bytes"]:
+                if job and job["kind"] == "pair":
+                    self.defer_pair(job, "Pair context exceeds context_bytes")
+                    continue
                 self.s.set_meta("current_issue", "One routed task exceeds budget.context_bytes")
                 return "partial", "context_blocked"
             try:
@@ -559,17 +611,29 @@ class RoutedDiscovery:
                     raise ValueError("Incomplete reply; send one complete JSON action")
                 self.apply(job, ctx, scopes, response(msg["raw"]), mid)
             except BudgetExhausted as exc:
-                self.s.set_meta("current_issue", str(exc))
-                return "partial", "routed_query_budget"
+                if job and job["kind"] == "pair":
+                    with self.s.transaction():
+                        self.defer_pair(job, str(exc), mid)
+                        self.complete_turn(mid, dict(action="defer_to_submission", reason=str(exc)))
+                else:
+                    self.s.set_meta("current_issue", str(exc))
+                    return "partial", "routed_query_budget"
+            except IntegrityError:
+                raise
             except (ValueError, KeyError, TypeError, RecursionError) as exc:
                 self.ctrl._load_candidates()  # Roll back any speculative in-memory revision.
                 error = str(exc)[:300]
+                failures = last["attempts"] + 1 if last and last["task"] == task else 1
+                exhausted = failures >= max(2, budget["stall_turns"])
+                defer = exhausted and job is not None and job["kind"] == "pair"
                 with self.s.transaction():
-                    self.complete_turn(mid, dict(error=error, status="needs_clarification"))
-                    failures = last["attempts"] + 1 if last and last["task"] == task else 1
-                    self.s.set_meta("route_last_error", dict(task=task, error=error, attempts=failures))
+                    self.complete_turn(mid, dict(error=error, status="deferred" if defer else "needs_clarification"))
                     self.s.set_meta("action_errors", self.s.get_meta("action_errors", 0) + 1)
-                if failures >= max(2, budget["stall_turns"]):
+                    if defer:
+                        self.defer_pair(job, error, mid)
+                    else:
+                        self.s.set_meta("route_last_error", dict(task=task, error=error, attempts=failures))
+                if exhausted and not defer:
                     self.s.set_meta("current_issue", f"Routed task {task}: {error}")
                     return "partial", "routed_action_blocked"
             if pause_after is not None and turn >= pause_after:

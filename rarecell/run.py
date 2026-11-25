@@ -444,7 +444,7 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
     migrate = False
     if old_code != code and resumed and spec["mode"] == ROUTED_MODE and spec["policy"] == "live":
         compatible = read_json(RESOURCES / "routed_checkpoint_upgrade.json")
-        migrate = (old_code == compatible["from"] and code == compatible["to"]
+        migrate = (old_code in [compatible["from"], *compatible.get("also_from", [])] and code == compatible["to"]
                    and (run / "state.sqlite").is_file() and not (run / ".publishing.json").exists())
     if (fingerprint(cfg) != spec["cfg_hash"] or fingerprint(contract()) != spec["contract_hash"]
             or spec["software"] != __version__ or (old_code != code and not migrate)):
@@ -460,7 +460,10 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
         if any(hash_file(run / f) != h for f, h in frozen["files"].items()):
             raise ValueError("Frozen run checksum mismatch")
         previous = read_json(run / "run_summary.json")
-        if not previous["resumable"]:
+        retry_blocked_pair = (resumed and spec["mode"] == ROUTED_MODE and spec["policy"] == "live"
+                              and previous["detail"] == "routed_action_blocked" and not previous["submitted"]
+                              and (previous.get("issue") or "").startswith("Routed task pair/"))
+        if not previous["resumable"] and not retry_blocked_pair:
             return previous
         retain_freeze(run, frozen)
     ann, astatus, annotation_detail = [], "disabled_by_mode", ""
@@ -497,11 +500,13 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
             s.set_meta("annotation_hash", annotation_hash)
         if migrate:
             upgrade = {"from": old_code, "to": code, "after_turn": s.get_meta("finished_turn", 0)}
-            spec = dict(spec, code_sha256=code, code_upgrade=upgrade)
+            history = spec.get("code_upgrades", [spec["code_upgrade"]] if spec.get("code_upgrade") else [])
+            spec = dict(spec, code_sha256=code, code_upgrade=upgrade, code_upgrades=[*history, upgrade])
             write_json(run / "checkpoint.json", spec)
-        if spec.get("code_upgrade") and not s.get_meta("code_upgrade"):
+        if spec.get("code_upgrade") and s.get_meta("code_upgrade") != spec["code_upgrade"]:
             with s.transaction():
                 s.set_meta("code_upgrade", spec["code_upgrade"])
+                s.set_meta("code_upgrades", spec.get("code_upgrades", [spec["code_upgrade"]]))
                 s.event("checkpoint_upgraded", spec["code_upgrade"])
         if publishing.exists():
             pending = read_json(publishing)
@@ -534,6 +539,8 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
                 status, detail = "partial", "submitted_with_blocked_prepare"
             elif astatus == "partial":
                 status, detail = "partial", "submitted_with_partial_annotations"
+            elif ctrl.routed and s.get_meta("submission_source") == "controller_routed":
+                status, detail = "partial", "submitted_with_deferred_pairs"
             elif coverage.get("pending") or coverage.get("conflict_pending") or coverage.get("guided_pending"):
                 status, detail = "partial", "submitted_with_pending_pool_followup"
             elif ctrl.exhaustive and exhaustive.coverage(ctrl)["named_seed_assessments"].get("unassessed"):

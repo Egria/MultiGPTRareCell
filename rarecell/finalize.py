@@ -168,6 +168,7 @@ def export(ctrl, status, detail, policy, annotation_status):
                        n_expanded_seeds=sum(seed["candidate_id"] in investigated for seed in seeds))
     if s.get_meta("code_upgrade"):
         summary["code_upgrade"] = s.get_meta("code_upgrade")
+        summary["code_upgrades"] = s.get_meta("code_upgrades", [summary["code_upgrade"]])
     if s.get_meta("closeout_trigger"):
         summary["closeout_trigger"] = s.get_meta("closeout_trigger")
     if ctrl.adaptive or policy == "live":
@@ -208,10 +209,13 @@ def export(ctrl, status, detail, policy, annotation_status):
                        "route_claims.jsonl": s.all("RouteFreeze"), "route_resolutions.jsonl": s.all("RouteResolution")}
         for name, data in route_files.items():
             jsonlines(run / name, data)
+        resolutions = route_files["route_resolutions.jsonl"]
+        deferred = sum(row["choice"] == "defer_to_submission" for row in resolutions)
         summary["routing"] = {"reviewed_seeds": len(route_files["seed_routes.jsonl"]),
                               "name_searches": sum(j["kind"] == "name" for j in route_files["route_jobs.jsonl"]),
                               "seed_searches": sum(j["kind"] == "seed" for j in route_files["route_jobs.jsonl"]),
-                              "frozen": len(route_files["route_claims.jsonl"]), "reviews": len(route_files["route_resolutions.jsonl"])}
+                              "frozen": len(route_files["route_claims.jsonl"]),
+                              "reviews": len(resolutions) - deferred, "deferred_pairs": deferred}
     write_json(run / "run_summary.json", summary)
     files = ["run_summary.json", "usage.json", "manifest.json", "config_resolved.yaml", "project_contract.yaml",
              "partition.tsv", "groups.tsv", "conflicts.jsonl", "candidate_tasks.tsv", "candidate_members.tsv", "candidates.jsonl", "seeds.tsv",

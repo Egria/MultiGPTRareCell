@@ -135,7 +135,7 @@ def test_public_route_resume_and_blinding(tmp_path, monkeypatch):
     assert paused["resumable"] and not paused["submitted"]
     result = resume(run)
     assert result["submitted"] and result["routing"] == dict(
-        reviewed_seeds=4, name_searches=3, seed_searches=3, frozen=6, reviews=1
+        reviewed_seeds=4, name_searches=3, seed_searches=3, frozen=6, reviews=1, deferred_pairs=0
     )
     assert sorted(blind) == ["Glia", "New state", "Other"]
     assert not any(
@@ -274,7 +274,7 @@ def test_resume_legacy_depth_crash_without_repeating_model_turns(tmp_path, monke
         release.setattr(runner, "code_fingerprint", lambda: code_pair["to"])
         summary = resume(run)
     assert summary["submitted"] and summary["status"] == "complete"
-    assert summary["code_upgrade"] == dict(code_pair, after_turn=old_turn)
+    assert summary["code_upgrade"] == {"from": code_pair["from"], "to": code_pair["to"], "after_turn": old_turn}
     assert read_json(run / "checkpoint.json")["code_sha256"] == code_pair["to"]
     assert sorted(label for phase, label in calls if phase == "seed_expansion") == ["a", "c", "d", "f"]
     assert len(calls) == len(set(calls))
@@ -310,3 +310,116 @@ def test_routed_zero_depth_keeps_seed_available_for_expression(tmp_path, monkeyp
     summary = discover(snap, run, cache, cfg, annotations=ann_dir)
     assert summary["submitted"] and sorted(reviewed) == ["a", "c", "d", "f"]
     assert summary["n_expanded_seeds"] == 0 and (run / "frozen.json").exists()
+
+
+def overlap_reply(ctx):
+    if ctx["phase"] == "seed_triage":
+        return dict(action="route_seeds", reviews=[
+            dict(candidate_id=s["candidate_id"], guide_label="L", reliability="supported", reason="Measured seed")
+            for s in ctx["seeds"]])
+    if ctx["phase"] == "blind_name_search":
+        return dict(action="freeze", rule={"L": ["G", 3], "M": "H"}[ctx["target"]],
+                    support=70, reason="Freeze exact expression boundary")
+    raise AssertionError(ctx["phase"])
+
+
+@pytest.mark.parametrize("stop", ["bad_decisions", "turn_budget"])
+def test_deferred_pair_uses_normal_submission_policy(tmp_path, monkeypatch, stop):
+    cfg, snap, ann_dir, _ = setup_input(tmp_path)
+    cfg["potential_names"] = ["L", "M"]
+    if stop == "turn_budget":
+        cfg["budget"]["max_agent_turns"] = 3
+    monkeypatch.setattr("rarecell.run.verify_annotation", lambda *a, **k: [])
+    pair_calls = []
+
+    def reply(ctx, cfg):
+        if ctx["phase"] == "boundary_review":
+            pair_calls.append(ctx)
+            req = [dict(action="resolve", choice=side, reason="Conflicting decisions") for side in ["left", "right"]]
+        else:
+            req = overlap_reply(ctx)
+        return json.dumps(req), {"api_calls": 1, "total_tokens": 10}
+
+    monkeypatch.setattr(providers, "complete", reply)
+    run = tmp_path / "run"
+    out = discover(snap, run, tmp_path / "cache", cfg, annotations=ann_dir)
+    assert out["submitted"] and out["submission_status"] == "provisional"
+    assert out["submission_source"] == "controller_routed" and out["detail"] == "submitted_with_deferred_pairs"
+    assert out["routing"]["reviews"] == 0 and out["routing"]["deferred_pairs"] == 1
+    assert len(pair_calls) == (0 if stop == "turn_budget" else cfg["budget"]["stall_turns"])
+    resolution, = read_lines(run / "route_resolutions.jsonl")
+    assert resolution["source"] == "controller" and len(resolution["retained"]) == 2
+    with (run / "partition.tsv").open() as stream:
+        cells = {r["cell_id"]: r for r in csv.DictReader(stream, delimiter="\t")}
+    assert cells["b"]["proposed_label"] == "L" and cells["a"]["status"] == "unresolved"
+    assert all(cells[c]["proposed_label"] == "M" for c in "cdef")
+
+
+def test_resume_blocked_pair_preserves_freeze_and_old_decisions(tmp_path, monkeypatch):
+    from rarecell import run as runner
+    from rarecell.config import RESOURCES, hash_file
+    from rarecell.evaluation import evaluate
+    from rarecell.state import State
+
+    cfg, snap, ann_dir, _ = setup_input(tmp_path)
+    cfg["potential_names"] = ["L", "M"]
+    monkeypatch.setattr(runner, "verify_annotation", lambda *a, **k: [])
+    calls = []
+    def reply(ctx, cfg):
+        calls.append(ctx["phase"])
+        if ctx["phase"] != "boundary_review":
+            req = overlap_reply(ctx)
+        elif not ctx["history"]:
+            req = {"actions": [dict(operation="survey", arguments={"genes":["G"]}), dict(action="views", rules=[{"scope":"shared"}], genes=["H"]),
+                               dict(action="resolve", choice="left", reason="Premature decision")]}
+        else:
+            assert len(ctx["history"]) == 2 and ctx["history"][-1]["not_executed"] == ["resolve"]
+            req = dict(action="resolve", choice="right", reason="Use measured flank")
+        return json.dumps(req), {"api_calls": 1, "total_tokens": 10}
+
+    monkeypatch.setattr(providers, "complete", reply)
+    code = read_json(RESOURCES / "routed_checkpoint_upgrade.json")
+    old = code["also_from"][0]
+    run, cache = tmp_path / "run", tmp_path / "cache"
+    # PR25 persisted this failure as a terminal partial export. Use the same
+    # serialization path, then exercise the public resume command against it.
+    def old_apply(self, job, ctx, scopes, req, mid):
+        if job and job["kind"] == "pair":
+            raise ValueError("Return one JSON action object")
+        return normal_apply(self, job, ctx, scopes, req, mid)
+    normal_apply = RoutedDiscovery.apply
+    with monkeypatch.context() as legacy:
+        legacy.setattr(runner, "code_fingerprint", lambda: old)
+        legacy.setattr(RoutedDiscovery, "apply", old_apply)
+        old_loop = RoutedDiscovery.run
+        def legacy_loop(self, obtain, pause_after, retry_unknown):
+            # Pause just after a rejected response, then export using the old terminal detail.
+            status, _ = old_loop(self, obtain, 4, retry_unknown)
+            failed = self.s.get_meta("route_last_error")
+            self.s.set_meta("current_issue", "Routed task " + failed["task"] + ": " + failed["error"])
+            return status, "routed_action_blocked"
+        legacy.setattr(RoutedDiscovery, "run", legacy_loop)
+        before = discover(snap, run, cache, cfg, annotations=ann_dir)
+    assert not before["submitted"] and not before["resumable"]
+    digest = hash_file(run / "frozen.json")
+    # Record the same earlier depth upgrade present on DCC.
+    previous = {"from":code["from"], "to":old, "after_turn":1}
+    checkpoint = read_json(run / "checkpoint.json")
+    write_json(run / "checkpoint.json", dict(checkpoint, code_upgrade=previous))
+    with closing(State(run, cache)) as state:
+        state.set_meta("code_upgrade", previous)
+        old_messages = state.all("Message")
+    old_count = len(calls)
+    with monkeypatch.context() as release:
+        release.setattr(runner, "code_fingerprint", lambda: code["to"])
+        after = resume(run)
+    assert calls[old_count:] == ["boundary_review", "boundary_review"]
+    assert after["submitted"] and after["routing"]["reviews"] == 1 and after["routing"]["deferred_pairs"] == 0
+    assert after["code_upgrades"] == [previous, {"from":old, "to":code["to"], "after_turn":4}]
+    assert hash_file(run / "history" / digest / "frozen.json") == digest
+    with closing(State(run, cache)) as state:
+        assert state.all("Message")[:len(old_messages)] == old_messages
+        assert len(state.all("RouteExchange")) == 2 and len(state.all("RouteResolution")) == 1
+    gt = tmp_path / "gt.tsv"
+    gt.write_text("cell_id\tlabel\n" + "".join(f"{c}\tX\n" for c in "abcdef"))
+    assert evaluate(run, gt, tmp_path / "scores")["submitted_partition"]["n_cells"] == 6
