@@ -90,9 +90,11 @@ def _verified(run):
     manifest_path = run / "frozen.json"
     if not _inside(manifest_path.resolve(), run):
         raise ValueError("Freeze manifest resolves outside discovery run")
-    if not manifest_path.is_file():
-        raise ValueError(f"Discovery has not exported frozen.json in {run}. Complete or resume discovery before evaluation.")
-    frozen = _json(manifest_path)
+    try:
+        frozen = _json(manifest_path)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(exc.errno, "Complete or resume discovery to export frozen.json before evaluation",
+                                str(manifest_path)) from None
     files = frozen["files"]
     required = {"partition.tsv", "candidates.jsonl", "candidate_members.tsv",
                 "usage.json", "run_summary.json", "artifacts/baselines.tsv"}

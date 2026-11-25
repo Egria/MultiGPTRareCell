@@ -255,7 +255,7 @@ def test_resume_legacy_depth_crash_without_repeating_model_turns(tmp_path, monke
             discover(snap, run, cache, cfg, annotations=ann_dir)
     assert ("seed_expansion", "a") in calls and ("seed_expansion", "c") not in calls
     assert not (run / "frozen.json").exists()
-    with pytest.raises(ValueError, match="resume discovery"):
+    with pytest.raises(FileNotFoundError, match="resume discovery"):
         evaluate(run, tmp_path / "gt.tsv", tmp_path / "scores")
     with closing(State(run, cache)) as state:
         messages = state.all("Message")
