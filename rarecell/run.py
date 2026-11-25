@@ -11,9 +11,9 @@ from pathlib import Path
 
 import yaml
 
-from . import __version__, exhaustive, pool_followup, expansion_review, providers
+from . import routed, __version__, exhaustive, pool_followup, expansion_review, providers
 from .annotation import verify_annotation
-from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, RESOURCES, atomic, contract, fingerprint, hash_file, read_json, validate_settings, write_json
+from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, ROUTED_MODE, RESOURCES, atomic, contract, fingerprint, hash_file, read_json, validate_settings, write_json
 from .discovery import Controller, SCIENTIFIC, prompt_version
 from .finalize import export
 from .prepare import verify_snapshot
@@ -24,7 +24,7 @@ def code_fingerprint():
     module = Path(__file__).parent
     files = ("discovery.py", "run.py", "protocol.py", "science.py", "state.py", "providers.py",
              "config.py", "seed_review.py", "exhaustive.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py",
-             "contrast_panels.py", "singleton_markers.py", "pool_followup.py", "nb_mixture.py", "claim_resolution.py", "handoff.py", "expansion_review.py")
+             "contrast_panels.py", "singleton_markers.py", "pool_followup.py", "nb_mixture.py", "claim_resolution.py", "handoff.py", "expansion_review.py", "routed.py", "rule_search.py")
     return fingerprint({name: hash_file(module / name) for name in files})
 
 
@@ -35,6 +35,8 @@ def disjoint(a, b):
 def new_spec(snapshot, run, cache, annotations, cfg, mode, policy, replication_id):
     if cfg.get("exhaustive_seed_review") and (policy != "live" or mode not in ACTIVE_MODES):
         raise ValueError("Exhaustive seed review requires live A2, A3, or A3_adaptive")
+    if mode == ROUTED_MODE and policy != "live":
+        raise ValueError("A3_routed requires live discovery")
     if policy not in {"live", "fixed", "scripted_demo"}:
         raise ValueError("Unknown policy")
     if policy == "fixed" and mode != "A3":
@@ -83,13 +85,14 @@ def offline_message(ctrl, strategy, turn):
                        "reason": "Submit threshold-qualified expansions. Competing assignments remain unresolved."})
 
 
-def obtain(ctrl, policy, turn, retry_unknown):
+def obtain(ctrl, policy, turn, retry_unknown, *, context=None):
     s = ctrl.state
     mid = "%s:T%04d" % (s.get_meta("run_id"), turn)
     saved = s.get_optional("Message", mid)
     if saved is not None:
         return saved
-    context = ctrl.context(turn)
+    if context is None:
+        context = ctrl.context(turn)
     complete = True
     if policy != "live":
         raw = offline_message(ctrl, policy, turn)
@@ -499,7 +502,10 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
         elif s.get_meta("submitted", False):
             status, detail = "complete", "submitted"
         else:
-            status, detail = explore(ctrl, spec["policy"], pause_after, retry_unknown)
+            if ctrl.routed:
+                status, detail = routed.RoutedDiscovery(ctrl).run(obtain, pause_after, retry_unknown)
+            else:
+                status, detail = explore(ctrl, spec["policy"], pause_after, retry_unknown)
         if detail == "submitted":
             coverage = pool_followup.coverage(ctrl) if ctrl.exhaustive and ctrl.labeled else {}
             exhausted = ctrl.active and s.usage()["new_queries"] >= ctrl.query_limit
@@ -517,7 +523,7 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
                 status, detail = "partial", "submitted_with_unreviewed_expansions"
             elif coverage.get("blocked") or coverage.get("conflict_blocked") or coverage.get("guided_blocked"):
                 status, detail = "partial", "submitted_with_blocked_pool_followup"
-            elif s.get_meta("denied_budget", False) or (exhausted and pending):
+            elif s.get_meta("denied_budget", False) or (exhausted and pending and not ctrl.routed):
                 status, detail = "partial", "submitted_after_budget_exhaustion"
             elif any(q["status"] != "success" for q in s.all("CanonicalQuery")):
                 status, detail = "partial", "submitted_with_blocked_queries"

@@ -219,7 +219,7 @@ function updateForm() {
     ["annotate", "discover"].includes(kind) || (full && $("start").value === "snapshot"),
     true
   );
-  const annotated = ["A1", "A3", "A3_adaptive"].includes(mode);
+  const annotated = ["A1", "A3", "A3_adaptive", "A3_routed"].includes(mode);
   field("seed-review-field", (full || kind === "discover") && ["A2", "A3", "A3_adaptive"].includes(mode));
   const showAnnotations = (full || kind === "discover") && annotated;
   field("annotations-field", showAnnotations, kind === "discover");
