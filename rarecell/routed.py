@@ -6,6 +6,7 @@ import math
 
 from . import providers
 from .config import fingerprint, json_bytes
+from .discovery import ExpansionDepthExhausted
 from .protocol import MAX_CHARS, _json_region, _trim_trailing_commas
 from .rule_search import ExpressionSearch
 from .state import BudgetExhausted, QueryBlocked
@@ -182,16 +183,22 @@ class RoutedDiscovery:
         anchor = self.ctrl.candidate(cid)["members"]
         saved = self.s.get_optional("RouteRetrieval", cid)
         if not saved:
-            result = self.ctrl.scientific("expand_candidate", {"candidate_id": cid})
-            raw = self.s.read_artifact(result["artifact_ref"])
-            saved = dict(
-                candidate_id=cid,
-                ref=result["artifact_ref"],
-                evidence_id=result["evidence_id"],
-                n_added=len(raw.get("added_members", [])),
-                status=result["status"],
-            )
+            try:
+                result = self.ctrl.scientific("expand_candidate", {"candidate_id": cid})
+            except ExpansionDepthExhausted:
+                saved = dict(candidate_id=cid, status="depth_exhausted", depth_limit=self.ctrl.depth_limit)
+            else:
+                raw = self.s.read_artifact(result["artifact_ref"])
+                saved = dict(
+                    candidate_id=cid,
+                    ref=result["artifact_ref"],
+                    evidence_id=result["evidence_id"],
+                    n_added=len(raw.get("added_members", [])),
+                    status=result["status"],
+                )
             self.s.put("RouteRetrieval", cid, saved)
+        if saved["status"] == "depth_exhausted":
+            return {"seed": anchor}
         measured = self.s.read_artifact(saved["ref"])
         return {"seed": anchor, "retrieved": sorted(set(anchor) | set(measured.get("added_members", [])))}
 
@@ -231,11 +238,15 @@ class RoutedDiscovery:
         if job["kind"] == "seed":
             seed = job["parents"][0]
             retrieval = self.s.get("RouteRetrieval", seed)
-            measured = self.s.read_artifact(retrieval["ref"])
-            context["retrieval"] = {
-                "summary": measured["summary"],
-                "signature": measured.get("selection_history", {}).get("signature", [])[:12],
-            }
+            if retrieval["status"] == "depth_exhausted":
+                context["retrieval"] = dict(status="depth_exhausted", depth_limit=retrieval["depth_limit"],
+                    reason="No structural retrieval was run. Inspect the original seed and expression rules, or abstain.")
+            else:
+                measured = self.s.read_artifact(retrieval["ref"])
+                context["retrieval"] = {
+                    "summary": measured["summary"],
+                    "signature": measured.get("selection_history", {}).get("signature", [])[:12],
+                }
             context.update(
                 seed_review=self.s.get("SeedRoute", seed),
                 seed_markers=self.ctrl.candidate(seed).get("markers", [])[:12],
@@ -461,7 +472,7 @@ class RoutedDiscovery:
             if req["rule"] is not None:
                 result, key = self.measured(req, scopes)
                 members = result["members"]
-                if members and job["kind"] == "seed" and set(members).isdisjoint(scopes["retrieved"]):
+                if members and job["kind"] == "seed" and set(members).isdisjoint(scopes.get("retrieved", scopes["seed"])):
                     raise ValueError("Anchored claim must overlap the seed or its retrieved cells")
             with self.s.transaction():
                 receipt = self.freeze(job, req, members, key, mid)

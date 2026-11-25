@@ -166,6 +166,8 @@ def export(ctrl, status, detail, policy, annotation_status):
     if policy == "live" and ctrl.active:
         summary.update(n_screened_seeds=len(screened), n_controller_seed_followups=len(followups),
                        n_expanded_seeds=sum(seed["candidate_id"] in investigated for seed in seeds))
+    if s.get_meta("code_upgrade"):
+        summary["code_upgrade"] = s.get_meta("code_upgrade")
     if s.get_meta("closeout_trigger"):
         summary["closeout_trigger"] = s.get_meta("closeout_trigger")
     if ctrl.adaptive or policy == "live":

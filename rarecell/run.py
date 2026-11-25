@@ -439,7 +439,15 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
     started = time.monotonic()
     snapshot = Path(spec["snapshot"])
     manifest = verify_snapshot(snapshot)
-    if fingerprint(cfg) != spec["cfg_hash"] or fingerprint(contract()) != spec["contract_hash"] or spec["software"] != __version__ or spec.get("code_sha256") != code_fingerprint():
+    code = code_fingerprint()
+    old_code = spec.get("code_sha256")
+    migrate = False
+    if old_code != code and resumed and spec["mode"] == ROUTED_MODE and spec["policy"] == "live":
+        compatible = read_json(RESOURCES / "routed_checkpoint_upgrade.json")
+        migrate = (old_code == compatible["from"] and code == compatible["to"]
+                   and (run / "state.sqlite").is_file() and not (run / ".publishing.json").exists())
+    if (fingerprint(cfg) != spec["cfg_hash"] or fingerprint(contract()) != spec["contract_hash"]
+            or spec["software"] != __version__ or (old_code != code and not migrate)):
         raise ValueError("Checkpoint configuration, contract or method version changed")
     if (run / "manifest.json").exists():
         if read_json(run / "manifest.json")["snapshot_hash"] != manifest["snapshot_hash"]:
@@ -468,6 +476,9 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
     ctrl = Controller(snapshot, run, spec["cache"], cfg, spec["mode"], ann)
     s = ctrl.state
     try:
+        if migrate and (s.get_meta("run_id") != spec["run_id"] or not s.get_meta("initialized", False)
+                        or astatus not in {"success", "partial"} or s.get_meta("annotation_hash") != fingerprint(ann)):
+            raise ValueError("Cannot upgrade routed checkpoint: original state or verified annotations differ")
         s.set_meta("run_id", spec["run_id"])
         s.set_meta("replication_id", spec["replication_id"])
         if resumed:
@@ -484,6 +495,14 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
             if s.get_meta("annotation_hash", annotation_hash) != annotation_hash:
                 raise ValueError("Verified annotation contents changed after initialization")
             s.set_meta("annotation_hash", annotation_hash)
+        if migrate:
+            upgrade = {"from": old_code, "to": code, "after_turn": s.get_meta("finished_turn", 0)}
+            spec = dict(spec, code_sha256=code, code_upgrade=upgrade)
+            write_json(run / "checkpoint.json", spec)
+        if spec.get("code_upgrade") and not s.get_meta("code_upgrade"):
+            with s.transaction():
+                s.set_meta("code_upgrade", spec["code_upgrade"])
+                s.event("checkpoint_upgraded", spec["code_upgrade"])
         if publishing.exists():
             pending = read_json(publishing)
             result = export(ctrl, pending["status"], pending["detail"], spec["policy"], pending["annotation_status"])

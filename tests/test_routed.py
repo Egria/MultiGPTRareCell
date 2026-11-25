@@ -211,3 +211,102 @@ def test_routed_gui_budget_override(tmp_path):
         config(override={"mode": ROUTED_MODE, "budget": {"max_agent_turns": 3}})["budget"]["max_agent_turns"]
         == 3
     )
+
+
+def test_resume_legacy_depth_crash_without_repeating_model_turns(tmp_path, monkeypatch):
+    from rarecell import run as runner
+    from rarecell.config import RESOURCES
+    from rarecell.evaluation import evaluate
+    from rarecell.state import State
+
+    cfg, snap, ann_dir, ann = setup_input(tmp_path)
+    cfg["potential_names"] = ["Shared"]
+    monkeypatch.setattr(runner, "verify_annotation", lambda *args, **kwargs: ann)
+    calls = []
+
+    def reply(ctx, cfg):
+        phase = ctx["phase"]
+        if phase == "seed_triage":
+            req = dict(action="route_seeds", reviews=[
+                dict(candidate_id=seed["candidate_id"], guide_label="Shared", reliability="uncertain",
+                     reason="Tentative singleton identity") for seed in ctx["seeds"]])
+            calls.append((phase, None))
+        elif phase == "blind_name_search":
+            # Exactly seed a matches, while four seeds nominated this name.
+            req = dict(action="freeze", rule=["G", 3.5] if ctx["target"] == "Shared" else None,
+                       support=60, reason="Expression rule")
+            calls.append((phase, ctx["target"]))
+        else:
+            assert phase == "seed_expansion" and "retrieved" in ctx["scopes"]
+            req = dict(action="freeze", rule=None, support=0, reason="Abstain")
+            calls.append((phase, ctx["seed_review"]["candidate_id"]))
+        return json.dumps(req), {"api_calls": 1, "total_tokens": 12}
+
+    monkeypatch.setattr(providers, "complete", reply)
+    code_pair = read_json(RESOURCES / "routed_checkpoint_upgrade.json")
+    run, cache = tmp_path / "run", tmp_path / "cache"
+    # Reproduce the two PR24 depth checks and its unhandled plain ValueError.
+    with monkeypatch.context() as legacy:
+        legacy.setattr(runner, "code_fingerprint", lambda: code_pair["from"])
+        legacy.setattr(Controller, "expansion_depth",
+                       lambda self, c, roots, depths: max(depths.get(r, 0) for r in roots))
+        legacy.setattr("rarecell.discovery.ExpansionDepthExhausted", ValueError)
+        with pytest.raises(ValueError, match="Expansion depth exhausted"):
+            discover(snap, run, cache, cfg, annotations=ann_dir)
+    assert ("seed_expansion", "a") in calls and ("seed_expansion", "c") not in calls
+    assert not (run / "frozen.json").exists()
+    with pytest.raises(ValueError, match="resume discovery"):
+        evaluate(run, tmp_path / "gt.tsv", tmp_path / "scores")
+    with closing(State(run, cache)) as state:
+        messages = state.all("Message")
+        before = {row["message_id"]: row["context_hash"] for row in messages}
+        old_turn = state.get_meta("finished_turn")
+        assert state.get_meta("depths")["c"] == 1
+        assert not any(r["candidate_id"] == "c" for r in state.all("Investigation"))
+    with monkeypatch.context() as unrecognized:
+        unrecognized.setattr(runner, "code_fingerprint", lambda: "unrecognized")
+        with pytest.raises(ValueError, match="method version changed"):
+            resume(run)
+
+    # Exercise this approved version pair even when a future, separately pinned
+    # implementation runs the regression suite.
+    with monkeypatch.context() as release:
+        release.setattr(runner, "code_fingerprint", lambda: code_pair["to"])
+        summary = resume(run)
+    assert summary["submitted"] and summary["status"] == "complete"
+    assert summary["code_upgrade"] == dict(code_pair, after_turn=old_turn)
+    assert read_json(run / "checkpoint.json")["code_sha256"] == code_pair["to"]
+    assert sorted(label for phase, label in calls if phase == "seed_expansion") == ["a", "c", "d", "f"]
+    assert len(calls) == len(set(calls))
+    with closing(State(run, cache)) as state:
+        assert before == {m["message_id"]: m["context_hash"] for m in state.all("Message") if m["message_id"] in before}
+        assert len(state.all("ProviderDispatch")) == len(calls)
+        assert len(state.all("Investigation")) == 4
+    assert (run / "frozen.json").is_file()
+    (tmp_path / "gt.tsv").write_text("cell_id\tlabel\n" + "".join(f"{c}\tstate\n" for c in "abcdef"))
+    assert evaluate(run, tmp_path / "gt.tsv", tmp_path / "scores")["submitted_partition"]["n_cells"] == 6
+
+
+def test_routed_zero_depth_keeps_seed_available_for_expression(tmp_path, monkeypatch):
+    cfg, snap, ann_dir, _ = setup_input(tmp_path)
+    cfg["budget"]["max_expansion_depth"] = 0
+    monkeypatch.setattr("rarecell.run.verify_annotation", lambda *args, **kwargs: [])
+    reviewed = []
+
+    def reply(ctx, cfg):
+        if ctx["phase"] == "seed_triage":
+            req = dict(action="route_seeds", reviews=[
+                dict(candidate_id=s["candidate_id"], reliability="unknown", reason="Unlabeled")
+                for s in ctx["seeds"]])
+        else:
+            assert ctx["phase"] == "seed_expansion" and ctx["scopes"] == {"seed": 1}
+            assert ctx["retrieval"]["status"] == "depth_exhausted"
+            reviewed.append(ctx["seed_review"]["candidate_id"])
+            req = dict(action="freeze", rule={"scope": "seed"}, support=20, reason="Measured core only")
+        return json.dumps(req), {"api_calls": 1, "total_tokens": 10}
+
+    monkeypatch.setattr(providers, "complete", reply)
+    run, cache = tmp_path / "run", tmp_path / "cache"
+    summary = discover(snap, run, cache, cfg, annotations=ann_dir)
+    assert summary["submitted"] and sorted(reviewed) == ["a", "c", "d", "f"]
+    assert summary["n_expanded_seeds"] == 0 and (run / "frozen.json").exists()
