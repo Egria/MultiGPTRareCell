@@ -104,6 +104,7 @@ def parser():
     d.add_argument("--context-bytes", type=int, help="discovery context size in serialized bytes")
     d.add_argument("--seed-review-batch-size", type=int, help="maximum cases per dedicated review request")
     d.add_argument("--max-agent-turns", type=int, help="total turns in A3_routed; ordinary discovery turns excluding dedicated reviews in other modes")
+    d.add_argument("--routed-conflict-policy", choices=["legacy", "single"], help="reconcile frozen routed claims cell by cell")
     d.add_argument("--replication-id")
     d.add_argument("--pause-after", type=int, help="checkpoint after this completed turn")
     resume_cmd = cmd("resume", False)
@@ -115,6 +116,13 @@ def parser():
     replay.add_argument("--prefer", action="append", default=[], help="preferred candidate in the selection (repeatable)")
     replay.add_argument("--candidate-id", action="append", help="explicit replacement for the historical selection (repeatable)")
     replay.add_argument("--gt", type=Path, help="optional reference for scoring after partition export")
+    forced = cmd("reconcile-routed")
+    forced.add_argument("--run", type=Path, required=True)
+    origin = forced.add_mutually_exclusive_group(required=True)
+    origin.add_argument("--snapshot", type=Path)
+    origin.add_argument("--dataset", type=Path, help="exact original input bound to the review book")
+    forced.add_argument("--review-book", type=Path, required=True)
+    forced.add_argument("--out", type=Path, required=True)
     e = cmd("evaluate", False)
     e.add_argument("--run", type=Path, required=True)
     e.add_argument("--gt", type=Path, required=True)
@@ -152,6 +160,8 @@ def dispatch(a, default_model=""):
         return {"output": str(a.out), "freeze_sha256": metrics["freeze_sha256"], "submitted_partition": metrics["submitted_partition"]}
     overrides = model_overrides(a.model or default_model)
     if cmd == "discover":
+        if a.routed_conflict_policy:
+            overrides["routed_conflict_policy"] = a.routed_conflict_policy
         if a.mode:
             overrides["mode"] = a.mode
         for key in ("context_bytes", "seed_review_batch_size", "max_agent_turns", "max_new_queries"):
@@ -164,6 +174,9 @@ def dispatch(a, default_model=""):
     if cmd == "annotate" and a.include_singletons is not None:
         overrides.setdefault("annotation", {})["include_singletons"] = a.include_singletons
     cfg = config(a.config, overrides)
+    if cmd == "reconcile-routed":
+        from .forced_replay import replay
+        return replay(a.run, a.snapshot, a.dataset, a.review_book, a.out, cfg)
     if cmd == "doctor":
         return doctor(cfg)
     if cmd == "prepare":

@@ -1,4 +1,5 @@
 mode: A3
+routed_conflict_policy: single
 exhaustive_seed_review: false
 prepare:
   views: [V_HVG, V_GINI, V_LINEAR]

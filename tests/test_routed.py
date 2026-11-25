@@ -68,7 +68,7 @@ def setup_input(tmp_path):
             ("d", "Other", "CL:2", "neighbor"),
         ]
     ]
-    cfg = config(override={"mode": ROUTED_MODE, "provider": {"model": "test", "api_key_env": None}})
+    cfg = config(override={"mode": ROUTED_MODE, "routed_conflict_policy":"legacy", "provider": {"model": "test", "api_key_env": None}})
     return cfg, snap, annotation, ann
 
 

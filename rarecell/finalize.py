@@ -209,6 +209,12 @@ def export(ctrl, status, detail, policy, annotation_status):
                        "route_claims.jsonl": s.all("RouteFreeze"), "route_resolutions.jsonl": s.all("RouteResolution")}
         for name, data in route_files.items():
             jsonlines(run / name, data)
+        forced_ref = s.get_meta("forced_choice_ref")
+        if forced_ref:
+            detail_record = s.read_artifact(forced_ref)
+            summary["forced_choice"] = dict(artifact_ref=forced_ref, n_claimed=detail_record["n_claimed"],
+                                             comparisons=len(detail_record["pair_votes"]),
+                                             n_wins_tied=detail_record["n_wins_tied"])
         resolutions = route_files["route_resolutions.jsonl"]
         deferred = sum(row["choice"] == "defer_to_submission" for row in resolutions)
         summary["routing"] = {"reviewed_seeds": len(route_files["seed_routes.jsonl"]),

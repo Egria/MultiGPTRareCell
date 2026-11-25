@@ -238,6 +238,8 @@ class RoutedDiscovery:
             )
         else:
             context["actions"]["freeze"] = FREEZE
+            if self.ctrl.cfg.get("routed_conflict_policy") == "single":
+                context["actions"]["freeze"] += " Include label_reliability (supported or uncertain) for identity independent of boundary precision."
             context["instruction"] = (
                 "Use biological knowledge to choose genes and evaluate competing explanations. "
                 "Compare expression intensity and joint detection across the whole sample, inspect neighboring cutoffs, "
@@ -285,6 +287,8 @@ class RoutedDiscovery:
             return None, self.triage_context(pending)
         frozen = {r["job"] for r in self.s.all("RouteFreeze")}
         job = next((j for j in self.jobs() if j["id"] not in frozen), None)
+        if job is None and self.ctrl.cfg.get("routed_conflict_policy") == "single":
+            return None, None
         return job or next(self.pending_pairs(), None), None
 
     def pending_pairs(self):
@@ -358,6 +362,11 @@ class RoutedDiscovery:
             message_id=mid,
             query_key=key,
         )
+        if self.ctrl.cfg.get("routed_conflict_policy") == "single" and "label_reliability" in req:
+            reliability = req["label_reliability"]
+            if reliability not in ("supported", "uncertain"):
+                raise ValueError("label_reliability must be supported or uncertain")
+            note["label_reliability"] = reliability
         cid = None
         if members:
             sh = fingerprint(sorted(members))
@@ -552,6 +561,9 @@ class RoutedDiscovery:
         while True:
             job, ctx = self.next_task()
             if job is None and ctx is None:
+                if self.ctrl.cfg.get("routed_conflict_policy") == "single":
+                    from .forced_routing import finish
+                    return finish(self, obtain, pause_after, retry_unknown)
                 with self.s.transaction():
                     deferred = any(r["choice"] == "defer_to_submission" for r in self.s.all("RouteResolution"))
                     args = dict(candidate_ids=self.s.get_meta("route_active", []),

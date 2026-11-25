@@ -52,9 +52,19 @@ run=$(mktemp -d "$task/discovery-routed.XXXXXX")
 
 流程先保留每颗 seed，并要求模型结合表达与提名逐颗判断名字是否可信。同一 Cell Ontology 编号下的提名只发起一次全局名字调查。模型在隔离上下文中只收到组织、物种、假设名字、细胞总数、工具说明及本次调查的问答。它可以选基因、查强度分布、比较多个表达边界、找群内富集基因，最后冻结确切成员和 0–100 的 RNA 支持分，也可以弃权。这个分数是模型的证据判断，未经概率校准。
 
-缺乏支持或未命名的 seed 各自从自己的成员和多视图检索结果开始外扩。即使 seed 本身身份存疑，已有注释中的具体名字仍可进入盲搜队列。使用双背景的历史注释时，邻居独有的提名也可进入。可选的顶层 YAML 列表 `potential_names` 可以提供额外假设。每个谱系提交与其他重叠提交、以及同名但不相交的碎片都进入边界复核。复核可以合并、择一、保留同名的两个独立群，或按测量规则分配交集。交集分配会保留两侧独有的细胞。状态类提交可叠加于谱系分群，其成员可由 candidate ID 在 `candidate_members.tsv` 中查到。
+缺乏支持或未命名的 seed 各自从自己的成员和多视图检索结果开始外扩。即使 seed 本身身份存疑，已有注释中的具体名字仍可进入盲搜队列。使用双背景的历史注释时，邻居独有的提名也可进入。可选的顶层 YAML 列表 `potential_names` 可以提供额外假设。默认的 `routed_conflict_policy: single` 固定所有谱系提名后统一裁决。有交集且名字可靠的同义群可以合并。两个名字均可靠时，模型先只根据名字、组织和物种提出各类别的表达模块，也可以为具体的竞争类别另外指定判别基因，再根据每对候选的实测值判定争议细胞。至少一侧名字存疑时，直接比较两侧独有成员的表达重心。每个细胞只在原来提名它的候选间投票，多方循环平局依次比较各对几何支持度之和与稳定 ID。最终每个被提名的细胞恰有一个谱系归属。状态类提交可叠加于谱系分群，其成员可由 candidate ID 在 `candidate_members.tsv` 中查到。
 
-`seed_routes.jsonl` 保存逐颗分流，`route_jobs.jsonl` 保存提名来源，`route_claims.jsonl` 保存成员规则、支持分及弃权，`route_resolutions.jsonl` 保存边界裁决。`partition.tsv` 为最终分群。`budget.queries_per_route` 默认 8 次探索性表达查询；冻结成员与多视图检索也计入全局查询预算。复用旧 `settings.yaml` 时，显式指定上述预算可覆盖旧配置的较低上限。
+`seed_routes.jsonl` 保存逐颗分流，`route_jobs.jsonl` 保存提名来源，`route_claims.jsonl` 保存成员规则、支持分及弃权，旧策略的 `route_resolutions.jsonl` 保存逐对裁决。强制单选的细胞级证据和每对投票保存在 `run_summary.json` 的 `forced_choice.artifact_ref` 所指文件。使用 `--routed-conflict-policy legacy` 可复现旧流程。`partition.tsv` 为最终分群。`budget.queries_per_route` 默认 8 次探索性表达查询；冻结成员与多视图检索也计入全局查询预算。复用旧 `settings.yaml` 时，显式指定上述预算可覆盖旧配置的较低上限。
+
+已有冻结候选和对应的模型复核记录时，下列命令可在新目录单独重算裁决。
+
+```bash
+.venv/bin/rarecell reconcile-routed --run "$run" --snapshot "$task/snapshot" \
+  --review-book review_book.json --out "${run}.single"
+.venv/bin/rarecell evaluate --run "${run}.single" --gt "$gt" --out "${run}.single.evaluation"
+```
+
+回放校验原任务、谱系成员和模型看到的表达摘要。持有匹配的原始 counts、genes、cells 与 dataset.yaml 时，也可使用 `--dataset` 替代 `--snapshot`。缺少原始 baseline 的导出仍支持提交分群评估。
 
 如果 PR #24 的 `A3_routed` 在生成 `frozen.json` 之前报 `Expansion depth exhausted for this lineage`，更新到包含修复的代码后，在原目录执行 `.venv/bin/rarecell resume --run "$run"`。兼容升级保留已完成的回复与查询，升级前后的代码指纹和完成轮数记在 `run_summary.json` 的 `code_upgrade` 中。等 `jq -e '.submitted == true' "$run/run_summary.json"` 成功后，再评估该次提交。
 
