@@ -100,9 +100,10 @@ def parser():
     d.add_argument("--policy", choices=["live", "fixed"], default="live")
     d.add_argument("--exhaustive-seed-review", action=argparse.BooleanOptionalAction, default=None,
                    help="measure every singleton seed and require an explicit model assessment before submission")
+    d.add_argument("--max-new-queries", type=int, help="global distinct scientific query budget")
     d.add_argument("--context-bytes", type=int, help="discovery context size in serialized bytes")
     d.add_argument("--seed-review-batch-size", type=int, help="maximum cases per dedicated review request")
-    d.add_argument("--max-agent-turns", type=int, help="ordinary discovery turns, excluding dedicated reviews")
+    d.add_argument("--max-agent-turns", type=int, help="total turns in A3_routed; ordinary discovery turns excluding dedicated reviews in other modes")
     d.add_argument("--replication-id")
     d.add_argument("--pause-after", type=int, help="checkpoint after this completed turn")
     resume_cmd = cmd("resume", False)
@@ -151,7 +152,9 @@ def dispatch(a, default_model=""):
         return {"output": str(a.out), "freeze_sha256": metrics["freeze_sha256"], "submitted_partition": metrics["submitted_partition"]}
     overrides = model_overrides(a.model or default_model)
     if cmd == "discover":
-        for key in ("context_bytes", "seed_review_batch_size", "max_agent_turns"):
+        if a.mode:
+            overrides["mode"] = a.mode
+        for key in ("context_bytes", "seed_review_batch_size", "max_agent_turns", "max_new_queries"):
             if getattr(a, key) is not None:
                 overrides.setdefault("budget", {})[key] = getattr(a, key)
     if cmd == "discover" and a.exhaustive_seed_review is not None:

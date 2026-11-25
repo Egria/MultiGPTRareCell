@@ -111,6 +111,8 @@ def export(ctrl, status, detail, policy, annotation_status):
     for seed in seeds:
         cid = seed["candidate_id"]
         activity = "investigated" if depths.get(cid, 0) else "selected" if cid in selected else "pending"
+        if ctrl.routed and s.get_optional("SeedRoute", cid):
+            activity = "reviewed"
         seed_rows.append(dict(seed, seed_id=seed["id"], barcode=seed.get("barcode", seed["cell_id"]), task_status=activity,
                               screened=cid in screened, priority_peer=screened.get(cid, {}).get("peer"),
                               shared_markers=",".join(screened.get(cid, {}).get("shared_markers", [])),
@@ -198,6 +200,16 @@ def export(ctrl, status, detail, policy, annotation_status):
             if row["candidate_id"] in reviews:
                 row["expansion_review"] = reviews[row["candidate_id"]]
         jsonlines(run / "pool_followups.jsonl", pool_rows)
+    if ctrl.routed:
+        from .routed import RoutedDiscovery
+        route_files = {"seed_routes.jsonl": s.all("SeedRoute"), "route_jobs.jsonl": RoutedDiscovery(ctrl).jobs(),
+                       "route_claims.jsonl": s.all("RouteFreeze"), "route_resolutions.jsonl": s.all("RouteResolution")}
+        for name, data in route_files.items():
+            jsonlines(run / name, data)
+        summary["routing"] = {"reviewed_seeds": len(route_files["seed_routes.jsonl"]),
+                              "name_searches": sum(j["kind"] == "name" for j in route_files["route_jobs.jsonl"]),
+                              "seed_searches": sum(j["kind"] == "seed" for j in route_files["route_jobs.jsonl"]),
+                              "frozen": len(route_files["route_claims.jsonl"]), "reviews": len(route_files["route_resolutions.jsonl"])}
     write_json(run / "run_summary.json", summary)
     files = ["run_summary.json", "usage.json", "manifest.json", "config_resolved.yaml", "project_contract.yaml",
              "partition.tsv", "groups.tsv", "conflicts.jsonl", "candidate_tasks.tsv", "candidate_members.tsv", "candidates.jsonl", "seeds.tsv",
@@ -206,6 +218,8 @@ def export(ctrl, status, detail, policy, annotation_status):
         files.append("seed_reviews.tsv")
     if ctrl.exhaustive and ctrl.labeled:
         files.append("pool_followups.jsonl")
+    if ctrl.routed:
+        files.extend(route_files)
     files.extend(str(p.relative_to(run)) for p in sorted((run / "artifacts").glob("*")) if p.is_file())
     freeze = {"version": 1, "snapshot_hash": ctrl.snapshot_hash, "files": {name: hash_file(run / name) for name in files}}
     write_json(run / "frozen.json", freeze)

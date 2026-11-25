@@ -9,9 +9,10 @@ from pathlib import Path
 import yaml
 
 ADAPTIVE_MODE = "A3_adaptive"
-MODES = ("A0", "A1", "A2", "A3", ADAPTIVE_MODE)
-ACTIVE_MODES = {"A2", "A3", ADAPTIVE_MODE}
-ANNOTATED_MODES = {"A1", "A3", ADAPTIVE_MODE}
+ROUTED_MODE = "A3_routed"
+MODES = ("A0", "A1", "A2", "A3", ADAPTIVE_MODE, ROUTED_MODE)
+ACTIVE_MODES = {"A2", "A3", ADAPTIVE_MODE, ROUTED_MODE}
+ANNOTATED_MODES = {"A1", "A3", ADAPTIVE_MODE, ROUTED_MODE}
 
 RESOURCES = Path(__file__).parent / "resources"
 
@@ -40,7 +41,10 @@ def validate_settings(cfg):
             raise ValueError(f"annotation.{flag} must be true or false")
     if type(cfg.get("exhaustive_seed_review", False)) is not bool:
         raise ValueError("exhaustive_seed_review must be true or false")
-    if set(cfg) - {"exhaustive_seed_review"} != {"mode", "prepare", "search", "budget", "provider", "annotation"}:
+    hypotheses = cfg.get("potential_names", [])
+    if not isinstance(hypotheses, list) or not all(isinstance(n, str) and 0 < len(n.strip()) <= 160 for n in hypotheses):
+        raise ValueError("potential_names must contain nonempty names of at most 160 characters")
+    if set(cfg) - {"potential_names", "exhaustive_seed_review"} != {"mode", "prepare", "search", "budget", "provider", "annotation"}:
         raise ValueError("Unknown or missing top-level configuration section")
     for name, fields in names.items():
         section = cfg[name]
@@ -67,6 +71,9 @@ def validate_settings(cfg):
 def config(path=None, override=None):
     base = yaml.safe_load((RESOURCES / "default.yaml").read_text())
     user = yaml.safe_load(Path(path).read_text()) if path else {}
+    if (override or {}).get("mode", (user or {}).get("mode", base["mode"])) == ROUTED_MODE:
+        # Routed budgets cover triage, every independent search and reconciliation together.
+        base["budget"].update(max_agent_turns=800, max_new_queries=800, seed_review_batch_size=8)
     combined = merge_config(merge_config(base, user or {}), override or {})
     validate_settings(combined)
     if combined["mode"] not in MODES:

@@ -6,7 +6,7 @@ from pathlib import Path
 from .contrast_panels import GUIDANCE as PANEL_GUIDANCE, SOURCE as PAIRED_CONTRAST, ontology_seed_pools
 from . import __version__, adaptive, exhaustive, handoff, pool_followup, seed_review
 from .base_evidence import FrozenSeurat, annotation_parents, prepared_page
-from .config import ACTIVE_MODES, ADAPTIVE_MODE, ANNOTATED_MODES, contract, fingerprint, json_bytes, read_json, read_lines
+from .config import ACTIVE_MODES, ADAPTIVE_MODE, ROUTED_MODE, ANNOTATED_MODES, contract, fingerprint, json_bytes, read_json, read_lines
 from .protocol import ProtocolError, resolve_genes
 from .science import METHOD_VERSION, Science
 from .state import State
@@ -36,6 +36,8 @@ GOAL = (
 
 
 def prompt_version(mode, exhaustive_review=False):
+    if mode == ROUTED_MODE:
+        return "discovery/routed-1"
     version = "discovery/adaptive-7" if mode == ADAPTIVE_MODE else "discovery/1.6"
     if mode in ANNOTATED_MODES:
         version += "/ontology-pools-1"
@@ -85,8 +87,9 @@ class Controller:
         self.barcodes = {r["cell_id"]: (r.get("barcode") or r["cell_id"], r["cell_id"]) for r in cell_rows}
         self.cell_set = set(self.cells)
         self.genes = rows(self.snapshot / "genes.tsv")
-        self.adaptive = mode == ADAPTIVE_MODE
-        self.exhaustive = cfg.get("exhaustive_seed_review", False)
+        self.routed = mode == ROUTED_MODE
+        self.adaptive = mode in (ADAPTIVE_MODE, ROUTED_MODE)
+        self.exhaustive = not self.routed and cfg.get("exhaustive_seed_review", False)
         self.active = mode in ACTIVE_MODES
         self.labeled = mode in ANNOTATED_MODES
         self.goal = GOAL + adaptive.GOAL if self.adaptive else GOAL
@@ -194,7 +197,7 @@ class Controller:
                 row = dict(ann, evidence_id=eid, id=aid)
                 self.state.put("Annotation", aid, row)
                 self.labels.setdefault(c["id"], {})[eid] = row
-            if self.labeled:
+            if self.labeled and not self.routed:
                 annotations = (row for items in self.labels.values() for row in items.values())
                 for term, label, parents, eids, counts in ontology_seed_pools(self.seed_ids, annotations):
                     members = [self.candidate(cid)["members"][0] for cid in parents]
@@ -763,7 +766,7 @@ class Controller:
             for investigation in self.state.all("Investigation"):
                 if investigation["evidence_id"] in ancestors:
                     roots.update(self.lineage_roots(self.candidate(investigation["candidate_id"])))
-        if not roots:
+        if not roots and kind != "routed_claim":
             raise ValueError("Revision requires traceable parent candidates")
         descriptor = [sh, parents, label, status, sorted(set(evidence_ids)), kind, basis]
         if biological_rarity:
@@ -788,6 +791,8 @@ class Controller:
         record = {"id": cid, "members": members, "set_hash": sh, "parents": parents, "roots": sorted(roots),
                   "initial": False, "sources": [{"kind": kind}], "evidence_ids": sorted(set(evidence_ids)),
                   "proposed_label": label, "status": status, "markers": []}
+        if kind == "routed_claim":
+            record["route_evidence"] = basis
         if biological_rarity:
             record["biological_rarity"] = biological_rarity
         if kind == "ontology_seed_pool":

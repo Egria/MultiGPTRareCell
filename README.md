@@ -38,6 +38,24 @@ rarecell doctor --config configs/real_provider.yaml
 
 doctor 区分本地导入/版本检查和网络调用。上面的 Python 安装足以运行 core demo。真实 A3 还需要 R、固定作者包和已部署模型。R 的私有环境安装命令、精确 commit、R/Seurat 配对和 API 方言见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 
+## A3_routed 名字盲搜与逐 seed 外扩
+
+在管理器中选择「从快照发现」和实验臂 `A3_routed`，复用同一份快照与注释。也可以在仓库根目录直接运行，下面的 `task` 指向已有任务。
+
+```bash
+run=$(mktemp -d "$task/discovery-routed.XXXXXX")
+.venv/bin/rarecell discover --mode A3_routed --policy live \
+  --snapshot "$task/snapshot" --annotations "$task/annotations" \
+  --config "$task/settings.yaml" --seed-review-batch-size 8 \
+  --max-agent-turns 800 --max-new-queries 800 --run "$run"
+```
+
+流程先保留每颗 seed，并要求模型结合表达与提名逐颗判断名字是否可信。同一 Cell Ontology 编号下的提名只发起一次全局名字调查。模型在隔离上下文中只收到组织、物种、假设名字、细胞总数、工具说明及本次调查的问答。它可以选基因、查强度分布、比较多个表达边界、找群内富集基因，最后冻结确切成员和 0–100 的 RNA 支持分，也可以弃权。这个分数是模型的证据判断，未经概率校准。
+
+缺乏支持或未命名的 seed 各自从自己的成员和多视图检索结果开始外扩。即使 seed 本身身份存疑，已有注释中的具体名字仍可进入盲搜队列。使用双背景的历史注释时，邻居独有的提名也可进入。可选的顶层 YAML 列表 `potential_names` 可以提供额外假设。每个谱系提交与其他重叠提交、以及同名但不相交的碎片都进入边界复核。复核可以合并、择一、保留同名的两个独立群，或按测量规则分配交集。交集分配会保留两侧独有的细胞。状态类提交可叠加于谱系分群，其成员可由 candidate ID 在 `candidate_members.tsv` 中查到。
+
+`seed_routes.jsonl` 保存逐颗分流，`route_jobs.jsonl` 保存提名来源，`route_claims.jsonl` 保存成员规则、支持分及弃权，`route_resolutions.jsonl` 保存边界裁决。`partition.tsv` 为最终分群。`budget.queries_per_route` 默认 8 次探索性表达查询；冻结成员与多视图检索也计入全局查询预算。复用旧 `settings.yaml` 时，显式指定上述预算可覆盖旧配置的较低上限。
+
 ## A3_adaptive：由模型选择稀有群成员边界
 
 在 GUI「新建任务」的实验臂选择 **A3_adaptive · 模型选择稀有群边界**。已经完成准备和 OntoAnno 注释的任务可以选「从快照发现」，填写旧任务的 `snapshot`、`annotations` 和配置文件，再创建新任务。在 DCC 仓库根目录，命令行与 Slurm 的 `discover` 使用相同参数。例如，将变量指向已有任务，再运行：

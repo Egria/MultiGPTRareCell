@@ -1,0 +1,7 @@
+mode: A3_routed
+# Global ceilings for the complete experiment, including individual seed reviews.
+budget:
+  max_agent_turns: 800
+  max_new_queries: 800
+  queries_per_route: 8
+  seed_review_batch_size: 8
