@@ -25,7 +25,7 @@ def code_fingerprint():
     files = ("discovery.py", "run.py", "protocol.py", "science.py", "state.py", "providers.py",
              "config.py", "seed_review.py", "exhaustive.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py",
              "contrast_panels.py", "singleton_markers.py", "pool_followup.py", "nb_mixture.py", "claim_resolution.py", "handoff.py", "expansion_review.py", "routed.py", "rule_search.py",
-             "single_choice.py", "forced_routing.py")
+             "single_choice.py", "forced_routing.py", "lineage_review.py", "unclaimed_review.py")
     return fingerprint({name: hash_file(module / name) for name in files})
 
 

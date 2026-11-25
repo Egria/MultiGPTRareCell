@@ -4,6 +4,7 @@ from itertools import combinations
 import numpy as np
 
 from .config import fingerprint
+from .lineage_review import ModuleVotes, relationships
 
 
 def _unit(x):
@@ -80,11 +81,18 @@ def validate_panels(names, specs):
         if canonical not in specs or specs[canonical]["canonical"] != canonical:
             raise ValueError("Canonical names must refer directly to a supplied canonical label")
         validate_proposal(name, s, names)
+    relationships(specs)
 
 
 def validate_proposal(name, proposal, names):
     if proposal["canonical"] not in names:
         raise ValueError("Use a supplied canonical name")
+    parents = proposal.get("broader_labels", [])
+    if not isinstance(parents, list) or any(not isinstance(p, str) or p not in names or p == name for p in parents):
+        raise ValueError("broader_labels must list supplied, strictly broader cell types")
+    family = proposal.get("lineage_family", "")
+    if not isinstance(family, str) or len(family) > 160:
+        raise ValueError("lineage_family must be a short shared name")
     contrasts = proposal.get("versus", {})
     if not isinstance(contrasts, dict) or set(contrasts) - (set(names) - {name}):
         raise ValueError("A pair-specific panel must name another supplied class")
@@ -135,20 +143,23 @@ def _panel_values(x, gene_index, spec):
     return np.stack(scores, axis=1), missing
 
 
-def measure(x, cells, gene_index, groups, specs):
+def measure(x, cells, gene_index, groups, specs, focus=None):
     """Return pair-wise numerical evidence plus compact feedback for isolated biological review."""
     measured_panels = {}
     pairs = []
     cards = {}
+    ancestors = relationships(specs)
+    modules = None
     for left, right in combinations(groups, 2):
         sides = [left["members"], right["members"]]
         shared = np.intersect1d(*sides, assume_unique=True)
-        if not len(shared):
+        if not len(shared) or (focus is not None and not focus[shared].any()):
             continue
         key = left["id"] + "/" + right["id"]
         geometry, flanks = _geometry(x, sides, shared, 20261125)
         bio = left["reliable"] and right["reliable"]
-        pair = dict(key=key, groups=(left["id"], right["id"]), rows=shared, geometry=geometry, named=bio)
+        keep = np.arange(len(shared)) if focus is None else np.flatnonzero(focus[shared])
+        pair = dict(key=key, groups=(left["id"], right["id"]), rows=shared[keep], geometry=geometry[keep], named=bio)
         pairs.append(pair)
         if not bio:
             continue
@@ -157,6 +168,7 @@ def measure(x, cells, gene_index, groups, specs):
         magnitudes = []
         missing = []
         overrides = {}
+        effective = []
         for group, other in [(left, right), (right, left)]:
             name = group["label"]
             spec = specs[name]
@@ -164,6 +176,7 @@ def measure(x, cells, gene_index, groups, specs):
             if override:
                 overrides[name] = override
                 spec = override
+            effective.append(spec)
             panel_key = tuple(tuple(panel) for panel in spec["panels"])
             if panel_key not in measured_panels:
                 measured_panels[panel_key] = _panel_values(x, gene_index, spec)
@@ -174,9 +187,17 @@ def measure(x, cells, gene_index, groups, specs):
             sufficient = positive.sum(1) >= spec.get("min_positive", min(2, score.shape[1]))
             if "required_panel" in spec:
                 sufficient &= positive[:, spec["required_panel"] - 1]
+            positive = positive[keep]
             masks.append(positive @ (1 << np.arange(score.shape[1])))
-            supported.append(sufficient)
-            magnitudes.append(score[shared])
+            supported.append(sufficient[keep])
+            magnitudes.append(score[pair["rows"]])
+        a, b = left["label"], right["label"]
+        fa, fb = (specs[n].get("lineage_family", "").strip().casefold() for n in (a, b))
+        if fa and fb and fa != fb and a not in ancestors[b] and b not in ancestors[a]:
+            if modules is None:
+                modules = ModuleVotes(x, cells, gene_index)
+            refs = [g.get("reference", g["members"]) for g in (left, right)]
+            pair["module_contrast"] = modules.contrast(pair["rows"], refs, effective)
         patterns = [f"{a}/{b}" for a, b in zip(*masks)]
         pair.update(patterns=patterns, unilateral=supported[0].astype(int) - supported[1].astype(int))
         bins = defaultdict(list)
@@ -187,16 +208,16 @@ def measure(x, cells, gene_index, groups, specs):
         def rounded(row):
             return np.round(row, 2).tolist()
         card = dict(left=left["label"], right=right["label"], exclusive=flanks,
-                  shared=len(shared), missing=missing,
+                  shared=len(keep), missing=missing,
                   profiles={pat: [len(ix), int(pair["unilateral"][ix[0]]),
                                  rounded(np.median(magnitudes[0][ix], axis=0)),
                                  rounded(np.median(magnitudes[1][ix], axis=0))]
                             for pat, ix in sorted(bins.items())})
         if overrides:
             card["pair_specific_panels"] = overrides
-        if len(shared) <= 12:
+        if len(keep) <= 12:
             card["cells"] = {str(j): [patterns[j], rounded(magnitudes[0][j]), rounded(magnitudes[1][j])]
-                           for j in range(len(shared))}
+                           for j in range(len(keep))}
         cards[key] = card
     return pairs, cards
 
@@ -216,18 +237,28 @@ def validate_rulings(cards, rules):
                 raise ValueError("Decision refers to unmeasured cells or profiles")
 
 
-def choose(cells, groups, pairs, rules):
+def choose(cells, groups, pairs, rules, ancestors=None, fallback_log=None, focus=None):
     """All rivals vote on the original, immutable memberships before one owner is chosen."""
     tally = [{} for _ in cells]
     for group in groups:
         for i in group["members"]:
             tally[i][group["id"]] = [0, 0.]
+    broader = {}
+    if ancestors:
+        for group in groups:
+            if group["reliable"]:
+                broader[group["id"]] = {p["id"] for p in groups if p["reliable"]
+                                        and p["label"] in ancestors.get(group["label"], ())}
+    shadowed = {i: {parent for child in rivals for parent in broader.get(child, ()) if parent in rivals}
+                for i, rivals in enumerate(tally) if broader and len(rivals) > 1}
+    redo = defaultdict(list)
     audit = []
     for p in pairs:
         a, b = p["groups"]
         rule = rules.get(p["key"], {})
         counts = Counter()
         outcomes = []
+        module_votes = []
         for j, i in enumerate(p["rows"]):
             geo = p["geometry"][j]
             action = "geometry"
@@ -235,6 +266,11 @@ def choose(cells, groups, pairs, rules):
                 solo = p["unilateral"][j]
                 base = "left" if solo > 0 else "right" if solo < 0 else rule["default"]
                 action = rule.get("cells", {}).get(str(j), rule.get("profiles", {}).get(p["patterns"][j], base))
+            gap = p["module_contrast"][j] if "module_contrast" in p else 0.
+            use_module = abs(gap) > np.log(3.)
+            if use_module:
+                module_votes.append(dict(cell_id=cells[i], log_ratio_difference=float(gap), prior_action=action))
+                action = "left" if gap > 0 else "right"
             tie = abs(geo - .5) <= 1e-12
             left = action == "left" or (action == "geometry" and (geo > .5 or (tie and a < b)))
             winner = a if left else b
@@ -242,14 +278,36 @@ def choose(cells, groups, pairs, rules):
             tally[i][a][1] += geo
             tally[i][b][1] += 1 - geo
             mode = "biology" if action != "geometry" else ("stable_id_tie" if tie else "geometry")
-            outcomes.append([cells[i], winner, mode, round(float(geo), 4)])
+            if shadowed.get(i):
+                redo[i].append((a, b, winner, geo))
+            record = [cells[i], winner, "cross_fitted_modules" if use_module else mode, round(float(geo), 4)]
+            if use_module:
+                mode = "cross_fitted_modules"
+            outcomes.append(record)
             counts[mode] += 1
-        audit.append(dict(pair=p["key"], route="named" if p["named"] else "blind", counts=dict(counts), outcomes=outcomes))
+        record = dict(pair=p["key"], route="named" if p["named"] else "blind", counts=dict(counts), outcomes=outcomes)
+        if module_votes:
+            record["module_votes"] = module_votes
+        audit.append(record)
     owners = {}
     ties = 0
     for i, rivals in enumerate(tally):
-        if rivals:
+        if rivals and (focus is None or focus[i]):
             order = sorted(rivals, key=lambda g:(-rivals[g][0], -rivals[g][1], g))
+            initial = order[0]
+            removed = []
+            while order[0] in shadowed.get(i, ()):
+                removed.append(order[0])
+                remaining = {g: [0, 0.] for g in rivals if g != order[0]}
+                for a, b, winner, geo in redo[i]:
+                    if a in remaining and b in remaining:
+                        remaining[winner][0] += 1
+                        remaining[a][1] += geo
+                        remaining[b][1] += 1 - geo
+                order = sorted(remaining, key=lambda g: (-remaining[g][0], -remaining[g][1], g))
+                rivals = remaining
+            if removed and fallback_log is not None:
+                fallback_log.append([cells[i], initial, order[0], removed])
             ties += int(len(order) > 1 and rivals[order[0]][0] == rivals[order[1]][0])
             owners[cells[i]] = order[0]
     return owners, audit, ties

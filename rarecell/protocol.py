@@ -58,7 +58,7 @@ FIELDS = _alias_map({
     "preferred_candidate_ids": (), "intersect_candidate_ids": (), "seed_genes": (), "support_genes": (), "counter_genes": (), "program": (),
     "disposition": ("recommendation", "outcome", "结论"),
     "seed_id": (), "guide_label": (), "label_reliability": (), "choice": (), "include_core": (),
-    "metric": (), "matched_evidence_id": (), "nb_high_gene": (), "min_detected": (), "exclude_candidate_ids": (), "reference_id": (),
+    "metric": (), "matched_evidence_id": (), "nb_high_gene": (), "unclaimed_only": (), "min_detected": (), "exclude_candidate_ids": (), "reference_id": (),
     "background_mode": (), "biological_rarity": (), "rarity_reason": (),
     "action": ("operation", "tool", "动作", "操作"),
     "args": ("arguments", "parameters", "params", "参数"),
@@ -222,6 +222,10 @@ def _group(value):
             clean = _ids(val, key, allow_empty=True)
         elif key in {"members", "candidate_ids", "exclude_candidate_ids", "intersect_candidate_ids"}:
             clean = _ids(val, key)
+        elif key == "unclaimed_only":
+            if not isinstance(val, bool):
+                raise ProtocolError("unclaimed_only requires a boolean")
+            clean = val
         elif key == "min_detected":
             clean = _value(key, val)
         elif key in {"matched_evidence_id", "nb_high_gene", "program"}:
@@ -240,6 +244,8 @@ def _group(value):
     if {"program", "min_detected"} & out.keys():
         if not {"program", "min_detected", "matched_evidence_id"} <= out.keys() or "nb_high_gene" in out:
             raise ProtocolError("A program boundary needs program, min_detected and matched_evidence_id")
+    if out.get("unclaimed_only") and not (out.get("matched_evidence_id") and out.get("candidate_ids")):
+        raise ProtocolError("unclaimed_only requires a retained candidate and measured evidence")
     if "nb_high_gene" in out and "matched_evidence_id" not in out:
         raise ProtocolError("nb_high_gene requires a matched_evidence_id")
     if not ({"members", "candidate_ids", "matched_evidence_id"} & out.keys()):

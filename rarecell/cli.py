@@ -121,7 +121,7 @@ def parser():
     origin = forced.add_mutually_exclusive_group(required=True)
     origin.add_argument("--snapshot", type=Path)
     origin.add_argument("--dataset", type=Path, help="exact original input bound to the review book")
-    forced.add_argument("--review-book", type=Path, required=True)
+    forced.add_argument("--review-book", type=Path, help="Defaults to the review book saved by the source run")
     forced.add_argument("--out", type=Path, required=True)
     e = cmd("evaluate", False)
     e.add_argument("--run", type=Path, required=True)

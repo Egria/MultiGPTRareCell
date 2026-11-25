@@ -21,6 +21,9 @@ def positive_otsu(x):
 
 class ExpressionSearch:
     def __init__(self, ctrl):
+        self.snapshot = ctrl.snapshot
+        self._raw = None
+        self.nb_fits = {}
         self.cells = np.asarray(ctrl.cells)
         self.rows = sparse.load_npz(ctrl.snapshot / "data.npz").tocsr()
         self.rows.sum_duplicates()
@@ -44,6 +47,26 @@ class ExpressionSearch:
             raise ValueError(f"Unknown or ambiguous gene {gene!r}")
         return self.cols[:, self.index[gene]].toarray().ravel()
 
+    def nb_high(self, gene):
+        if gene not in self.index:
+            raise ValueError(f"Unknown or ambiguous gene {gene!r}")
+        if not (self.snapshot / "raw.npz").is_file():
+            raise ValueError("nb_high needs raw counts; use a measured expression rule on this snapshot")
+        idx = self.index[gene]
+        if idx not in self.nb_fits:
+            from .nb_mixture import fit_nb_split
+            if self._raw is None:
+                self._raw = sparse.load_npz(self.snapshot / "raw.npz").tocsc()
+                self._libraries = np.asarray(self._raw.sum(axis=1)).ravel()
+            valid = self._libraries > 0
+            counts = self._raw[:, idx].toarray().ravel()
+            summary, high = fit_nb_split(counts[valid], self._libraries[valid])
+            members = np.zeros(len(self.cells), dtype=bool)
+            if high is not None:
+                members[valid] = high
+            self.nb_fits[idx] = summary, members
+        return self.nb_fits[idx][1]
+
     def mask(self, rule, scopes, depth=0):
         if depth > 12:
             raise ValueError("Expression rule nesting exceeds 12")
@@ -59,6 +82,8 @@ class ExpressionSearch:
         key, value = next(iter(rule.items()))
         if key == "scope" and isinstance(value, str) and value in scopes:
             return np.isin(self.cells, scopes[value])
+        if key == "nb_high" and isinstance(value, str):
+            return self.nb_high(value)
         if key == "otsu" and isinstance(value, str):
             x = self.column(value)
             cut = positive_otsu(x)
@@ -82,6 +107,20 @@ class ExpressionSearch:
         for child in children:
             hits += self.mask(child, scopes, depth + 1)
         return hits >= k
+
+    def fitted_states(self, rule):
+        """Report the fits used by this expression rule, including one-component results."""
+        if isinstance(rule, dict):
+            if "nb_high" in rule:
+                gene = rule["nb_high"]
+                summary, mask = self.nb_fits[self.index[gene]]
+                return {gene: dict(summary, n_high=int(mask.sum()))}
+            return self.fitted_states(next(iter(rule.values())))
+        result = {}
+        if isinstance(rule, list):
+            for child in rule:
+                result.update(self.fitted_states(child))
+        return result
 
     def measure(self, request, scopes):
         op = request["action"]
@@ -126,6 +165,9 @@ class ExpressionSearch:
                         int(np.count_nonzero(outside)),
                         round(float(outside.mean()), 5) if outside.size else None,
                     ]
+                fits = self.fitted_states(rule)
+                if fits:
+                    row["nb_high_fits"] = fits
                 rows.append(row)
             return {"views": rows}
         mask = self.mask(request["rule"], scopes)
