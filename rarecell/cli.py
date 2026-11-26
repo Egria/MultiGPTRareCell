@@ -105,6 +105,7 @@ def parser():
     d.add_argument("--seed-review-batch-size", type=int, help="maximum cases per dedicated review request")
     d.add_argument("--max-agent-turns", type=int, help="total turns in A3_routed; ordinary discovery turns excluding dedicated reviews in other modes")
     d.add_argument("--routed-conflict-policy", choices=["legacy", "single"], help="reconcile frozen routed claims cell by cell")
+    d.add_argument("--routed-workers", type=int, help="concurrent independent A3_routed model calls (1..16, default 1)")
     d.add_argument("--replication-id")
     d.add_argument("--pause-after", type=int, help="checkpoint after this completed turn")
     resume_cmd = cmd("resume", False)
@@ -112,6 +113,7 @@ def parser():
     resume_cmd.add_argument("--retry-unknown", action="store_true", help="allow one extra attempt for an incomplete external call")
     resume_cmd.add_argument("--max-new-queries", type=int, help="increased cumulative query ceiling for a budget-stopped A3_routed checkpoint")
     resume_cmd.add_argument("--max-agent-turns", type=int, help="increased cumulative turn ceiling for a budget-stopped A3_routed checkpoint")
+    resume_cmd.add_argument("--routed-workers", type=int, help="concurrent independent A3_routed model calls (1..16); omit to retain the checkpoint setting")
     replay = cmd("replay-submit", False)
     replay.add_argument("--run", type=Path, required=True)
     replay.add_argument("--out", type=Path, required=True)
@@ -155,13 +157,16 @@ def dispatch(a, default_model=""):
         from .replay import replay_submit
         return replay_submit(a.run, a.out, a.prefer, a.candidate_id, a.gt)
     if cmd == "resume":
-        return resume(a.run, a.retry_unknown, max_new_queries=a.max_new_queries, max_agent_turns=a.max_agent_turns)
+        return resume(a.run, a.retry_unknown, max_new_queries=a.max_new_queries,
+                      max_agent_turns=a.max_agent_turns, routed_workers=a.routed_workers)
     if cmd == "evaluate":
         from .evaluation import evaluate
         metrics = evaluate(a.run, a.gt, a.out)
         return {"output": str(a.out), "freeze_sha256": metrics["freeze_sha256"], "submitted_partition": metrics["submitted_partition"]}
     overrides = model_overrides(a.model or default_model)
     if cmd == "discover":
+        if a.routed_workers is not None:
+            overrides["routed_workers"] = a.routed_workers
         if a.routed_conflict_policy:
             overrides["routed_conflict_policy"] = a.routed_conflict_policy
         if a.mode:

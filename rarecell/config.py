@@ -18,6 +18,14 @@ ANNOTATED_MODES = {"A1", "A3", ADAPTIVE_MODE, ROUTED_MODE}
 RESOURCES = Path(__file__).parent / "resources"
 
 
+def validate_routed_workers(value, mode):
+    if mode != ROUTED_MODE:
+        raise ValueError("routed_workers applies only to A3_routed")
+    if type(value) is not int or not 1 <= value <= 16:
+        raise ValueError("routed_workers must be an integer from 1 to 16")
+    return value
+
+
 def merge_config(base, override):
     output = dict(base)
     for key, value in override.items():
@@ -47,7 +55,9 @@ def validate_settings(cfg):
         raise ValueError("potential_names must contain nonempty names of at most 160 characters")
     if cfg.get("routed_conflict_policy", "legacy") not in ("single", "legacy"):
         raise ValueError("routed_conflict_policy must be single or legacy")
-    if set(cfg) - {"potential_names", "exhaustive_seed_review", "routed_conflict_policy"} != {"mode", "prepare", "search", "budget", "provider", "annotation"}:
+    if "routed_workers" in cfg:
+        validate_routed_workers(cfg["routed_workers"], cfg.get("mode"))
+    if set(cfg) - {"potential_names", "exhaustive_seed_review", "routed_conflict_policy", "routed_workers"} != {"mode", "prepare", "search", "budget", "provider", "annotation"}:
         raise ValueError("Unknown or missing top-level configuration section")
     for name, fields in names.items():
         section = cfg[name]

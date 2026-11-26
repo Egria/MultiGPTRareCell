@@ -45,7 +45,7 @@ def measured_rules(route, claims):
     return [records[k] for k in sorted(records)]
 
 
-def review_options(expr, groups, claims, queries, owners, ask, batches, limit):
+def review_options(expr, groups, claims, queries, owners, review_batches, limit):
     """Approve an exact former hit set or identified members; defer by default."""
     from_job = {c["job"]: c for c in claims}
     by_parent = {cid: g for g in groups for cid in g["parents"]}
@@ -110,19 +110,18 @@ def review_options(expr, groups, claims, queries, owners, ask, batches, limit):
         else:
             decisions[key] = dict(card, decision=dict(add=[], reason="Full measured rule exceeds context_bytes"),
                                   n_accepted=0)
-    for batch in batches(visible, prompt, limit, 8):
-        def validate(reply):
-            reviews = reply.get("reviews")
-            if not isinstance(reviews, dict) or reviews.keys() != batch.keys():
-                raise ValueError("Review every supplied measured boundary")
-            for key, decision in reviews.items():
-                add = decision["add"]
-                if add != "all" and (not isinstance(add, list) or not all(is_eligible(key, c) for c in add)):
-                    raise ValueError("Select only measured unclaimed hits for this option")
-                if not isinstance(decision.get("reason"),str) or not decision["reason"].strip():
-                    raise ValueError("Explain each unclaimed membership decision")
-        reviews = ask(prompt(batch), validate)["reviews"]
+    def validate(batch, reply):
+        reviews = reply.get("reviews")
+        if not isinstance(reviews, dict) or reviews.keys() != batch.keys():
+            raise ValueError("Review every supplied measured boundary")
         for key, decision in reviews.items():
+            add = decision["add"]
+            if add != "all" and (not isinstance(add, list) or not all(is_eligible(key, c) for c in add)):
+                raise ValueError("Select only measured unclaimed hits for this option")
+            if not isinstance(decision.get("reason"), str) or not decision["reason"].strip():
+                raise ValueError("Explain each unclaimed membership decision")
+    for reply in review_batches(visible, prompt, 8, validate):
+        for key, decision in reply["reviews"].items():
             if decision["add"] == "all":
                 mask = np.unpackbits(members[key], count=len(expr.cells)).astype(bool)
                 accepted = expr.cells[mask].tolist()

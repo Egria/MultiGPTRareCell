@@ -1,5 +1,6 @@
 """Budgeted model exchanges and projection of immutable nominations into disjoint claims."""
 from collections import Counter, defaultdict
+from functools import partial
 
 import numpy as np
 
@@ -30,7 +31,7 @@ def _batches(rows, prompt, limit, size):
         yield batch
 
 
-def adjudicate(ctrl, claims, ask, queries=(), version=2):
+def adjudicate(ctrl, claims, ask, queries=(), version=2, *, ask_many=None):
     cells = list(ctrl.cells)
     ids = {cell: i for i, cell in enumerate(cells)}
     limit = ctrl.budget["context_bytes"]
@@ -39,29 +40,35 @@ def adjudicate(ctrl, claims, ask, queries=(), version=2):
     quality = {cid: c.get("label_reliability") for cid, c in indexed.items()}
     unknown = {cid: {k: c[k] for k in ("label", "reason", "support")} for cid, c in indexed.items()
              if label(c["label"]) and quality[cid] not in ("supported", "uncertain")}
+
+    def review_batches(rows, prompt, size, validate):
+        requests = [(prompt(batch), partial(validate, batch)) for batch in _batches(rows, prompt, limit, size)]
+        if ask_many is not None:
+            return ask_many(requests)
+        return [ask(context, check) for context, check in requests]
+
     def quality_prompt(batch):
         return dict(tissue, phase="conflict_label_audit", candidates=batch,
                     instruction='Assess the proposed identity of each frozen group using its rationale. Distinguish identity from purity or exact boundary. Return {"reviews":{candidate_id:"supported" or "uncertain"}}. A support number alone is insufficient.')
-    for batch in _batches(unknown, quality_prompt, limit, 24):
-        def validate_quality(reply):
-            reviews = reply.get("reviews")
-            if not isinstance(reviews, dict) or reviews.keys() != batch.keys() or any(v not in ("supported", "uncertain") for v in reviews.values()):
-                raise ValueError("Assess every supplied group name")
-        quality.update(ask(quality_prompt(batch), validate_quality)["reviews"])
+    def validate_quality(batch, reply):
+        reviews = reply.get("reviews")
+        if not isinstance(reviews, dict) or reviews.keys() != batch.keys() or any(v not in ("supported", "uncertain") for v in reviews.values()):
+            raise ValueError("Assess every supplied group name")
+    for reply in review_batches(unknown, quality_prompt, 24, validate_quality):
+        quality.update(reply["reviews"])
     names = sorted({c["label"] for cid, c in indexed.items() if label(c["label"]) and quality[cid] == "supported"})
     def panel_prompt(batch):
         return dict(tissue, phase="conflict_panel_nomination", labels=list(batch), vocabulary=names,
                     instruction='Using only the class names and tissue, propose discriminating coexpression evidence. Return {"labels":{name:{"canonical":exact supplied equivalent label or itself,"panels":[[gene_symbols],...],"min_positive":2,"required_panel":1}}}. Use 2-3 nonoverlapping functional panels per class, with 1-4 genes each. required_panel is optional and 1-based. Use the same canonical for true synonyms; distinguish subtypes and states. For a particular rival, optionally supply versus:{rival_canonical_name:{panels:[[genes],...],min_positive:2}} inside the class proposal. Prioritize mechanisms distinguishing those two names. Each panel is scored in each cell and compared with the opposite flank. Supply broader_labels as exact supplied names that are strict biological ancestors (exclude states, related types and synonyms). Use [] when none apply. Supply lineage_family using the same broad lineage name for relatives across the vocabulary, or an empty string when uncertain.')
     specs = {}
-    for batch in _batches(dict.fromkeys(names), panel_prompt, limit, 32):
-        def validate_batch(reply):
-            partial = reply.get("labels")
-            if not isinstance(partial, dict) or partial.keys() != batch.keys():
-                raise ValueError("Supply marker panels for each supplied name")
-            # Validate the per-label shape even when its alias is specified in another batch.
-            for name, s in partial.items():
-                validate_proposal(name, s, names)
-        specs.update(ask(panel_prompt(batch), validate_batch)["labels"])
+    def validate_labels(batch, reply):
+        proposals = reply.get("labels")
+        if not isinstance(proposals, dict) or proposals.keys() != batch.keys():
+            raise ValueError("Supply marker panels for each supplied name")
+        for name, proposal in proposals.items():
+            validate_proposal(name, proposal, names)
+    for reply in review_batches(dict.fromkeys(names), panel_prompt, 32, validate_labels):
+        specs.update(reply["labels"])
     try:
         validate_panels(names, specs)
     except ValueError as exc:
@@ -93,10 +100,10 @@ def adjudicate(ctrl, claims, ask, queries=(), version=2):
             if focus is not None:
                 data["phase"] = "unclaimed_conflict_measured_review"
             return data
-        for batch in _batches(cards, context, limit, 8):
-            def validate_batch(reply):
-                validate_rulings(batch, reply.get("rules"))
-            rules.update(ask(context(batch), validate_batch)["rules"])
+        def validate(batch, reply):
+            validate_rulings(batch, reply.get("rules"))
+        for reply in review_batches(cards, context, 8, validate):
+            rules.update(reply["rules"])
         fallbacks = []
         parents = relationships(specs) if version == 2 else {}
         owners, votes, ties = choose(cells, active, pairs, rules, parents, fallbacks, focus)
@@ -105,7 +112,7 @@ def adjudicate(ctrl, claims, ask, queries=(), version=2):
     owners, votes, ties, cards, rules, fallbacks = resolve(groups)
     extra = {}
     if version == 2:
-        approvals, decisions = review_options(expr, groups, claims, queries, owners, ask, _batches, limit)
+        approvals, decisions = review_options(expr, groups, claims, queries, owners, review_batches, limit)
         counts = Counter(c for members in approvals.values() for c in members)
         for gid, members in approvals.items():
             owners.update((c, gid) for c in members if counts[c] == 1)
@@ -155,6 +162,64 @@ def project(ctrl, result):
                        None, source="forced_single_choice")
 
 
+def _ask_independent(route, requests, ask, retry_unknown, pause_after):
+    """Dispatch a phase's disjoint response objects, then validate them on the controller thread."""
+    from .run import obtain_parallel
+
+    ctrl, state = route.ctrl, route.s
+    workers = 1 if ctrl.budget.get("max_reported_tokens") else ctrl.cfg.get("routed_workers", 1)
+    wave = state.get_meta("forced_review_wave")
+    if not requests or (workers == 1 and not wave):
+        return [ask(ctx, validate) for ctx, validate in requests]
+    jobs = {fingerprint(ctx): (ctx, validate) for ctx, validate in requests}
+    if wave and wave[0]["key"] not in jobs:
+        # A resumed adjudication replays cached earlier phases before it reaches the active one.
+        if not all(state.get_optional("ForcedReview", key) for key in jobs):
+            raise ValueError("Pending review wave does not match the current phase")
+        return [state.get("ForcedReview", key)["reply"] for key in jobs]
+
+    while True:
+        if not wave:
+            pending = [key for key in jobs if not state.get_optional("ForcedReview", key)]
+            finished = state.get_meta("finished_turn", 0)
+            ceiling = ctrl.budget["max_agent_turns"]
+            if pause_after is not None:
+                ceiling = min(ceiling, pause_after)
+            width = min(len(pending), workers, ceiling - finished)
+            if width <= 1:
+                # Includes exhausted budgets and their existing phase-specific defaults.
+                return [ask(ctx, validate) for ctx, validate in requests]
+            wave = []
+            for offset, key in enumerate(pending[:width], 1):
+                prior = state.get_optional("ForcedReviewError", key)
+                wave.append(dict(key=key, turn=finished + offset, previous_error=prior["error"] if prior else None))
+            state.set_meta("forced_review_wave", wave)
+
+        # The durable turn assignment survives interrupts, worker-count changes and malformed replies.
+        remaining = [item for item in wave if item["turn"] > state.get_meta("finished_turn", 0)]
+        for start in range(0, len(remaining), workers):
+            chunk = remaining[start:start + workers]
+            dispatch = []
+            for item in chunk:
+                context, _ = jobs[item["key"]]
+                if item["previous_error"] is not None:
+                    context = dict(context, previous_error=item["previous_error"])
+                dispatch.append((item["turn"], context))
+            obtain_parallel(ctrl, dispatch, retry_unknown)
+            for item in chunk:
+                try:
+                    ask(*jobs[item["key"]])
+                except StopReview as exc:
+                    if str(exc) not in {"routed_action_blocked", "retry_forced_review"}:
+                        raise
+                    # This response consumed its turn. Finish recording the already-paid siblings.
+        if any(item["previous_error"] is not None and not state.get_optional("ForcedReview", item["key"])
+               for item in wave):
+            raise StopReview("routed_action_blocked")
+        wave = None
+        state.set_meta("forced_review_wave", None)
+
+
 def finish(route, obtain, pause_after, retry_unknown):
     ctrl, s = route.ctrl, route.s
     def ask(context, validate):
@@ -166,7 +231,8 @@ def finish(route, obtain, pause_after, retry_unknown):
         turn = s.get_meta("finished_turn", 0) + 1
         exhausted = "routed_turn_budget" if turn > ctrl.budget["max_agent_turns"] else None
         cap = ctrl.budget.get("max_reported_tokens")
-        if cap:
+        mid = "%s:T%04d" % (s.get_meta("run_id"), turn)
+        if cap and s.get_optional("Message", mid) is None:
             used = [m["usage"].get("total_tokens") for m in s.all("Message")]
             if None in used or sum(used) >= cap:
                 exhausted = "max_reported_tokens" if None not in used else "token_usage_unreported"
@@ -209,9 +275,11 @@ def finish(route, obtain, pause_after, retry_unknown):
     claims = [dict(r, members=ctrl.candidate(r["candidate_id"])["members"]) for r in s.all("RouteFreeze")
             if r.get("candidate_id") and r.get("kind") == "lineage"]
     queries = measured_rules(route, claims)
+    def ask_many(requests):
+        return _ask_independent(route, requests, ask, retry_unknown, pause_after)
     while True:
         try:
-            result = adjudicate(ctrl, claims, ask, queries)
+            result = adjudicate(ctrl, claims, ask, queries, ask_many=ask_many)
             result["evidence_queries"] = queries
             with s.transaction():
                 project(ctrl, result)

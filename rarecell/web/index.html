@@ -138,6 +138,8 @@
           <label id="seed-review-field" hidden>单细胞种子调查<select name="exhaustive_seed_review">
             <option value="">沿用配置</option><option value="yes">强制逐种子调查并写明判断</option>
             <option value="no">按优先级调查</option></select></label>
+          <label id="routed-workers-field" hidden>发现模型并发数 <small>A3_routed，留空沿用配置或检查点</small>
+            <input name="routed_workers" type="number" min="1" max="16" step="1" placeholder="如 4" /></label>
           <label data-kinds="pipeline"
             >起点<select id="start">
               <option value="dataset">从数据集准备快照</option>

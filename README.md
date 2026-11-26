@@ -248,10 +248,14 @@ rarecell resume --run work/paused
 如果 `A3_routed` 的摘要是 `routed_query_budget` 或 `routed_turn_budget` 且 `submitted=false`，可以在原目录提高累计上限。下面的 4,000 包含已用额度。
 
 ```bash
-rarecell resume --run "$run" --max-new-queries 4000 --max-agent-turns 4000
+rarecell resume --run "$run" --max-new-queries 4000 --max-agent-turns 4000 --routed-workers 4
 ```
 
 控制器从 SQLite 中恢复已付费的回复、已完成的查询和冻结的候选。原始配置继续保存在 `config_resolved.yaml`，每次批准的新上限写入 `run_summary.json` 的 `budget_extensions`，旧评估对应的冻结文件保存在 `history/`。使用任务管理器时，在“恢复发现”中填入新的查询和轮次总上限。
+
+`--routed-workers` 控制一个 A3_routed 作业内最多同时发出的发现模型请求。新运行默认 1，可在 `discover` 或 `resume` 时指定 1–16。每个 seed 或名字使用独立上下文，同一候选的下一轮会等待上一轮测量。SQLite 写入、本地表达查询和最终提交由一个控制器负责。并发任务共享原来的模型、累计查询和轮次上限。启用累计 token 硬上限 `max_reported_tokens` 时，控制器逐次核算用量后再发送下一条请求。
+
+可以从 4 个 worker 开始，按项目的每分钟请求数、每分钟 token 数和实际限流情况调整。临时限流的并发请求共享冷却时间并进行有限次数的退避重试。每个 worker 仍使用配置中的发现模型。组织和项目对同一模型的请求共享额度。[OpenAI 速率限制](https://developers.openai.com/api/docs/guides/rate-limits/)
 
 ## 产物与解释
 
