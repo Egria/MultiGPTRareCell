@@ -26,7 +26,7 @@ def code_fingerprint():
     files = ("discovery.py", "run.py", "protocol.py", "science.py", "state.py", "providers.py",
              "config.py", "seed_review.py", "exhaustive.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py",
              "contrast_panels.py", "singleton_markers.py", "pool_followup.py", "nb_mixture.py", "claim_resolution.py", "handoff.py", "expansion_review.py", "routed.py", "rule_search.py",
-             "single_choice.py", "forced_routing.py", "lineage_review.py", "unclaimed_review.py", "routed_parallel.py")
+             "single_choice.py", "forced_routing.py", "lineage_review.py", "unclaimed_review.py", "routed_parallel.py", "review_recovery.py")
     return fingerprint({name: hash_file(module / name) for name in files})
 
 
@@ -573,12 +573,15 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
         retry_blocked_pair = (resumed and spec["mode"] == ROUTED_MODE and spec["policy"] == "live"
                               and previous["detail"] == "routed_action_blocked" and not previous["submitted"]
                               and (previous.get("issue") or "").startswith("Routed task pair/"))
+        retry_blocked_review = (resumed and spec["mode"] == ROUTED_MODE and spec["policy"] == "live"
+                                and cfg.get("routed_conflict_policy") == "single" and not previous["submitted"]
+                                and previous["detail"] == previous.get("issue") == "routed_action_blocked")
         # The effective extension is checkpointed before executing the first new action.
         # A killed process can therefore restart with plain resume and the same old freeze.
         reopening = extension or (budget_history and budget_history[-1]["source_freeze_sha256"] == freeze_sha)
-        if not previous["resumable"] and not retry_blocked_pair and not reopening:
+        if not previous["resumable"] and not (retry_blocked_pair or retry_blocked_review or reopening):
             return previous
-        if reopening and not (run / "state.sqlite").is_file():
+        if (reopening or retry_blocked_review) and not (run / "state.sqlite").is_file():
             raise ValueError("The original state.sqlite is required to continue discovery")
         retain_freeze(run, frozen)
     ann, astatus, annotation_detail = [], "disabled_by_mode", ""

@@ -85,7 +85,9 @@ def replay(source, snapshot, dataset, book_path, out, cfg):
                 reply = book["answers"].get(fingerprint(ctx))
                 if reply is None:
                     raise ValueError("Measured review context differs from the archived review")
-                validate(reply)
+                from .review_recovery import is_rejected
+                if not is_rejected(reply):
+                    validate(reply)
                 return reply
             phase = ctx["phase"]
             if phase == "conflict_label_audit":

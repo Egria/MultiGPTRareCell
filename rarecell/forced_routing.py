@@ -1,12 +1,12 @@
 """Budgeted model exchanges and projection of immutable nominations into disjoint claims."""
 from collections import Counter, defaultdict
-from functools import partial
 
 import numpy as np
 
 from . import providers
 from .config import fingerprint, json_bytes
 from .routed import label, response
+from .review_recovery import VALIDATION_ERRORS, conservative_relations, is_rejected, rejected_reply, review_rows
 from .rule_search import ExpressionSearch
 from .lineage_review import relationships
 from .unclaimed_review import measured_rules, review_options
@@ -41,11 +41,15 @@ def adjudicate(ctrl, claims, ask, queries=(), version=2, *, ask_many=None):
     unknown = {cid: {k: c[k] for k in ("label", "reason", "support")} for cid, c in indexed.items()
              if label(c["label"]) and quality[cid] not in ("supported", "uncertain")}
 
-    def review_batches(rows, prompt, size, validate):
-        requests = [(prompt(batch), partial(validate, batch)) for batch in _batches(rows, prompt, limit, size)]
+    recoveries = []
+    def dispatch(requests):
         if ask_many is not None:
             return ask_many(requests)
         return [ask(context, check) for context, check in requests]
+
+    def review_batches(rows, prompt, size, validate):
+        batches = list(_batches(rows, prompt, limit, size))
+        return review_rows(batches, prompt, validate, dispatch, recoveries)
 
     def quality_prompt(batch):
         return dict(tissue, phase="conflict_label_audit", candidates=batch,
@@ -68,7 +72,19 @@ def adjudicate(ctrl, claims, ask, queries=(), version=2, *, ask_many=None):
         for name, proposal in proposals.items():
             validate_proposal(name, proposal, names)
     for reply in review_batches(dict.fromkeys(names), panel_prompt, 32, validate_labels):
-        specs.update(reply["labels"])
+        specs.update({n: spec for n, spec in reply["labels"].items() if spec is not None})
+    if len(specs) < len(names):
+        # An unavailable panel must not become a biological vote via an alias.
+        names = sorted(specs)
+        for name, spec in list(specs.items()):
+            spec = dict(spec)
+            if spec["canonical"] not in specs:
+                spec["canonical"] = name
+            if "broader_labels" in spec:
+                spec["broader_labels"] = [p for p in spec["broader_labels"] if p in specs]
+            if "versus" in spec:
+                spec["versus"] = {k: v for k, v in spec["versus"].items() if k in specs}
+            specs[name] = spec
     try:
         validate_panels(names, specs)
     except ValueError as exc:
@@ -85,7 +101,16 @@ def adjudicate(ctrl, claims, ask, queries=(), version=2, *, ask_many=None):
             merged = {n: dict(specs[n], **v) for n,v in mapping.items()}
             validate_panels(names, merged)
             return merged
-        specs = repaired(ask(ctx, repaired))
+        answer = ask(ctx, repaired)
+        if is_rejected(answer):
+            failure = answer["rejected_review"]
+            safe = conservative_relations(specs)
+            changed = [n for n in names if safe[n]["canonical"] != specs[n]["canonical"]
+                       or safe[n]["broader_labels"] != specs[n].get("broader_labels", [])]
+            recoveries.append(dict(phase=ctx["phase"], message_id=failure["message_id"],
+                                   error=failure["error"], fallback=changed))
+            answer = {"labels": safe}
+        specs = repaired(answer)
     groups = build_groups(claims, quality, specs, ids)
     expr = ExpressionSearch(ctrl)
     def rule_prompt(batch):
@@ -142,6 +167,8 @@ def adjudicate(ctrl, claims, ask, queries=(), version=2, *, ask_many=None):
                 n_claimed=len(owners), n_wins_tied=ties,
                 groups=[{**{k: g[k] for k in ("id", "parents", "label", "reliable")},
                          "n_nominated": len(g["members"]), "members": sorted(by_group[g["id"]])} for g in groups])
+    if recoveries:
+        result["review_recoveries"] = recoveries
     return result
 
 
@@ -178,6 +205,17 @@ def _ask_independent(route, requests, ask, retry_unknown, pause_after):
             raise ValueError("Pending review wave does not match the current phase")
         return [state.get("ForcedReview", key)["reply"] for key in jobs]
 
+    if not wave:
+        # A former serial terminal retry can be resumed with multiple workers.
+        mid = "%s:T%04d" % (state.get_meta("run_id"), state.get_meta("finished_turn", 0))
+        receipt = state.get_optional("Receipt", mid + "/0")
+        if receipt and receipt["result"].get("error"):
+            for key, (ctx, _) in jobs.items():
+                prior = state.get_optional("ForcedReviewError", key)
+                if prior and not state.get_optional("ForcedReview", key):
+                    if _recover_consumed(state, key, ctx, prior["error"], mid) is not None:
+                        break
+
     while True:
         if not wave:
             pending = [key for key in jobs if not state.get_optional("ForcedReview", key)]
@@ -210,14 +248,33 @@ def _ask_independent(route, requests, ask, retry_unknown, pause_after):
                 try:
                     ask(*jobs[item["key"]])
                 except StopReview as exc:
-                    if str(exc) not in {"routed_action_blocked", "retry_forced_review"}:
+                    if str(exc) != "retry_forced_review":
                         raise
                     # This response consumed its turn. Finish recording the already-paid siblings.
-        if any(item["previous_error"] is not None and not state.get_optional("ForcedReview", item["key"])
-               for item in wave):
-            raise StopReview("routed_action_blocked")
+        # Older checkpoints can retain a consumed retry wave without a validated record.
+        for item in wave:
+            key = item["key"]
+            if item["previous_error"] is not None and not state.get_optional("ForcedReview", key):
+                ctx, _ = jobs[key]
+                mid = "%s:T%04d" % (state.get_meta("run_id"), item["turn"])
+                _recover_consumed(state, key, ctx, item["previous_error"], mid)
         wave = None
         state.set_meta("forced_review_wave", None)
+
+
+def _recover_consumed(state, key, context, previous_error, mid):
+    receipt = state.get_optional("Receipt", mid + "/0")
+    error = receipt and receipt["result"].get("error")
+    if not error:
+        return None
+    message = state.get("Message", mid)
+    expected_hash = fingerprint(dict(context, previous_error=previous_error))
+    if message.get("context_hash") != expected_hash:
+        return None
+    reply = rejected_reply(message, error)
+    state.put("ForcedReview", key, dict(context_ref=state.artifact(context), reply=reply,
+                                        message_id=mid, source="invalid_response"))
+    return reply
 
 
 def finish(route, obtain, pause_after, retry_unknown):
@@ -229,6 +286,11 @@ def finish(route, obtain, pause_after, retry_unknown):
             return cached["reply"]
         last = s.get_optional("ForcedReviewError", key)
         turn = s.get_meta("finished_turn", 0) + 1
+        if last and not s.get_meta("forced_review_wave"):
+            previous_mid = "%s:T%04d" % (s.get_meta("run_id"), turn - 1)
+            recovered = _recover_consumed(s, key, context, last["error"], previous_mid)
+            if recovered is not None:
+                return recovered
         exhausted = "routed_turn_budget" if turn > ctrl.budget["max_agent_turns"] else None
         cap = ctrl.budget.get("max_reported_tokens")
         mid = "%s:T%04d" % (s.get_meta("run_id"), turn)
@@ -258,14 +320,22 @@ def finish(route, obtain, pause_after, retry_unknown):
             if not msg.get("complete", True) or not isinstance(reply, dict):
                 raise ValueError("Expected one complete review object")
             validate(reply)
-        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        except VALIDATION_ERRORS as exc:
             error = str(exc)[:200]
             with s.transaction():
                 # A new turn can retry without overwriting an immutable response.
                 if not last:
                     s.put("ForcedReviewError", key, {"error": error})
-                route.complete_turn(mid, {"error": error})
-            raise StopReview("routed_action_blocked" if last else "retry_forced_review")
+                else:
+                    reply = rejected_reply(msg, error)
+                    s.put("ForcedReview", key, dict(context_ref=s.artifact(context), reply=reply,
+                                                    message_id=mid, source="invalid_response"))
+                route.complete_turn(mid, dict(action=context["phase"], status="needs_clarification", error=error))
+            if last:
+                if pause_after is not None and turn >= pause_after:
+                    raise StopReview("paused")
+                return reply
+            raise StopReview("retry_forced_review")
         with s.transaction():
             s.put("ForcedReview", key, dict(context_ref=s.artifact(context), reply=reply, message_id=mid))
             route.complete_turn(mid, dict(action=context["phase"]))

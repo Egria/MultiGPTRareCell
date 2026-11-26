@@ -217,6 +217,10 @@ def export(ctrl, status, detail, policy, annotation_status):
             summary["forced_choice"] = dict(artifact_ref=forced_ref, n_claimed=detail_record["n_claimed"],
                                              comparisons=len(detail_record["pair_votes"]),
                                              n_wins_tied=detail_record["n_wins_tied"])
+            if detail_record.get("review_recoveries"):
+                records = detail_record["review_recoveries"]
+                summary["forced_choice"]["rejected_review_batches"] = len(records)
+                summary["forced_choice"]["review_fallback_items"] = sum(len(r["fallback"]) for r in records)
             if detail_record["method"] == "routed_single_choice/2":
                 queries = detail_record["evidence_queries"]
                 route_files["route_measured_rules.jsonl"] = queries
