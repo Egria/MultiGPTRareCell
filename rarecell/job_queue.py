@@ -15,7 +15,7 @@ from contextlib import closing, contextmanager
 
 import yaml
 
-from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, ROUTED_BUDGET_STOPS, config, read_json, write_json
+from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, ROUTED_BUDGET_STOPS, config, read_json, validate_routed_workers, write_json
 from .runtime import model_overrides, project_model
 
 KINDS = {"pipeline", "prepare", "annotate", "discover", "resume", "evaluate", "demo", "inspect"}
@@ -98,10 +98,21 @@ def submit(root, project, form):
             spec[key] = input_path(form[key], project, key in {"snapshot", "annotations", "reuse_annotations", "run"})
     if kind in {"resume", "inspect"} and not (Path(spec["run"]) / "checkpoint.json").is_file():
         raise ValueError("运行目录中缺少 checkpoint.json")
+    workers = None
+    if kind in {"resume", "pipeline", "discover"} and "routed_workers" in form:
+        raw = form["routed_workers"]
+        if not raw.isascii() or not raw.isdecimal():
+            raise ValueError("并发数须为 1 到 16 的整数")
+        worker_mode = read_json(Path(spec["run"]) / "checkpoint.json")["mode"] if kind == "resume" else mode
+        workers = validate_routed_workers(int(raw), worker_mode)
+        if kind == "resume":
+            spec["routed_workers"] = workers
     if kind == "evaluate" and not (Path(spec["run"]) / "frozen.json").is_file():
         raise ValueError("运行目录中缺少 frozen.json")
     if kind in {"pipeline", "prepare", "discover", "annotate"}:
         override = model_overrides(project_model(project))
+        if workers is not None:
+            override["routed_workers"] = workers
         for field, section in (("model", "provider"), ("annotation_model", "annotation")):
             if form.get(field):
                 override[section] = {"model": form[field]}
@@ -192,7 +203,7 @@ def steps(root, task):
         yield args + cfg
     if kind == "resume":
         args = ["resume", "--run", run] + (["--retry-unknown"] if spec.get("retry_unknown") else [])
-        for key in ROUTED_BUDGET_STOPS.values():
+        for key in (*ROUTED_BUDGET_STOPS.values(), "routed_workers"):
             if key in spec:
                 args.extend(["--" + key.replace("_", "-"), str(spec[key])])
         yield args

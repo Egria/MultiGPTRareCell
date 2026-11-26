@@ -1,5 +1,6 @@
 """Checkpointed, single-writer discovery policy loop."""
 import fcntl
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 import json
 import os
@@ -13,7 +14,7 @@ import yaml
 
 from . import routed, __version__, exhaustive, pool_followup, expansion_review, providers
 from .annotation import verify_annotation
-from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, ROUTED_BUDGET_STOPS, ROUTED_MODE, RESOURCES, atomic, contract, fingerprint, hash_file, read_json, validate_settings, write_json
+from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, ROUTED_BUDGET_STOPS, ROUTED_MODE, RESOURCES, atomic, contract, fingerprint, hash_file, read_json, validate_routed_workers, validate_settings, write_json
 from .discovery import Controller, SCIENTIFIC, prompt_version
 from .finalize import export
 from .prepare import verify_snapshot
@@ -25,7 +26,7 @@ def code_fingerprint():
     files = ("discovery.py", "run.py", "protocol.py", "science.py", "state.py", "providers.py",
              "config.py", "seed_review.py", "exhaustive.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py",
              "contrast_panels.py", "singleton_markers.py", "pool_followup.py", "nb_mixture.py", "claim_resolution.py", "handoff.py", "expansion_review.py", "routed.py", "rule_search.py",
-             "single_choice.py", "forced_routing.py", "lineage_review.py", "unclaimed_review.py")
+             "single_choice.py", "forced_routing.py", "lineage_review.py", "unclaimed_review.py", "routed_parallel.py")
     return fingerprint({name: hash_file(module / name) for name in files})
 
 
@@ -86,46 +87,118 @@ def offline_message(ctrl, strategy, turn):
                        "reason": "Submit threshold-qualified expansions. Competing assignments remain unresolved."})
 
 
+def dispatch_id(state, mid, retry_unknown):
+    first, second = mid + "/api/1", mid + "/api/2"
+    if state.get_optional("ProviderDispatch", first) is None:
+        return first
+    last = second if state.get_optional("ProviderDispatch", second) is not None else first
+    if last == second or not retry_unknown:
+        failure = state.get_optional("ProviderFailure", last)
+        raise providers.ProviderError("Prior dispatch has no usable response; bounded explicit retry available once",
+                                      failure["status"] if failure else "unknown_execution")
+    return second
+
+
+def record_dispatch(state, mid, aid, context):
+    ref = state.artifact(context)
+    state.put("ProviderDispatch", aid, {"id": aid, "message_id": mid, "context_ref": ref})
+
+
+def record_reply(state, mid, context, raw, usage, complete=True):
+    item = {"message_id": mid, "complete": complete, "raw": raw, "usage": usage, "context_hash": fingerprint(context)}
+    if context.get("requested_evidence") and complete:
+        item["delivered_receipts"] = [r["receipt_id"] for r in context["requested_evidence"]]
+    state.put("Message", mid, item)
+    return item
+
+
+def record_failure(state, mid, aid, context, exc):
+    failure = {"id": aid, "status": exc.status, "detail": str(exc)}
+    if hasattr(exc, "usage"):
+        failure["usage"] = exc.usage
+    with state.transaction():
+        state.put("ProviderFailure", aid, failure)
+        if exc.status == "incomplete":
+            # Preserve paid unfinished text as a consumed turn, without parsing a partial action.
+            usage = getattr(exc, "usage", {"provider": "openai_compatible", "api_calls": 1})
+            return record_reply(state, mid, context, "", usage, complete=False)
+    return None
+
+
+def check_provider(cfg):
+    health = providers.diagnose(cfg)
+    if health["status"] == "blocked":
+        raise providers.ProviderError(health["detail"])
+
+
 def obtain(ctrl, policy, turn, retry_unknown, *, context=None):
-    s = ctrl.state
-    mid = "%s:T%04d" % (s.get_meta("run_id"), turn)
-    saved = s.get_optional("Message", mid)
+    state = ctrl.state
+    mid = "%s:T%04d" % (state.get_meta("run_id"), turn)
+    saved = state.get_optional("Message", mid)
     if saved is not None:
         return saved
     if context is None:
         context = ctrl.context(turn)
-    complete = True
     if policy != "live":
         raw = offline_message(ctrl, policy, turn)
-        usage = {"provider": policy, "api_calls": 0}
-    else:
-        health = providers.diagnose(ctrl.cfg)
-        if health["status"] == "blocked":
-            raise providers.ProviderError(health["detail"])
-        previous = [r for r in s.all("ProviderDispatch") if r["message_id"] == mid]
-        if previous:
-            error = s.get_optional("ProviderFailure", previous[-1]["id"])
-            last_status = error["status"] if error else "unknown_execution"
-            if len(previous) >= 2 or not retry_unknown:
-                raise providers.ProviderError("Prior dispatch has no usable response; bounded explicit retry available once", last_status)
-        aid = mid + "/api/" + str(len(previous) + 1)
-        ref = s.artifact(context)
-        s.put("ProviderDispatch", aid, {"id": aid, "message_id": mid, "context_ref": ref})
-        try:
-            raw, usage = providers.complete(context, ctrl.cfg)
-        except providers.ProviderError as exc:
-            s.put("ProviderFailure", aid, {"id": aid, "status": exc.status, "detail": str(exc)})
-            if exc.status != "incomplete":
-                raise
-            # A completed HTTP exchange with an unfinished answer consumes a
-            # message turn. It yields feedback, never a partially parsed action.
-            raw, complete = "", False
-            usage = getattr(exc, "usage", {"provider": "openai_compatible", "api_calls": 1})
-    item = {"message_id": mid, "complete": complete, "raw": raw, "usage": usage, "context_hash": fingerprint(context)}
-    if context.get("requested_evidence") and complete:
-        item["delivered_receipts"] = [r["receipt_id"] for r in context["requested_evidence"]]
-    s.put("Message", mid, item)
-    return item
+        return record_reply(state, mid, context, raw, {"provider": policy, "api_calls": 0})
+    check_provider(ctrl.cfg)
+    aid = dispatch_id(state, mid, retry_unknown)
+    record_dispatch(state, mid, aid, context)
+    try:
+        raw, usage = providers.complete(context, ctrl.cfg)
+    except providers.ProviderError as exc:
+        incomplete = record_failure(state, mid, aid, context, exc)
+        if incomplete is None:
+            raise
+        return incomplete
+    return record_reply(state, mid, context, raw, usage)
+
+
+def obtain_parallel(ctrl, requests, retry_unknown):
+    """Fetch one wave of independent paid replies. Only this caller touches SQLite."""
+    state = ctrl.state
+    run_id = state.get_meta("run_id")
+    pending = []
+    # Resolve ambiguous previous attempts before paying for another request in the wave.
+    for turn, context in requests:
+        mid = "%s:T%04d" % (run_id, turn)
+        if state.get_optional("Message", mid) is None:
+            pending.append((mid, dispatch_id(state, mid, retry_unknown), context))
+    if not pending:
+        return
+    if len({mid for mid, _, _ in pending}) != len(pending):
+        raise ValueError("A parallel wave must use distinct turn IDs")
+    check_provider(ctrl.cfg)
+    if not hasattr(ctrl, "provider_window"):
+        ctrl.provider_window = providers.RateLimitWindow()
+    limit = min(len(pending), ctrl.cfg.get("routed_workers", 1))
+    with ThreadPoolExecutor(max_workers=limit) as workers:
+        # A resumed wave may exceed a newly lowered worker limit. Journal only the calls
+        # we are about to start, so a stopped cohort leaves the next one undispatched.
+        for offset in range(0, len(pending), limit):
+            futures = {}
+            failures = {}
+            cohort = pending[offset:offset + limit]
+            for mid, aid, context in cohort:
+                record_dispatch(state, mid, aid, context)
+                future = workers.submit(ctrl.provider_window.complete, context, ctrl.cfg)
+                futures[future] = (mid, aid, context)
+            for future in as_completed(futures):
+                mid, aid, context = futures[future]
+                try:
+                    raw, usage = future.result()
+                except providers.ProviderError as exc:
+                    if record_failure(state, mid, aid, context, exc) is None:
+                        failures[mid] = exc
+                except Exception as exc:
+                    # Keep any other paid replies even if a worker raises unexpectedly.
+                    failures[mid] = exc
+                else:
+                    record_reply(state, mid, context, raw, usage)
+            for mid, _, _ in cohort:
+                if mid in failures:
+                    raise failures[mid]
 
 
 def repaired_locally(raw, parsed):
@@ -458,7 +531,8 @@ def resume_limits(cfg, spec, previous, freeze_sha, requested):
     return increased, {"source_freeze_sha256": freeze_sha, "previous_limits": limits, "limits": increased}
 
 
-def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=False, requested_limits=None):
+def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=False, requested_limits=None,
+             routed_workers=None):
     started = time.monotonic()
     snapshot = Path(spec["snapshot"])
     manifest = verify_snapshot(snapshot)
@@ -472,6 +546,12 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
     if (fingerprint(cfg) != spec["cfg_hash"] or fingerprint(contract()) != spec["contract_hash"]
             or spec["software"] != __version__ or (old_code != code and not migrate)):
         raise ValueError("Checkpoint configuration, contract or method version changed")
+    workers = spec.get("routed_workers", cfg.get("routed_workers", 1))
+    if routed_workers is not None:
+        validate_routed_workers(routed_workers, spec["mode"])
+    changed_workers = routed_workers is not None and routed_workers != workers
+    if changed_workers:
+        workers = routed_workers
     if (run / "manifest.json").exists():
         if read_json(run / "manifest.json")["snapshot_hash"] != manifest["snapshot_hash"]:
             raise ValueError("Prepare snapshot differs from the pinned run")
@@ -513,6 +593,8 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
             astatus, annotation_detail = "blocked", str(exc)
     if budget_history or extension:
         cfg = dict(cfg, budget=dict(cfg["budget"], **limits))
+    if spec["mode"] == ROUTED_MODE:
+        cfg = dict(cfg, routed_workers=workers)
     ctrl = Controller(snapshot, run, spec["cache"], cfg, spec["mode"], ann)
     s = ctrl.state
     try:
@@ -542,8 +624,15 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
         if extension:
             extension.update(after_turn=s.get_meta("finished_turn", 0), used_queries=s.usage()["new_queries"])
             spec = dict(spec, budget_extensions=[*budget_history, extension])
-        if migrate or extension:
+        if changed_workers:
+            spec = dict(spec, routed_workers=workers)
+        if migrate or extension or changed_workers:
             write_json(run / "checkpoint.json", spec)
+        if ctrl.routed and workers != s.get_meta("routed_workers", 1):
+            with s.transaction():
+                s.event("routed_workers_changed", {"previous": s.get_meta("routed_workers", 1),
+                                                  "workers": workers, "after_turn": s.get_meta("finished_turn", 0)})
+                s.set_meta("routed_workers", workers)
         if spec.get("budget_extensions") and s.get_meta("budget_extensions") != spec["budget_extensions"]:
             with s.transaction():
                 s.set_meta("budget_extensions", spec["budget_extensions"])
@@ -624,7 +713,7 @@ def discover(snapshot, run, cache, cfg, mode=None, policy="live", annotations=No
         return _execute(run, spec, cfg, pause_after)
 
 
-def resume(run, retry_unknown=False, *, max_new_queries=None, max_agent_turns=None):
+def resume(run, retry_unknown=False, *, max_new_queries=None, max_agent_turns=None, routed_workers=None):
     run = Path(run).resolve()
     with (run / ".controller.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -632,7 +721,8 @@ def resume(run, retry_unknown=False, *, max_new_queries=None, max_agent_turns=No
         cfg = yaml.safe_load((run / "config_resolved.yaml").read_text())
         requested = {k: v for k, v in dict(max_new_queries=max_new_queries, max_agent_turns=max_agent_turns).items()
                      if v is not None}
-        if requested and (run / ".publishing.json").exists():
+        if (requested or routed_workers is not None) and (run / ".publishing.json").exists():
             _execute(run, spec, cfg, resumed=True)  # Finish the interrupted export before archiving it.
             spec = read_json(run / "checkpoint.json")
-        return _execute(run, spec, cfg, retry_unknown=retry_unknown, resumed=True, requested_limits=requested)
+        return _execute(run, spec, cfg, retry_unknown=retry_unknown, resumed=True, requested_limits=requested,
+                        routed_workers=routed_workers)

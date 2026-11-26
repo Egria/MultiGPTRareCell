@@ -3,7 +3,7 @@
 from itertools import combinations
 import math
 
-from . import providers
+from . import providers, routed_parallel
 from .config import fingerprint, json_bytes
 from .discovery import ExpansionDepthExhausted
 from .protocol import MAX_ACTIONS, MAX_CHARS, _decode, _materialize, _json_region, _trim_trailing_commas
@@ -79,6 +79,7 @@ class RoutedDiscovery:
         self.ctrl = ctrl
         self.s = ctrl.state
         self.engine = None
+        self.clear_error_key = None
         self.terms = {}
         for ann in ctrl.annotations:
             name = label(ann.get("label"))
@@ -284,8 +285,11 @@ class RoutedDiscovery:
             evidence=c.get("route_evidence", {}),
         )
 
+    def pending_seeds(self):
+        return sorted(set(self.ctrl.seed_ids) - {r["candidate_id"] for r in self.s.all("SeedRoute")})
+
     def next_task(self):
-        pending = sorted(set(self.ctrl.seed_ids) - {r["candidate_id"] for r in self.s.all("SeedRoute")})
+        pending = self.pending_seeds()
         if pending:
             return None, self.triage_context(pending)
         frozen = {r["job"] for r in self.s.all("RouteFreeze")}
@@ -553,16 +557,48 @@ class RoutedDiscovery:
         )
         self.s.set_meta("finished_turn", int(mid.rsplit("T", 1)[1]))
         self.s.set_meta("route_last_error", None)
+        if self.clear_error_key:
+            self.s.set_meta(self.clear_error_key, None)
         self.s.event(
             "action",
             {"message_id": mid, "action": receipt.get("action"), "status": receipt.get("status", "ok")},
         )
 
+    def task_key(self, job, ctx):
+        if job:
+            return job["id"]
+        return "triage/" + ctx["seeds"][0]["candidate_id"]
+
+    def task_error(self, task):
+        last = self.s.get_meta("route_error/" + task) or self.s.get_meta("route_last_error")
+        if last and (last["task"] == task or (last["task"] == "triage" and task.startswith("triage/"))):
+            return last
+        return None
+
+    def context_for(self, job, ctx, scopes):
+        if job:
+            history = [r["exchange"] for r in self.s.all("RouteExchange") if r["job"] == job["id"]]
+            ctx = self.search_context(job, scopes, history)
+        ctx.update(tissue=self.ctrl.manifest.get("tissue"), species=self.ctrl.manifest.get("species"))
+        last = self.task_error(self.task_key(job, ctx))
+        if last:
+            ctx["previous_error"] = last["error"]
+        limit = self.ctrl.budget["context_bytes"]
+        while len(json_bytes(ctx)) > limit and ctx.get("history"):
+            ctx["history"].pop(0)
+        return ctx if len(json_bytes(ctx)) <= limit else None
+
     def run(self, obtain, pause_after, retry_unknown):
         self.s.set_meta("policy", "live")
         budget = self.ctrl.budget
         while True:
-            job, ctx = self.next_task()
+            self.clear_error_key = None
+            turn = self.s.get_meta("finished_turn", 0) + 1
+            planned = routed_parallel.planned_turn(self, turn, pause_after)
+            if planned:
+                job, ctx = planned["job"], self.s.read_artifact(planned["context_ref"])
+            else:
+                job, ctx = self.next_task()
             if job is None and ctx is None:
                 if self.ctrl.cfg.get("routed_conflict_policy") == "single":
                     from .forced_routing import finish
@@ -575,7 +611,6 @@ class RoutedDiscovery:
                         args.update(status="provisional", reason="Apply the existing overlap policy to surviving drafts, including pairs deferred by the controller.")
                     self.ctrl.decide("submit", args, None, source="controller_routed" if deferred else "agent")
                 return "complete", "submitted"
-            turn = self.s.get_meta("finished_turn", 0) + 1
             mid = f"{self.s.get_meta('run_id')}:T{turn:04d}"
             stopping = None
             if turn > budget["max_agent_turns"]:
@@ -601,23 +636,23 @@ class RoutedDiscovery:
                     return "partial", "routed_query_budget" if isinstance(
                         exc, BudgetExhausted
                     ) else "routed_retrieval_blocked"
-                history = [r["exchange"] for r in self.s.all("RouteExchange") if r["job"] == job["id"]]
-                ctx = self.search_context(job, scopes, history)
-            ctx.update(tissue=self.ctrl.manifest.get("tissue"), species=self.ctrl.manifest.get("species"))
-            task = job["id"] if job else "triage"
-            last = self.s.get_meta("route_last_error")
-            if last and last["task"] == task:
-                ctx["previous_error"] = last["error"]
-            while len(json_bytes(ctx)) > budget["context_bytes"] and ctx.get("history"):
-                ctx["history"].pop(0)
-            if len(json_bytes(ctx)) > budget["context_bytes"]:
+            if not planned:
+                ctx = self.context_for(job, ctx, scopes)
+            if ctx is None:
                 if job and job["kind"] == "pair":
                     self.defer_pair(job, "Pair context exceeds context_bytes")
                     continue
                 self.s.set_meta("current_issue", "One routed task exceeds budget.context_bytes")
                 return "partial", "context_blocked"
+            task = self.task_key(job, ctx)
+            last = self.task_error(task)
+            if last:
+                self.clear_error_key = "route_error/" + task
             try:
-                msg = obtain(self.ctrl, "live", turn, retry_unknown, context=ctx)
+                if planned:
+                    msg = routed_parallel.wave_message(self, turn, planned, retry_unknown)
+                else:
+                    msg = obtain(self.ctrl, "live", turn, retry_unknown, context=ctx)
             except providers.ProviderError as exc:
                 self.s.set_meta("current_issue", str(exc))
                 return "partial", "provider_blocked" if exc.status == "blocked" else exc.status
@@ -647,7 +682,9 @@ class RoutedDiscovery:
                     if defer:
                         self.defer_pair(job, error, mid)
                     else:
-                        self.s.set_meta("route_last_error", dict(task=task, error=error, attempts=failures))
+                        issue = dict(task=task, error=error, attempts=failures)
+                        self.s.set_meta("route_last_error", issue)
+                        self.s.set_meta("route_error/" + task, issue)
                 if exhausted and not defer:
                     self.s.set_meta("current_issue", f"Routed task {task}: {error}")
                     return "partial", "routed_action_blocked"

@@ -220,6 +220,7 @@ function updateForm() {
     true
   );
   const annotated = ["A1", "A3", "A3_adaptive", "A3_routed"].includes(mode);
+  field("routed-workers-field", ((full || kind === "discover") && mode === "A3_routed") || kind === "resume");
   field("seed-review-field", (full || kind === "discover") && ["A2", "A3", "A3_adaptive"].includes(mode));
   const showAnnotations = (full || kind === "discover") && annotated;
   field("annotations-field", showAnnotations, kind === "discover");

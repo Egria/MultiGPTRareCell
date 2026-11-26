@@ -1,17 +1,99 @@
-"""One non-streaming request to an explicitly configured discovery endpoint."""
+"""Non-streaming discovery requests to an explicitly configured endpoint."""
+from email.utils import parsedate_to_datetime
+from http.client import HTTPException
 import ipaddress
 import json
 import math
 import os
+import random
 import re
+import threading
 import time
 from urllib import error, parse, request
+
+
+RATE_LIMIT_HEADERS = tuple("x-ratelimit-" + field + "-" + resource
+                           for resource in ("requests", "tokens") for field in ("limit", "remaining", "reset"))
 
 
 class ProviderError(RuntimeError):
     def __init__(self, message, status="blocked"):
         super().__init__(message)
         self.status = status
+
+
+def _retry_after(headers):
+    raw = headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        delay = float(raw)
+    except ValueError:
+        try:
+            delay = parsedate_to_datetime(raw).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError, OSError):
+            return None
+    return max(0., delay) if math.isfinite(delay) else None
+
+
+def _http_failure(response):
+    if response.code != 429:
+        status = "temporary_failure" if response.code == 408 or response.code >= 500 else "blocked"
+        return ProviderError("HTTP {}".format(response.code), status)
+    try:
+        payload = json.loads(response.read(8192))
+        details = payload.get("error", {})
+        reasons = {str(details.get(k, "")).lower() for k in ("code", "type")}
+    except (OSError, HTTPException, ValueError, TypeError, AttributeError):
+        reasons = set()
+    if any("quota" in reason or "billing" in reason or "insufficient_credit" in reason for reason in reasons):
+        return ProviderError("HTTP 429: provider quota exhausted", "blocked")
+    failure = ProviderError("HTTP 429: provider rate limit", "temporary_failure")
+    delay = _retry_after(response.headers or {})
+    if delay is not None or reasons.intersection({"rate_limit_exceeded", "rate_limit_error", "requests", "tokens"}):
+        failure.retry_after = delay or 0.
+    return failure
+
+
+class RateLimitWindow:
+    """A single controller's concurrent calls share the provider's retry deadline."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.next_request = 0.
+
+    def wait(self):
+        while True:
+            with self.lock:
+                delay = self.next_request - time.monotonic()
+            if delay <= 0:
+                return
+            if delay > 60:
+                raise ProviderError("HTTP 429: provider requested a cooldown longer than 60 seconds", "temporary_failure")
+            time.sleep(delay)
+
+    def complete(self, context, cfg):
+        started = time.monotonic()
+        attempts = 0
+        while True:
+            try:
+                self.wait()
+                attempts += 1
+                raw, usage = complete(context, cfg)
+            except ProviderError as exc:
+                usage = dict(getattr(exc, "usage", {}), api_calls=attempts, elapsed_seconds=time.monotonic() - started)
+                exc.usage = usage
+                if not hasattr(exc, "retry_after"):
+                    raise
+                delay = max(exc.retry_after, 2 ** (attempts - 1))
+                with self.lock:
+                    self.next_request = max(self.next_request, time.monotonic() + delay)
+                if attempts >= 3 or delay > 60:
+                    raise
+                # Add per-worker jitter after the common reset to avoid another synchronized burst.
+                time.sleep(delay + random.uniform(0, 0.5))
+            else:
+                return raw, dict(usage, api_calls=attempts, elapsed_seconds=time.monotonic() - started)
 
 
 def safe_url(url):
@@ -127,6 +209,7 @@ def complete(context, cfg):
         with request.build_opener(_NoRedirect).open(req, timeout=timeout) as response:
             # Cap the buffered envelope; never parse a prefix as an action.
             raw = response.read(8388609)
+            limits = {key: response.headers[key] for key in RATE_LIMIT_HEADERS if key in response.headers}
         if len(raw) > 8388608:
             raise ProviderError("response envelope exceeds 8 MiB", "incomplete")
         packet = json.loads(raw)
@@ -135,16 +218,21 @@ def complete(context, cfg):
         exc.usage = _usage(model, started, packet)
         raise
     except error.HTTPError as exc:
-        status = "temporary_failure" if exc.code in (408, 429) or exc.code >= 500 else "blocked"
-        raise ProviderError("HTTP {}".format(exc.code), status) from None
-    except (OSError, error.URLError) as exc:
+        with exc:
+            failure = _http_failure(exc)
+        failure.usage = _usage(model, started, None)
+        raise failure from None
+    except (OSError, HTTPException, error.URLError) as exc:
         raise ProviderError("transport interrupted; remote completion unknown ({})".format(
             type(exc).__name__), "unknown_execution") from None
     except (ValueError, KeyError, IndexError, AttributeError, TypeError):
         failure = ProviderError("unrecognized response envelope", "incomplete")
         failure.usage = _usage(model, started, packet)
         raise failure from None
-    return answer, _usage(model, started, packet)
+    usage = _usage(model, started, packet)
+    if limits:
+        usage["rate_limits"] = limits
+    return answer, usage
 
 
 def _usage(model, started, packet):
