@@ -15,7 +15,7 @@ from contextlib import closing, contextmanager
 
 import yaml
 
-from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, config, read_json, write_json
+from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, ROUTED_BUDGET_STOPS, config, read_json, write_json
 from .runtime import model_overrides, project_model
 
 KINDS = {"pipeline", "prepare", "annotate", "discover", "resume", "evaluate", "demo", "inspect"}
@@ -87,6 +87,12 @@ def submit(root, project, form):
     }
     if kind == "resume" and form.get("retry_unknown") == "yes":
         spec["retry_unknown"] = True
+    if kind == "resume":
+        for key in ROUTED_BUDGET_STOPS.values():
+            if key in form:
+                if not form[key].isascii() or not form[key].isdecimal():
+                    raise ValueError("续跑上限须为非负整数")
+                spec[key] = int(form[key])
     for key in path_fields[kind]:
         if form.get(key):
             spec[key] = input_path(form[key], project, key in {"snapshot", "annotations", "reuse_annotations", "run"})
@@ -185,7 +191,11 @@ def steps(root, task):
             args += ["--annotations", annotations]
         yield args + cfg
     if kind == "resume":
-        yield ["resume", "--run", run] + (["--retry-unknown"] if spec.get("retry_unknown") else [])
+        args = ["resume", "--run", run] + (["--retry-unknown"] if spec.get("retry_unknown") else [])
+        for key in ROUTED_BUDGET_STOPS.values():
+            if key in spec:
+                args.extend(["--" + key.replace("_", "-"), str(spec[key])])
+        yield args
     if kind == "evaluate" or (kind in {"pipeline", "resume", "discover"} and spec.get("gt")):
         yield ["evaluate", "--run", run, "--gt", spec["gt"], "--out", str(dest / "evaluation")]
 

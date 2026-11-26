@@ -323,6 +323,73 @@ def overlap_reply(ctx):
     raise AssertionError(ctx["phase"])
 
 
+def test_extend_query_then_turn_budget_replays_paid_response(tmp_path, monkeypatch):
+    from rarecell import run as runner
+    from rarecell.config import RESOURCES, hash_file
+    from rarecell.state import State
+
+    cfg, snapshot, annotations, _ = setup_input(tmp_path)
+    cfg["potential_names"] = ["L", "M"]
+    cfg["budget"].update(max_new_queries=1, max_agent_turns=3)
+    monkeypatch.setattr(runner, "verify_annotation", lambda *a, **kw: [])
+    dispatches = []
+
+    def reply(ctx, cfg):
+        dispatches.append((ctx["phase"], ctx.get("target")))
+        if ctx["phase"] == "boundary_review":
+            action = dict(action="resolve", choice="left", reason="Retain measured boundary")
+        elif ctx.get("target") == "M" and not ctx["history"]:
+            action = dict(action="survey", genes=["H"])
+        else:
+            action = overlap_reply(ctx)
+        return json.dumps(action), {"api_calls": 1, "total_tokens": 10}
+
+    monkeypatch.setattr(providers, "complete", reply)
+    run, cache = tmp_path / "run", tmp_path / "cache"
+    compatible = read_json(RESOURCES / "routed_checkpoint_upgrade.json")
+    with monkeypatch.context() as old:
+        old.setattr(runner, "code_fingerprint", lambda: compatible["also_from"][-1])
+        before = discover(snapshot, run, cache, cfg, annotations=annotations)
+    assert before["detail"] == "routed_query_budget" and not before["submitted"]
+    assert resume(run) == before
+    with pytest.raises(ValueError, match="exhausted cumulative ceiling"):
+        resume(run, max_agent_turns=8)
+    original_freeze = hash_file(run / "frozen.json")
+    with closing(State(run, cache)) as state:
+        messages = state.all("Message")
+        claim, = state.all("RouteFreeze")
+        assert state.get_meta("finished_turn") == 2 and len(messages) == 3
+    queue = tmp_path / "tasks"
+    job_queue.initialize(queue)
+    task = job_queue.submit(queue, tmp_path, dict(kind="resume", run=str(run), max_new_queries="10"))
+    args = parser().parse_args(next(job_queue.steps(queue, job_queue.get_task(queue, task))))
+    assert args.cmd == "resume" and args.max_new_queries == 10 and args.max_agent_turns is None
+    # Simulate a killed process just after the increased budget has been saved.
+    with monkeypatch.context() as crash:
+        def interrupt(*args):
+            raise SystemExit
+        crash.setattr(RoutedDiscovery, "apply", interrupt)
+        with pytest.raises(SystemExit):
+            resume(run, max_new_queries=10)
+    middle = resume(run)
+    assert middle["detail"] == "routed_turn_budget" and len(dispatches) == 3
+    assert hash_file(run / "history" / original_freeze / "frozen.json") == original_freeze
+    grant, = middle["budget_extensions"]
+    assert grant == dict(source_freeze_sha256=original_freeze, previous_limits=dict(max_new_queries=1, max_agent_turns=3),
+                         limits=dict(max_new_queries=10, max_agent_turns=3), after_turn=2, used_queries=1)
+    with pytest.raises(ValueError, match="at least as high"):
+        resume(run, max_new_queries=9, max_agent_turns=8)
+    after = resume(run, max_agent_turns=8)
+    assert after["submitted"] and len(dispatches) == 5
+    assert len(after["budget_extensions"]) == 2
+    assert after["budget_extensions"][-1]["used_queries"] == 2
+    assert after["budget_extensions"][-1]["limits"] == dict(max_new_queries=10, max_agent_turns=8)
+    with closing(State(run, cache)) as state:
+        assert state.all("Message")[:len(messages)] == messages
+        assert claim in state.all("RouteFreeze")
+    assert resume(run, max_new_queries=10, max_agent_turns=8) == after
+
+
 @pytest.mark.parametrize("stop", ["bad_decisions", "turn_budget"])
 def test_deferred_pair_uses_normal_submission_policy(tmp_path, monkeypatch, stop):
     cfg, snap, ann_dir, _ = setup_input(tmp_path)

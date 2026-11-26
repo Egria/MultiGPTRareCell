@@ -241,7 +241,7 @@ function updateForm() {
     prepare: "使用配置中指定的视角生成快照，结果保存在本任务目录。",
     annotate: "将调用配置中的 OntoAnno 模型，可在后续发现任务中复用输出目录。",
     discover: "使用真实主 Agent 调查候选，API 调用使用服务端环境中的密钥。",
-    resume: "沿用 checkpoint 中冻结的模型和预算，仅恢复发现阶段。",
+    resume: "恢复原发现进度。A3_routed 因预算停止时，请提高已耗尽的总上限。",
     evaluate: "从冻结结果和完整的 cell_id、label 真值表生成评估。"
   };
   $("form-hint").textContent = hints[kind];

@@ -156,6 +156,10 @@
           <label data-kinds="resume evaluate inspect"
             >发现运行目录<input name="run" placeholder="work/A3" required
           /></label>
+          <label data-kinds="resume">查询总上限 <small>A3_routed 追加预算时填写</small>
+            <input name="max_new_queries" type="number" min="0" step="1" /></label>
+          <label data-kinds="resume">模型轮次总上限 <small>包含已完成轮次</small>
+            <input name="max_agent_turns" type="number" min="0" step="1" /></label>
           <label data-kinds="pipeline prepare annotate discover"
             >配置文件 <small>可选，YAML</small><input name="config" placeholder="real_openai.yaml"
           /></label>
