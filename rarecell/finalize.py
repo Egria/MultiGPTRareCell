@@ -169,6 +169,8 @@ def export(ctrl, status, detail, policy, annotation_status):
     if s.get_meta("code_upgrade"):
         summary["code_upgrade"] = s.get_meta("code_upgrade")
         summary["code_upgrades"] = s.get_meta("code_upgrades", [summary["code_upgrade"]])
+    if s.get_meta("budget_extensions"):
+        summary["budget_extensions"] = s.get_meta("budget_extensions")
     if s.get_meta("closeout_trigger"):
         summary["closeout_trigger"] = s.get_meta("closeout_trigger")
     if ctrl.adaptive or policy == "live":

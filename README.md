@@ -243,7 +243,15 @@ rarecell discover --snapshot work/prepared --mode A2 --config real.yaml \
 rarecell resume --run work/paused
 ```
 
-暂停导出的 frozen.json 及其文件在恢复时保存于 history，原先已评分的部分分配仍可复核。正常提交后重复 resume 只核验并读取冻结结果。中断的本地计算会检查已发布产物并恢复；同一组的成员编辑事务要么全部提交，要么全部回滚。网络断开时远端可能已执行。检查服务记录后，可用 resume --run work/paused --retry-unknown 明确发起一次额外尝试。改变发现模型、配额、方法或冻结输入时使用新的运行目录。若 A1/A3 因注释阻塞，可在原先指定的注释目录完成 annotate，然后 resume。收到格式错误时查 events.jsonl 和 SQLite 中的 Receipt，以确定哪个请求需要澄清。
+暂停导出的 frozen.json 及其文件在恢复时保存于 history，原先已评分的部分分配仍可复核。正常提交后重复 resume 只核验并读取冻结结果。中断的本地计算会检查已发布产物并恢复；同一组的成员编辑事务要么全部提交，要么全部回滚。网络断开时远端可能已执行。检查服务记录后，可用 resume --run work/paused --retry-unknown 明确发起一次额外尝试。改变发现模型、方法或冻结输入时使用新的运行目录。若 A1/A3 因注释阻塞，可在原先指定的注释目录完成 annotate，然后 resume。收到格式错误时查 events.jsonl 和 SQLite 中的 Receipt，以确定哪个请求需要澄清。
+
+如果 `A3_routed` 的摘要是 `routed_query_budget` 或 `routed_turn_budget` 且 `submitted=false`，可以在原目录提高累计上限。下面的 4,000 包含已用额度。
+
+```bash
+rarecell resume --run "$run" --max-new-queries 4000 --max-agent-turns 4000
+```
+
+控制器从 SQLite 中恢复已付费的回复、已完成的查询和冻结的候选。原始配置继续保存在 `config_resolved.yaml`，每次批准的新上限写入 `run_summary.json` 的 `budget_extensions`，旧评估对应的冻结文件保存在 `history/`。使用任务管理器时，在“恢复发现”中填入新的查询和轮次总上限。
 
 ## 产物与解释
 

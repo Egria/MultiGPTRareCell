@@ -110,6 +110,8 @@ def parser():
     resume_cmd = cmd("resume", False)
     resume_cmd.add_argument("--run", type=Path, required=True)
     resume_cmd.add_argument("--retry-unknown", action="store_true", help="allow one extra attempt for an incomplete external call")
+    resume_cmd.add_argument("--max-new-queries", type=int, help="increased cumulative query ceiling for a budget-stopped A3_routed checkpoint")
+    resume_cmd.add_argument("--max-agent-turns", type=int, help="increased cumulative turn ceiling for a budget-stopped A3_routed checkpoint")
     replay = cmd("replay-submit", False)
     replay.add_argument("--run", type=Path, required=True)
     replay.add_argument("--out", type=Path, required=True)
@@ -153,7 +155,7 @@ def dispatch(a, default_model=""):
         from .replay import replay_submit
         return replay_submit(a.run, a.out, a.prefer, a.candidate_id, a.gt)
     if cmd == "resume":
-        return resume(a.run, a.retry_unknown)
+        return resume(a.run, a.retry_unknown, max_new_queries=a.max_new_queries, max_agent_turns=a.max_agent_turns)
     if cmd == "evaluate":
         from .evaluation import evaluate
         metrics = evaluate(a.run, a.gt, a.out)

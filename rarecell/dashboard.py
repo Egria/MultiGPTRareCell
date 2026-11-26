@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 import yaml
 
 from . import job_queue as jobs
-from .config import read_json
+from .config import ROUTED_BUDGET_STOPS, read_json
 from .dashboard_diagnostics import diagnostics
 from .dashboard_transcript import transcript
 from .dashboard_reload import serve as serve
@@ -84,7 +84,8 @@ def detail(root, task_id):
     task["run_path"] = str(run) if run and (run / "checkpoint.json").is_file() else None
     summary = read_json(outputs["run_summary.json"]) if "run_summary.json" in outputs else {}
     task["resumable"] = (task["kind"] not in {"evaluate", "inspect"} and bool(task["run_path"]) and
-                         task["status"] not in jobs.ACTIVE and summary.get("resumable", True))
+                         task["status"] not in jobs.ACTIVE and (summary.get("resumable", True)
+                         or (not summary.get("submitted") and summary.get("detail") in ROUTED_BUDGET_STOPS)))
     task["metrics"] = {key: summary[key] for key in ("n_cells", "n_candidates", "n_groups", "unresolved_cells")
                        if key in summary}
     if "usage.json" in outputs:

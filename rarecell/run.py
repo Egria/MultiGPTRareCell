@@ -13,7 +13,7 @@ import yaml
 
 from . import routed, __version__, exhaustive, pool_followup, expansion_review, providers
 from .annotation import verify_annotation
-from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, ROUTED_MODE, RESOURCES, atomic, contract, fingerprint, hash_file, read_json, validate_settings, write_json
+from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, ROUTED_BUDGET_STOPS, ROUTED_MODE, RESOURCES, atomic, contract, fingerprint, hash_file, read_json, validate_settings, write_json
 from .discovery import Controller, SCIENTIFIC, prompt_version
 from .finalize import export
 from .prepare import verify_snapshot
@@ -436,7 +436,29 @@ def explore(ctrl, policy, pause_after=None, retry_unknown=False):
     return status, detail
 
 
-def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=False):
+def resume_limits(cfg, spec, previous, freeze_sha, requested):
+    """Use absolute ceilings. Only the exhausted resource can reopen a terminal freeze."""
+    budget_history = spec.get("budget_extensions", [])
+    limits = {key: cfg["budget"][key] for key in ROUTED_BUDGET_STOPS.values()}
+    if budget_history:
+        limits = budget_history[-1]["limits"]
+    if not requested:
+        return limits, None
+    if any(type(v) is not int or v < limits[k] for k, v in requested.items()):
+        raise ValueError("Resume ceilings must be integers at least as high as the current cumulative limits")
+    increased = dict(limits, **requested)
+    if budget_history and increased == limits:
+        return limits, None  # Reissuing the same ceilings after a crash or submission.
+    resource = ROUTED_BUDGET_STOPS.get(previous.get("detail"))
+    if (not freeze_sha or spec["mode"] != ROUTED_MODE or spec["policy"] != "live"
+            or previous.get("submitted") or not resource):
+        raise ValueError("Budget extensions require an unsubmitted A3_routed query- or turn-budget stop")
+    if increased[resource] <= limits[resource]:
+        raise ValueError("Increase the exhausted cumulative ceiling: " + resource)
+    return increased, {"source_freeze_sha256": freeze_sha, "previous_limits": limits, "limits": increased}
+
+
+def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=False, requested_limits=None):
     started = time.monotonic()
     snapshot = Path(spec["snapshot"])
     manifest = verify_snapshot(snapshot)
@@ -456,16 +478,28 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
     else:
         write_json(run / "manifest.json", manifest)
     publishing = run / ".publishing.json"
+    previous = {}
+    frozen = None
+    freeze_sha = None
     if (run / "frozen.json").exists() and not publishing.exists():
         frozen = read_json(run / "frozen.json")
         if any(hash_file(run / f) != h for f, h in frozen["files"].items()):
             raise ValueError("Frozen run checksum mismatch")
         previous = read_json(run / "run_summary.json")
+        freeze_sha = hash_file(run / "frozen.json")
+    limits, extension = resume_limits(cfg, spec, previous, freeze_sha, requested_limits)
+    budget_history = spec.get("budget_extensions", [])
+    if frozen is not None:
         retry_blocked_pair = (resumed and spec["mode"] == ROUTED_MODE and spec["policy"] == "live"
                               and previous["detail"] == "routed_action_blocked" and not previous["submitted"]
                               and (previous.get("issue") or "").startswith("Routed task pair/"))
-        if not previous["resumable"] and not retry_blocked_pair:
+        # The effective extension is checkpointed before executing the first new action.
+        # A killed process can therefore restart with plain resume and the same old freeze.
+        reopening = extension or (budget_history and budget_history[-1]["source_freeze_sha256"] == freeze_sha)
+        if not previous["resumable"] and not retry_blocked_pair and not reopening:
             return previous
+        if reopening and not (run / "state.sqlite").is_file():
+            raise ValueError("The original state.sqlite is required to continue discovery")
         retain_freeze(run, frozen)
     ann, astatus, annotation_detail = [], "disabled_by_mode", ""
     if spec["mode"] in ANNOTATED_MODES:
@@ -477,10 +511,12 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
             astatus = read_json(ann_dir / "annotation_status.json")["status"]
         except (OSError, KeyError, ValueError) as exc:
             astatus, annotation_detail = "blocked", str(exc)
+    if budget_history or extension:
+        cfg = dict(cfg, budget=dict(cfg["budget"], **limits))
     ctrl = Controller(snapshot, run, spec["cache"], cfg, spec["mode"], ann)
     s = ctrl.state
     try:
-        if migrate and (s.get_meta("run_id") != spec["run_id"] or not s.get_meta("initialized", False)
+        if (migrate or extension) and (s.get_meta("run_id") != spec["run_id"] or not s.get_meta("initialized", False)
                         or astatus not in {"success", "partial"} or s.get_meta("annotation_hash") != fingerprint(ann)):
             raise ValueError("Cannot upgrade routed checkpoint: original state or verified annotations differ")
         s.set_meta("run_id", spec["run_id"])
@@ -503,7 +539,15 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
             upgrade = {"from": old_code, "to": code, "after_turn": s.get_meta("finished_turn", 0)}
             history = spec.get("code_upgrades", [spec["code_upgrade"]] if spec.get("code_upgrade") else [])
             spec = dict(spec, code_sha256=code, code_upgrade=upgrade, code_upgrades=[*history, upgrade])
+        if extension:
+            extension.update(after_turn=s.get_meta("finished_turn", 0), used_queries=s.usage()["new_queries"])
+            spec = dict(spec, budget_extensions=[*budget_history, extension])
+        if migrate or extension:
             write_json(run / "checkpoint.json", spec)
+        if spec.get("budget_extensions") and s.get_meta("budget_extensions") != spec["budget_extensions"]:
+            with s.transaction():
+                s.set_meta("budget_extensions", spec["budget_extensions"])
+                s.event("budget_extended", spec["budget_extensions"][-1])
         if spec.get("code_upgrade") and s.get_meta("code_upgrade") != spec["code_upgrade"]:
             with s.transaction():
                 s.set_meta("code_upgrade", spec["code_upgrade"])
@@ -580,10 +624,15 @@ def discover(snapshot, run, cache, cfg, mode=None, policy="live", annotations=No
         return _execute(run, spec, cfg, pause_after)
 
 
-def resume(run, retry_unknown=False):
+def resume(run, retry_unknown=False, *, max_new_queries=None, max_agent_turns=None):
     run = Path(run).resolve()
     with (run / ".controller.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         spec = read_json(run / "checkpoint.json")
         cfg = yaml.safe_load((run / "config_resolved.yaml").read_text())
-        return _execute(run, spec, cfg, retry_unknown=retry_unknown, resumed=True)
+        requested = {k: v for k, v in dict(max_new_queries=max_new_queries, max_agent_turns=max_agent_turns).items()
+                     if v is not None}
+        if requested and (run / ".publishing.json").exists():
+            _execute(run, spec, cfg, resumed=True)  # Finish the interrupted export before archiving it.
+            spec = read_json(run / "checkpoint.json")
+        return _execute(run, spec, cfg, retry_unknown=retry_unknown, resumed=True, requested_limits=requested)

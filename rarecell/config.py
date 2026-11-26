@@ -10,6 +10,7 @@ import yaml
 
 ADAPTIVE_MODE = "A3_adaptive"
 ROUTED_MODE = "A3_routed"
+ROUTED_BUDGET_STOPS = {"routed_query_budget": "max_new_queries", "routed_turn_budget": "max_agent_turns"}
 MODES = ("A0", "A1", "A2", "A3", ADAPTIVE_MODE, ROUTED_MODE)
 ACTIVE_MODES = {"A2", "A3", ADAPTIVE_MODE, ROUTED_MODE}
 ANNOTATED_MODES = {"A1", "A3", ADAPTIVE_MODE, ROUTED_MODE}
