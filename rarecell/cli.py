@@ -128,6 +128,8 @@ def parser():
     origin.add_argument("--snapshot", type=Path)
     origin.add_argument("--dataset", type=Path, help="exact original input bound to the review book")
     forced.add_argument("--review-book", type=Path, help="Defaults to the review book saved by the source run")
+    forced.add_argument("--direct-votes", action="store_true",
+                        help="verify the historical owners, then adjudicate them using the frozen direct votes")
     forced.add_argument("--out", type=Path, required=True)
     e = cmd("evaluate", False)
     e.add_argument("--run", type=Path, required=True)
@@ -185,7 +187,7 @@ def dispatch(a, default_model=""):
     cfg = config(a.config, overrides)
     if cmd == "reconcile-routed":
         from .forced_replay import replay
-        return replay(a.run, a.snapshot, a.dataset, a.review_book, a.out, cfg)
+        return replay(a.run, a.snapshot, a.dataset, a.review_book, a.out, cfg, direct_votes=a.direct_votes)
     if cmd == "doctor":
         return doctor(cfg)
     if cmd == "prepare":

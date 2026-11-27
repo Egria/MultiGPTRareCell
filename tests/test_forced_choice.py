@@ -190,6 +190,101 @@ def test_cross_fitted_marker_votes_require_reliable_separate_families():
     assert not measure(x,cells,idx,groups,specs)[1]
 
 
+def test_direct_vote_challenges_respect_cycles_parents_and_stages():
+    from copy import deepcopy
+    from rarecell.single_choice import apply_direct_votes
+
+    def ballot(left, right, winner, mode, cells):
+        return dict(pair=f"{left}/{right}", outcomes=[[c, winner, mode, 0.75] for c in cells])
+
+    groups = [dict(id=k, label=k, reliable=True, members=list("xyzuv") if k == "B" else [])
+              for k in "ABCP"]
+    result = dict(groups=groups, panels={k: dict(canonical=k) for k in "ABCP"},
+                  parent_fallbacks=[["x", "P", "B", ["P"]]],
+                  pair_votes=[ballot("A", "B", "A", "cross_fitted_modules", "xyz"),
+                              ballot("B", "C", "B", "biology", "y"),
+                              ballot("A", "C", "C", "biology", "y"),
+                              ballot("B", "C", "B", "biology", "v"),
+                              ballot("A", "C", "C", "biology", "z"),
+                              ballot("P", "A", "P", "biology", "xz"),
+                              ballot("P", "B", "P", "biology", "xz")],
+                  unclaimed_conflicts=dict(pair_votes=[ballot("A", "B", "A", "biology", "u")]))
+    result["panels"]["A"]["broader_labels"] = ["P"]
+    shuffled = deepcopy(result)
+    shuffled["pair_votes"].reverse()
+    shuffled["groups"].reverse()
+    for artifact in (result, shuffled):
+        apply_direct_votes(artifact)
+        members = {g["id"]: g["members"] for g in artifact["groups"]}
+        assert members == {"A": ["u", "x"], "B": ["v", "y"], "C": ["z"], "P": []}
+        assert artifact["parent_fallbacks"] == [["x", "P", "A", ["P"]]]
+        assert [(c["cell_id"], c["stage"]) for c in artifact["ownership_changes"]] == [
+            ("x", "nominated"), ("z", "nominated"), ("u", "unclaimed")]
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_direct_vote_submission_and_offline_replay(tmp_path, monkeypatch, historical):
+    from rarecell import forced_routing
+    from rarecell.forced_replay import replay
+
+    cfg, snap, ann, _ = setup_input(tmp_path)
+    cfg.update(routed_conflict_policy="single", potential_names=["A", "B", "C"])
+    monkeypatch.setattr("rarecell.run.verify_annotation", lambda *args, **kw: [])
+    measure = forced_routing.measure
+
+    def measured(x, cells, index, groups, specs, focus):
+        pairs, cards = measure(x, cells, index, groups, specs, focus)
+        # A defeats B on the panel. Geometry favors B over C and C over A.
+        for pair in pairs:
+            card = cards[pair["key"]]
+            sides = (card["left"], card["right"])
+            geometry = {("A", "B"): .1, ("A", "C"): .45, ("B", "C"): .95}
+            pair["geometry"][:] = geometry[sides] if sides in geometry else 1 - geometry[sides[::-1]]
+        return pairs, cards
+
+    def reply(ctx, cfg):
+        phase = ctx["phase"]
+        if phase == "seed_triage":
+            result = dict(action="route_seeds", reviews=[dict(candidate_id=r["candidate_id"],
+                          reliability="unknown", reason="unknown", guide_label="") for r in ctx["seeds"]])
+        elif phase == "seed_expansion":
+            result = dict(action="freeze", rule=None, reason="abstain", support=0)
+        elif phase == "blind_name_search":
+            result = dict(action="freeze", rule={"any": ["G", "H"]}, reason="observed", support=80,
+                          label_reliability="supported")
+        elif phase == "conflict_panel_nomination":
+            result = {"labels": {n: dict(canonical=n, panels=[["G"]]) for n in ctx["labels"]}}
+        else:
+            assert phase == "conflict_measured_review"
+            rules = {}
+            for key, card in ctx["pairs"].items():
+                direction = "geometry"
+                if {card["left"], card["right"]} == {"A", "B"}:
+                    direction = "left" if card["left"] == "A" else "right"
+                rules[key] = dict(default=direction, profiles={p: direction for p in card["profiles"]})
+            result = {"rules": rules}
+        return json.dumps(result), {"api_calls": 1, "total_tokens": 10}
+
+    run = tmp_path / "run"
+    monkeypatch.setattr(forced_routing, "measure", measured)
+    with monkeypatch.context() as live:
+        live.setattr(providers, "complete", reply)
+        if historical:
+            live.setattr(forced_routing, "apply_direct_votes", lambda result: None)
+        summary = discover(snap, run, tmp_path / "cache", cfg, annotations=ann)
+    assert summary["submitted"]
+    source = read_json(run / summary["forced_choice"]["artifact_ref"])
+    assert [g["label"] for g in source["groups"] if g["members"]] == ["B" if historical else "A"]
+    for change in (False, True):
+        out = tmp_path / str(change)
+        replay(run, snap, None, None, out, cfg, direct_votes=change)
+        new = read_json(out / "artifacts/forced_choice.json")
+        label = "B" if historical and not change else "A"
+        assert [(g["label"], g["members"]) for g in new["groups"] if g["members"]] == [(label, list("abcdef"))]
+        assert new["pair_votes"] == source["pair_votes"]
+        assert len(new.get("ownership_changes", [])) == (0 if label == "B" else 6)
+
+
 def test_adaptive_can_recover_unclaimed_measured_hits_and_keep_other_owners(tmp_path):
     from rarecell.discovery import Controller
     from rarecell.protocol import parse_message
