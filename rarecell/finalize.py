@@ -235,6 +235,10 @@ def export(ctrl, status, detail, policy, annotation_status):
                             members_sha256=fingerprint(detail_record["frozen_claims"]),
                             measurements_sha256=fingerprint(detail_record["measurements"]),
                             assignments_sha256=fingerprint(owners))
+                if "ownership_policy" in detail_record:
+                    book["ownership_policy"] = detail_record["ownership_policy"]
+                    summary["forced_choice"].update(ownership_policy=book["ownership_policy"],
+                        ownership_changes=len(detail_record["ownership_changes"]))
                 write_json(run / "forced_review_book.json", book)
                 summary["forced_choice"].update(parent_fallback_cells=len(detail_record["parent_fallbacks"]),
                     unclaimed_options=len(detail_record["unclaimed_reviews"]),

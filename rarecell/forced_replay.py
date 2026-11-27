@@ -12,9 +12,10 @@ from .discovery import rows
 from .finalize import jsonlines, tsv
 from .forced_routing import adjudicate
 from .prepare import verify_snapshot
+from .single_choice import apply_direct_votes
 
 
-def replay(source, snapshot, dataset, book_path, out, cfg):
+def replay(source, snapshot, dataset, book_path, out, cfg, *, direct_votes=False):
     source, out = Path(source).resolve(), Path(out).resolve()
     if out.exists():
         raise ValueError("Choose a new output directory")
@@ -26,6 +27,9 @@ def replay(source, snapshot, dataset, book_path, out, cfg):
     version = book.get("version", 1)
     if version not in (1, 2):
         raise ValueError("Unsupported forced review book version")
+    policy = book.get("ownership_policy", "aggregate_wins")
+    if policy not in ("aggregate_wins", "direct_votes"):
+        raise ValueError("Unrecognized archived ownership policy")
     if (book["snapshot_hash"] != summary["snapshot_hash"] or book["run_id"] != summary["run_id"]
             or book["route_claims_sha256"] != hash_file(source / "route_claims.jsonl")):
         raise ValueError("Review book does not match this frozen source")
@@ -105,7 +109,7 @@ def replay(source, snapshot, dataset, book_path, out, cfg):
             queries = list(read_lines(source / "route_measured_rules.jsonl"))
             if fingerprint(queries) != book["evidence_queries_sha256"]:
                 raise ValueError("Measured rule ledger differs from archived source")
-        result = adjudicate(ctrl, claims, answer, queries, version)
+        result = adjudicate(ctrl, claims, answer, queries, version, direct_votes=(policy == "direct_votes"))
         returned = result["measurements"] if version == 2 else returned
         if (fingerprint(returned) != book["measurements_sha256"]
                 or fingerprint(result["frozen_claims"]) != book["members_sha256"]):
@@ -115,6 +119,8 @@ def replay(source, snapshot, dataset, book_path, out, cfg):
             raise ValueError("Unclaimed conflicts differ from archived adjudication")
         if fingerprint(assignments) != book["assignments_sha256"]:
             raise ValueError("Final owners differ from the archived adjudication")
+        if direct_votes and policy == "aggregate_wins":
+            apply_direct_votes(result)
         artifacts = stage / "artifacts"
         artifacts.mkdir()
         write_json(artifacts / "forced_choice.json", result)
@@ -165,6 +171,8 @@ def replay(source, snapshot, dataset, book_path, out, cfg):
                     submitted=True, snapshot_hash=summary["snapshot_hash"], n_entries=len(partition),
                     n_claimed=len(owner), n_conflicted=0, n_unclaimed=len(cells) - len(owner),
                     review_book_sha256=hash_file(book_path))
+        report.update(ownership_policy=result.get("ownership_policy", policy),
+                      ownership_changes=len(result.get("ownership_changes", [])))
         write_json(stage / "run_summary.json", report)
         files = {p.relative_to(stage).as_posix(): hash_file(p) for p in sorted(stage.rglob("*")) if p.is_file()}
         write_json(stage / "frozen.json", dict(version=1, snapshot_hash=summary["snapshot_hash"], files=files))

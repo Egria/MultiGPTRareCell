@@ -10,7 +10,7 @@ from .review_recovery import VALIDATION_ERRORS, conservative_relations, is_rejec
 from .rule_search import ExpressionSearch
 from .lineage_review import relationships
 from .unclaimed_review import measured_rules, review_options
-from .single_choice import build_groups, choose, measure, validate_panels, validate_proposal, validate_rulings
+from .single_choice import apply_direct_votes, build_groups, choose, measure, validate_panels, validate_proposal, validate_rulings
 
 
 class StopReview(Exception):
@@ -31,7 +31,7 @@ def _batches(rows, prompt, limit, size):
         yield batch
 
 
-def adjudicate(ctrl, claims, ask, queries=(), version=2, *, ask_many=None):
+def adjudicate(ctrl, claims, ask, queries=(), version=2, *, ask_many=None, direct_votes=True):
     cells = list(ctrl.cells)
     ids = {cell: i for i, cell in enumerate(cells)}
     limit = ctrl.budget["context_bytes"]
@@ -169,6 +169,8 @@ def adjudicate(ctrl, claims, ask, queries=(), version=2, *, ask_many=None):
                          "n_nominated": len(g["members"]), "members": sorted(by_group[g["id"]])} for g in groups])
     if recoveries:
         result["review_recoveries"] = recoveries
+    if direct_votes:
+        apply_direct_votes(result)
     return result
 
 

@@ -6,6 +6,8 @@ import numpy as np
 from .config import fingerprint
 from .lineage_review import ModuleVotes, relationships
 
+DIRECT_MODES = frozenset(("biology", "cross_fitted_modules"))
+
 
 def _unit(x):
     return x / np.maximum(np.linalg.norm(x, axis=-1, keepdims=True), 1e-12)
@@ -311,3 +313,89 @@ def choose(cells, groups, pairs, rules, ancestors=None, fallback_log=None, focus
             ties += int(len(order) > 1 and rivals[order[0]][0] == rivals[order[1]][0])
             owners[cells[i]] = order[0]
     return owners, audit, ties
+
+
+def _reachable(start, neighbors):
+    seen = {start}
+    stack = [start]
+    while stack:
+        node = stack.pop()
+        new = neighbors[node] - seen
+        seen.update(new)
+        stack.extend(new)
+    return seen
+
+
+def _direct_owner(incumbent, ballots, labels, ancestors, removed):
+    """Resolve evidence-backed challenges to the aggregate winner on this cell."""
+    tally = defaultdict(lambda: [0, 0])
+    edges = []
+    for left, right, winner, mode, geo in ballots:
+        if left in removed or right in removed:
+            continue
+        tally[winner][0] += 1
+        # The recorded geometry is a bootstrap fraction, exported to four decimals.
+        left_ticks = round(10000 * geo)
+        tally[left][1] += left_ticks
+        tally[right][1] += 10000 - left_ticks
+        if mode in DIRECT_MODES:
+            edges.append((winner, right if winner == left else left))
+
+    broader = {parent for g in tally for parent in ancestors.get(labels[g], ())}
+    incoming, outgoing = defaultdict(set), defaultdict(set)
+    for winner, loser in edges:
+        if labels[winner] in broader or labels[loser] in broader:
+            continue
+        incoming[loser].add(winner)
+        outgoing[winner].add(loser)
+    challengers = _reachable(incumbent, incoming)
+    # Within a cycle no candidate satisfies all direct votes. Consider only source
+    # components upstream of the incumbent; an unrelated third party cannot enter.
+    ranked = sorted(challengers, key=lambda g: (g != incumbent, -tally[g][0], -tally[g][1], g))
+    for g in ranked:
+        if not incoming[g] or _reachable(g, incoming) <= _reachable(g, outgoing):
+            return g
+    raise AssertionError("Every finite directed graph has a source component")
+
+
+def apply_direct_votes(result):
+    """Update only the final ownership of reviewed cells; reuse both frozen ballot ledgers."""
+    if result.get("ownership_policy") == "direct_votes":
+        return
+    labels = {g["id"]: g["label"] if g["reliable"] else None for g in result["groups"]}
+    ancestors = relationships(result["panels"])
+    owners = {c: g["id"] for g in result["groups"] for c in g["members"]}
+    changes = []
+    for stage, ledger in (("nominated", result), ("unclaimed", result.get("unclaimed_conflicts", {}))):
+        pairs = ledger.get("pair_votes", [])
+        challenged = set()
+        for pair in pairs:
+            left, right = pair["pair"].split("/")
+            for cell, winner, mode, _ in pair["outcomes"]:
+                if mode in DIRECT_MODES and owners[cell] == (right if winner == left else left):
+                    challenged.add(cell)
+        if not challenged:
+            continue
+        ballots = defaultdict(list)
+        for pair in pairs:
+            left, right = pair["pair"].split("/")
+            for cell, winner, mode, geo in pair["outcomes"]:
+                if cell in challenged:
+                    ballots[cell].append((left, right, winner, mode, geo))
+        fallbacks = {row[0]: row for row in ledger.get("parent_fallbacks", [])}
+        for cell in sorted(challenged):
+            previous = owners[cell]
+            fallback = fallbacks.get(cell)
+            winner = _direct_owner(previous, ballots[cell], labels, ancestors, set(fallback[3]) if fallback else set())
+            if winner != previous:
+                changes.append(dict(cell_id=cell, stage=stage, previous=previous, winner=winner))
+                owners[cell] = winner
+                if fallback:
+                    fallback[2] = winner
+    by_group = defaultdict(list)
+    for cell, gid in owners.items():
+        by_group[gid].append(cell)
+    for group in result["groups"]:
+        group["members"] = sorted(by_group[group["id"]])
+    result["ownership_policy"] = "direct_votes"
+    result["ownership_changes"] = changes
