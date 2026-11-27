@@ -1,6 +1,7 @@
 import csv
 import json
 
+import pytest
 from scipy import sparse
 
 from rarecell import providers
@@ -77,9 +78,11 @@ def test_live_submission_reliable_and_uncertain_names(tmp_path, monkeypatch):
     assert all(r["group_id"].startswith("claim/") for r in rows)
 
 
-def test_review_unclaimed_across_routes_resumes_and_replays(tmp_path, monkeypatch):
+@pytest.mark.parametrize("extra_field", [None, "action", "metadata"], ids=["complete", "cached-action", "cached-metadata"])
+def test_review_unclaimed_across_routes_resumes_and_replays(tmp_path, monkeypatch, extra_field):
     from rarecell.forced_replay import replay
-    from rarecell.config import fingerprint
+    from rarecell.config import RESOURCES, fingerprint
+    from rarecell import run as runner
     cfg, snap, ann, _ = setup_input(tmp_path)
     cfg.update(routed_conflict_policy="single", potential_names=["A", "B"])
     cfg["budget"]["max_agent_turns"] = 40
@@ -107,6 +110,13 @@ def test_review_unclaimed_across_routes_resumes_and_replays(tmp_path, monkeypatc
         elif phase == "unclaimed_evidence_review":
             result = {"reviews":{k:dict(add="all" if card["label"]=="A" else ["c"],
                                         reason="Reviewed prior rule and outside hits") for k,card in ctx["options"].items()}}
+            if extra_field and len(ctx["options"]) == 2:
+                result["reviews"] = {k: v for k, v in result["reviews"].items() if ctx["options"][k]["label"] == "A"}
+            elif extra_field:
+                # Both forms sort before "reviews" when SQLite encodes the accepted response.
+                key, = ctx["options"]
+                result[extra_field] = ("review" if extra_field == "action" else
+                                       {key: dict(add=[], reason="A different, unvalidated decision")})
         else:
             assert phase == "unclaimed_conflict_measured_review"
             assert all(v["shared"] == 1 for v in ctx["pairs"].values())
@@ -116,10 +126,20 @@ def test_review_unclaimed_across_routes_resumes_and_replays(tmp_path, monkeypatc
     monkeypatch.setattr(providers,"complete",reply)
     run=tmp_path/"run"
     # Pause after the accepted addition review and before arbitrating its shared cell.
-    a=discover(snap,run,tmp_path/"cache",cfg,annotations=ann,pause_after=11)
-    assert a["resumable"] and phases[-1]=="unclaimed_evidence_review"
-    b=resume(run)
-    assert b["submitted"] and phases.count("unclaimed_evidence_review")==1
+    cutoff = 13 if extra_field else 11
+    with monkeypatch.context() as old:
+        if extra_field:
+            upgrade = read_json(RESOURCES / "routed_checkpoint_upgrade.json")
+            old.setattr(runner, "code_fingerprint", lambda: upgrade["also_from"][-1])
+        a = discover(snap, run, tmp_path / "cache", cfg, annotations=ann, pause_after=cutoff)
+    assert a["resumable"] and phases[-1] == "unclaimed_evidence_review"
+    earlier_phases = len(phases)
+    b = resume(run)
+    assert b["submitted"] and phases[earlier_phases:] == ["unclaimed_conflict_measured_review"]
+    assert phases.count("unclaimed_evidence_review") == (3 if extra_field else 1)
+    if extra_field:
+        assert b["code_upgrade"]["after_turn"] == cutoff
+        assert b["forced_choice"]["review_fallback_items"] == 0
     forced=b["forced_choice"]
     assert (forced["unclaimed_options"],forced["unclaimed_accepted"],forced["unclaimed_competing"])==(2,2,1)
     art=read_json(run/forced["artifact_ref"])

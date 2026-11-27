@@ -67,15 +67,16 @@ def review_rows(batches, prompt, validate, dispatch, audit):
                     continue
             if len(batch) > 1:
                 entry["retried"].append(key)
-                retries[key] = (single, result)
+                retries[key] = (single, field, result)
             else:
                 entry["fallback"].append(key)
                 result[key] = fallback(phase)
     if retries:
-        singles = [single for single, _ in retries.values()]
+        singles = [single for single, _, _ in retries.values()]
         repaired = review_rows(singles, prompt, validate, dispatch, audit)
-        for (_, result), answer in zip(retries.values(), repaired):
-            result.update(next(iter(answer.values())))
+        for key, answer in zip(retries, repaired):
+            _, field, destination = retries[key]
+            destination[key] = answer[field][key]
     return results
 
 

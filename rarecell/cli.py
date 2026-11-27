@@ -6,6 +6,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 from . import annotation, providers
@@ -110,6 +111,7 @@ def parser():
     d.add_argument("--pause-after", type=int, help="checkpoint after this completed turn")
     resume_cmd = cmd("resume", False)
     resume_cmd.add_argument("--run", type=Path, required=True)
+    resume_cmd.add_argument("--traceback", action="store_true", help="show the Python stack if resume raises an exception")
     resume_cmd.add_argument("--retry-unknown", action="store_true", help="allow one extra attempt for an incomplete external call")
     resume_cmd.add_argument("--max-new-queries", type=int, help="increased cumulative query ceiling for a budget-stopped A3_routed checkpoint")
     resume_cmd.add_argument("--max-agent-turns", type=int, help="increased cumulative turn ceiling for a budget-stopped A3_routed checkpoint")
@@ -217,6 +219,7 @@ def dispatch(a, default_model=""):
 
 
 def main(argv=None):
+    args = None
     try:
         args = parser().parse_args(argv)
         project = checkout(Path.cwd())
@@ -236,7 +239,10 @@ def main(argv=None):
                 return 2
         return 0
     except (OSError, ValueError, KeyError) as exc:
-        print("%s: %s" % (type(exc).__name__, exc), file=sys.stderr)
+        if getattr(args, "traceback", False):
+            traceback.print_exc()
+        else:
+            print("%s: %s" % (type(exc).__name__, exc), file=sys.stderr)
         return 2
 
 
