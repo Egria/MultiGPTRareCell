@@ -14,7 +14,7 @@ def readonly(path):
     return closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True))
 
 
-def recent_error(run):
+def recent_error(run, previously_shown=None):
     with readonly(run / "state.sqlite") as db:
         receipts = db.execute("SELECT body FROM record WHERE kind='Receipt' ORDER BY id DESC LIMIT 200")
         for (body,) in receipts:
@@ -23,6 +23,8 @@ def recent_error(run):
             if not error:
                 continue
             mid = receipt["message_id"]
+            if mid == previously_shown:
+                return mid
             dispatch = db.execute("SELECT body FROM record WHERE kind='ProviderDispatch' AND id IN (?, ?) "
                                   "ORDER BY id DESC LIMIT 1", (mid + "/api/1", mid + "/api/2")).fetchone()
             phase = receipt["result"].get("action")
@@ -30,8 +32,8 @@ def recent_error(run):
                 path = run / json.loads(dispatch[0])["context_ref"]
                 if path.is_file():
                     phase = json.loads(path.read_text()).get("phase")
-            print(f"最近的校验错误 {mid}  {phase or 'unknown'}  {error}", flush=True)
-            return
+            print(f"检查点记录的校验错误 {mid}  {phase or 'unknown'}  {error}", flush=True)
+            return mid
 
 
 def evaluation_gt(task):
@@ -58,16 +60,16 @@ def main():
         parser.error("需要 A3_routed 的运行目录")
     project = Path(__file__).resolve().parents[1]
     print(f"原地续跑 {spec['run_id']}  {run}\n进度文件 {run / 'events.jsonl'}", flush=True)
-    recent_error(run)
+    last_error = recent_error(run)
     cmd = [sys.executable, "-u", "-m", "rarecell"]
     options = ["--routed-workers", str(args.workers)] if args.workers is not None else []
-    result = subprocess.run([*cmd, "resume", "--run", str(run), *options], cwd=project)
+    result = subprocess.run([*cmd, "resume", "--traceback", "--run", str(run), *options], cwd=project)
     summary = run / "run_summary.json"
     if result.returncode not in (0, 2) or not summary.is_file():
         return result.returncode or 1
     saved = json.loads(summary.read_text())
     if saved["run_id"] != spec["run_id"] or not saved["submitted"]:
-        recent_error(run)
+        recent_error(run, last_error)
         return result.returncode or 2
     gt = args.gt or evaluation_gt(run.parent)
     if not gt or not gt.is_file():
