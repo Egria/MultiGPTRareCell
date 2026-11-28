@@ -72,6 +72,19 @@ run=$(mktemp -d "$task/discovery-routed.XXXXXX")
 
 要用新归属规则重新评估旧提交，在上述 `reconcile-routed` 命令中加 `--direct-votes`。程序先复现并校验历史归属，再应用同一批直接投票。新目录的 `artifacts/forced_choice.json` 中，`ownership_changes` 列出每个改判细胞及前后归属。
 
+在任务管理器的「完整流程」或「发现」选择 `A3_routed` 后，「争议细胞裁决」可选强制单选（默认）或允许多归属。命令行的新发现任务可指定 `--routed-conflict-policy single` 或 `multiple`。对已提交的运行，在界面选择「离线重做争议裁决」，填写原运行目录和快照即可复用投票。提供 GT 时会自动评估。也可以用命令行回放：
+
+```bash
+out="${run}.multiple"
+.venv/bin/rarecell reconcile-routed --run "$run" --snapshot "$task/snapshot" \
+  --direct-votes --routed-conflict-policy multiple --out "$out" &&
+.venv/bin/rarecell evaluate --run "$out" --gt "$gt" --out "${out}.evaluation"
+```
+
+多归属沿用单选的主归属，并考虑该细胞实际参加投票的其他候选，包括补查后获准的候选。可靠的严格父类让位于提名该细胞的可靠子类。生物学面板和交叉拟合模块的直接胜负可以排除候选。生物学裁决后仍有竞争者时，若几何重采样投票全部指向一侧，可进一步排除弱侧。普通几何多数票和稳定 ID 平局均保留歧义。每一步都保留没有被外部胜者击败的循环。多归属表示身份仍有歧义。
+
+多归属提交的 `memberships.tsv` 每行是一对细胞和群，`is_primary=1` 标记主归属。`ambiguous_cells.tsv` 每个模糊细胞一行，列出主群、群数、所有群 ID 和对应标签；没有模糊细胞时保留表头。零主归属的候选使用 `vote/G…` 群 ID。未认领细胞保留原有 residual 归属。`partition.tsv` 和 `targets.tsv` 可用于对照单选。多归属的逐目标 F1 另见 `membership_targets.tsv`，其每个群独立计成员，沿用相同的 GT 匹配和可判读细胞口径。ARI 和 NMI 仅在互斥分区上计算。
+
 旧运行请显式提供与原策略对应的 `--review-book review_book.json`。回放校验原任务、谱系成员和模型看到的表达摘要。持有匹配的原始 counts、genes、cells 与 dataset.yaml 时，也可使用 `--dataset` 替代 `--snapshot`。缺少原始 baseline 的导出仍支持提交分群评估。
 
 如果 PR #24 的 `A3_routed` 在生成 `frozen.json` 之前报 `Expansion depth exhausted for this lineage`，更新到包含修复的代码后，在原目录执行 `.venv/bin/rarecell resume --run "$run"`。兼容升级保留已完成的回复与查询，升级前后的代码指纹和完成轮数记在 `run_summary.json` 的 `code_upgrade` 中。等 `jq -e '.submitted == true' "$run/run_summary.json"` 成功后，再评估该次提交。

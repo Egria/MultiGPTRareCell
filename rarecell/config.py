@@ -53,8 +53,10 @@ def validate_settings(cfg):
     hypotheses = cfg.get("potential_names", [])
     if not isinstance(hypotheses, list) or not all(isinstance(n, str) and 0 < len(n.strip()) <= 160 for n in hypotheses):
         raise ValueError("potential_names must contain nonempty names of at most 160 characters")
-    if cfg.get("routed_conflict_policy", "legacy") not in ("single", "legacy"):
-        raise ValueError("routed_conflict_policy must be single or legacy")
+    if cfg.get("routed_conflict_policy", "legacy") not in ("single", "multiple", "legacy"):
+        raise ValueError("routed_conflict_policy must be single, multiple or legacy")
+    if cfg.get("routed_conflict_policy") == "multiple" and cfg.get("mode") != ROUTED_MODE:
+        raise ValueError("Multiple memberships require A3_routed")
     if "routed_workers" in cfg:
         validate_routed_workers(cfg["routed_workers"], cfg.get("mode"))
     if set(cfg) - {"potential_names", "exhaustive_seed_review", "routed_conflict_policy", "routed_workers"} != {"mode", "prepare", "search", "budget", "provider", "annotation"}:

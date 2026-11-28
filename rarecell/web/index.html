@@ -107,6 +107,7 @@
                 <option value="prepare">准备快照</option>
                 <option value="annotate">注释快照</option>
                 <option value="discover">从快照发现</option>
+                <option value="reconcile">离线重做争议裁决</option>
                 <option value="resume">恢复发现</option>
                 <option value="evaluate">评估结果</option>
                 <option value="inspect">查看已有运行（只读）</option>
@@ -138,6 +139,12 @@
           <label id="seed-review-field" hidden>单细胞种子调查<select name="exhaustive_seed_review">
             <option value="">沿用配置</option><option value="yes">强制逐种子调查并写明判断</option>
             <option value="no">按优先级调查</option></select></label>
+          <label id="conflict-policy-field" hidden>争议细胞裁决
+            <select name="routed_conflict_policy">
+              <option value="">沿用配置（默认强制单选）</option>
+              <option value="single">强制单选</option>
+              <option value="multiple">允许多归属，并导出模糊细胞清单</option>
+            </select></label>
           <label id="routed-workers-field" hidden>发现模型并发数 <small>A3_routed，留空沿用配置或检查点</small>
             <input name="routed_workers" type="number" min="1" max="16" step="1" placeholder="如 4" /></label>
           <label data-kinds="pipeline"
@@ -155,7 +162,7 @@
             >已有注释目录 <small id="annotations-hint"></small
             ><input name="annotations" placeholder="work/annotations"
           /></label>
-          <label data-kinds="resume evaluate inspect"
+          <label data-kinds="resume evaluate inspect reconcile"
             >发现运行目录<input name="run" placeholder="work/A3" required
           /></label>
           <label data-kinds="resume">查询总上限 <small>A3_routed 追加预算时填写</small>
@@ -171,7 +178,7 @@
               >注释模型<input name="annotation_model" placeholder="沿用配置文件中的模型"
             /></label>
           </div>
-          <label data-kinds="pipeline discover resume evaluate"
+          <label data-kinds="pipeline discover resume evaluate reconcile"
             >真值标签 TSV <small id="gt-hint"></small><input name="gt" placeholder="fixtures/pbmc_tcr/gt.tsv"
           /></label>
           <label class="check" data-kinds="resume"

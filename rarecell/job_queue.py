@@ -18,7 +18,7 @@ import yaml
 from .config import ACTIVE_MODES, ANNOTATED_MODES, MODES, ROUTED_BUDGET_STOPS, config, read_json, validate_routed_workers, write_json
 from .runtime import model_overrides, project_model
 
-KINDS = {"pipeline", "prepare", "annotate", "discover", "resume", "evaluate", "demo", "inspect"}
+KINDS = {"pipeline", "prepare", "annotate", "discover", "resume", "evaluate", "demo", "inspect", "reconcile"}
 ACTIVE = {"queued", "running", "stopping"}
 
 
@@ -74,7 +74,7 @@ def submit(root, project, form):
         raise ValueError("任务名最多 120 个字符")
     spec = {}
     required = {"prepare": ["dataset"], "annotate": ["snapshot"], "discover": ["snapshot"],
-                "resume": ["run"], "inspect": ["run"], "evaluate": ["run", "gt"]}.get(kind, [])
+                "resume": ["run"], "inspect": ["run"], "evaluate": ["run", "gt"], "reconcile": ["run", "snapshot"]}.get(kind, [])
     if kind == "pipeline" and bool(form.get("dataset")) == bool(form.get("snapshot")):
         raise ValueError("完整流程需要选择一个 dataset.yaml 或已有快照")
     if any(not form.get(k) for k in required):
@@ -83,7 +83,7 @@ def submit(root, project, form):
         "pipeline": ("dataset", "snapshot", "annotations", "reuse_annotations", "config", "gt"),
         "prepare": ("dataset", "config"), "annotate": ("snapshot", "config", "reuse_annotations"),
         "discover": ("snapshot", "annotations", "config", "gt"), "evaluate": ("run", "gt"),
-        "resume": ("run", "gt"), "inspect": ("run",), "demo": (),
+        "reconcile": ("run", "snapshot", "gt"), "resume": ("run", "gt"), "inspect": ("run",), "demo": (),
     }
     if kind == "resume" and form.get("retry_unknown") == "yes":
         spec["retry_unknown"] = True
@@ -98,6 +98,21 @@ def submit(root, project, form):
             spec[key] = input_path(form[key], project, key in {"snapshot", "annotations", "reuse_annotations", "run"})
     if kind in {"resume", "inspect"} and not (Path(spec["run"]) / "checkpoint.json").is_file():
         raise ValueError("运行目录中缺少 checkpoint.json")
+    if kind == "reconcile":
+        source = Path(spec["run"])
+        for filename in ("forced_review_book.json", "run_summary.json"):
+            if not (source / filename).is_file():
+                raise ValueError("离线裁决需要原提交目录中的 " + filename)
+        summary = read_json(source / "run_summary.json")
+        if summary.get("mode") != "A3_routed" or not summary.get("submitted"):
+            raise ValueError("请选择已提交的 A3_routed 运行")
+    if "routed_conflict_policy" in form:
+        membership_policy = form["routed_conflict_policy"]
+        if membership_policy not in {"single", "multiple"} or not (
+                kind == "reconcile" or (kind in {"pipeline", "discover"} and mode == "A3_routed")):
+            raise ValueError("请选择有效的 A3_routed 争议细胞裁决方式")
+        if kind == "reconcile":
+            spec["routed_conflict_policy"] = membership_policy
     workers = None
     if kind in {"resume", "pipeline", "discover"} and "routed_workers" in form:
         raw = form["routed_workers"]
@@ -118,6 +133,8 @@ def submit(root, project, form):
                 override[section] = {"model": form[field]}
         if kind in {"discover", "pipeline"}:
             override["mode"] = mode
+            if "routed_conflict_policy" in form:
+                override["routed_conflict_policy"] = form["routed_conflict_policy"]
             setting = form.get("exhaustive_seed_review")
             if setting in {"yes", "no"}:
                 override["exhaustive_seed_review"] = setting == "yes"
@@ -174,7 +191,7 @@ def submit(root, project, form):
 def run_path(root, task):
     if task["kind"] in {"resume", "evaluate", "inspect"}:
         return Path(task["spec"]["run"])
-    if task["kind"] in {"pipeline", "discover"}:
+    if task["kind"] in {"pipeline", "discover", "reconcile"}:
         return root / task["id"] / "run"
     if task["kind"] == "demo":
         return root / task["id"] / "demo" / "run"
@@ -207,7 +224,12 @@ def steps(root, task):
             if key in spec:
                 args.extend(["--" + key.replace("_", "-"), str(spec[key])])
         yield args
-    if kind == "evaluate" or (kind in {"pipeline", "resume", "discover"} and spec.get("gt")):
+    if kind == "reconcile":
+        args = ["reconcile-routed", "--run", spec["run"], "--snapshot", snapshot, "--direct-votes", "--out", run]
+        if "routed_conflict_policy" in spec:
+            args += ["--routed-conflict-policy", spec["routed_conflict_policy"]]
+        yield args
+    if kind == "evaluate" or (kind in {"pipeline", "resume", "discover", "reconcile"} and spec.get("gt")):
         yield ["evaluate", "--run", run, "--gt", spec["gt"], "--out", str(dest / "evaluation")]
 
 

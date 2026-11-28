@@ -217,6 +217,10 @@ def export(ctrl, status, detail, policy, annotation_status):
             summary["forced_choice"] = dict(artifact_ref=forced_ref, n_claimed=detail_record["n_claimed"],
                                              comparisons=len(detail_record["pair_votes"]),
                                              n_wins_tied=detail_record["n_wins_tied"])
+            summary["membership_policy"] = ctrl.cfg.get("routed_conflict_policy", "single")
+            if summary["membership_policy"] == "multiple":
+                from .overlap_membership import write_memberships
+                summary.update(write_memberships(run, detail_record, part))
             if detail_record.get("review_recoveries"):
                 records = detail_record["review_recoveries"]
                 summary["forced_choice"]["rejected_review_batches"] = len(records)
@@ -239,6 +243,7 @@ def export(ctrl, status, detail, policy, annotation_status):
                     book["ownership_policy"] = detail_record["ownership_policy"]
                     summary["forced_choice"].update(ownership_policy=book["ownership_policy"],
                         ownership_changes=len(detail_record["ownership_changes"]))
+                book["membership_policy"] = summary["membership_policy"]
                 write_json(run / "forced_review_book.json", book)
                 summary["forced_choice"].update(parent_fallback_cells=len(detail_record["parent_fallbacks"]),
                     unclaimed_options=len(detail_record["unclaimed_reviews"]),
@@ -261,6 +266,8 @@ def export(ctrl, status, detail, policy, annotation_status):
         files.append("pool_followups.jsonl")
     if ctrl.routed:
         files.extend(route_files)
+        if summary.get("membership_policy") == "multiple":
+            files.extend(["memberships.tsv", "ambiguous_cells.tsv"])
         if "route_measured_rules.jsonl" in route_files:
             files.append("forced_review_book.json")
     files.extend(str(p.relative_to(run)) for p in sorted((run / "artifacts").glob("*")) if p.is_file())

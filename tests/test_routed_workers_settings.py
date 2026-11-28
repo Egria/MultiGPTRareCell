@@ -68,3 +68,38 @@ def test_worker_options_in_cli_and_queue(tmp_path):
     assert args.cmd == "resume" and args.routed_workers == 1 and args.max_new_queries is None
     with pytest.raises(ValueError, match="only to A3_routed"):
         config(override={"mode": "A2", "routed_workers": 4})
+
+
+@pytest.mark.parametrize("policy", ["single", "multiple"])
+def test_membership_policy_from_dashboard_and_replay_cli(tmp_path, policy):
+    root = tmp_path / "tasks"
+    job_queue.initialize(root)
+    dataset = Path(__file__).resolve().parents[1] / "examples/minimal_sparse/input/dataset.yaml"
+    form = dict(kind="pipeline", mode=ROUTED_MODE, dataset=str(dataset),
+                routed_conflict_policy=policy, model="test", annotation_model="test")
+    task = job_queue.submit(root, tmp_path, form)
+    steps = list(job_queue.steps(root, job_queue.get_task(root, task)))
+    assert config(parser().parse_args(steps[-1]).config)["routed_conflict_policy"] == policy
+    replay = ["reconcile-routed", "--run", "old", "--out", "new", "--snapshot", "snapshot"]
+    assert parser().parse_args(replay + ["--routed-conflict-policy", policy]).routed_conflict_policy == policy
+    with pytest.raises(ValueError):
+        job_queue.submit(root, tmp_path, dict(form, mode="A3"))
+
+
+def test_dashboard_reruns_frozen_votes_in_new_directory(tmp_path):
+    root = tmp_path / "tasks"
+    job_queue.initialize(root)
+    run, snapshot = tmp_path / "original", tmp_path / "snapshot"
+    run.mkdir()
+    snapshot.mkdir()
+    write_json(run / "run_summary.json", dict(mode=ROUTED_MODE, submitted=True))
+    write_json(run / "forced_review_book.json", {})
+    gt = tmp_path / "gt.tsv"
+    gt.touch()
+    form = dict(kind="reconcile", run=str(run), snapshot=str(snapshot), gt=str(gt), routed_conflict_policy="multiple")
+    tid = job_queue.submit(root, tmp_path, form)
+    task = job_queue.get_task(root, tid)
+    reconcile, evaluate = [parser().parse_args(argv) for argv in job_queue.steps(root, task)]
+    assert reconcile.run == run and reconcile.snapshot == snapshot and reconcile.direct_votes
+    assert reconcile.routed_conflict_policy == "multiple"
+    assert evaluate.run == reconcile.out == root / tid / "run" and evaluate.gt == gt

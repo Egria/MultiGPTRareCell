@@ -112,14 +112,17 @@ def _verified(run):
     return frozen, _sha(manifest_path)
 
 
-def _partition_scores(gt, predictions):
+def _partition_scores(gt, predictions, *, multiple=False):
     if gt.keys() != predictions.keys():
         raise ValueError("Ground truth and partition cell_id sets differ")
     cells = sorted(gt)
     targets = sorted(set(gt.values()))
-    by_group = sorted(set(predictions.values()))
-    true_n, pred_n = Counter(gt.values()), Counter(predictions.values())
-    overlap = Counter((gt[cell], predictions[cell]) for cell in cells)
+    true_n, pred_n, overlap = Counter(gt.values()), Counter(), Counter()
+    for cell in cells:
+        for group in predictions[cell] if multiple else (predictions[cell],):
+            pred_n[group] += 1
+            overlap[gt[cell], group] += 1
+    by_group = sorted(pred_n)
     ti = {target: i for i, target in enumerate(targets)}
     gi = {group: i for i, group in enumerate(by_group)}
     n, m = len(ti), len(gi)
@@ -153,11 +156,14 @@ def _partition_scores(gt, predictions):
             "matched_group_gt_labels": mix[group] if group is not None else 0,
             "unmatched": group is None,
         })
-    yt, yp = [gt[c] for c in cells], [predictions[c] for c in cells]
+    ari = nmi = None
+    if not multiple:
+        yt, yp = [gt[c] for c in cells], [predictions[c] for c in cells]
+        ari = adjusted_rand_score(yt, yp)
+        nmi = normalized_mutual_info_score(yt, yp, average_method="arithmetic")
     used = {g for g in matches.values() if g is not None}
     return {
-        "ari": adjusted_rand_score(yt, yp),
-        "nmi": normalized_mutual_info_score(yt, yp, average_method="arithmetic"),
+        "ari": ari, "nmi": nmi,
         "macro_f1": float(np.mean([r["f1"] for r in per_target])),
         "n_groups": m, "n_targets": n, "n_cells": len(cells),
         "unmatched_targets": [t for t in targets if matches[t] is None],
@@ -210,9 +216,9 @@ def _target_reference(path):
     return targets
 
 
-def _target_scores(targets, predictions):
+def _target_scores(targets, predictions, *, multiple=False):
     scores = []
-    groups = set(predictions.values())
+    groups = {g for values in predictions.values() for g in values} if multiple else set(predictions.values())
     for (target, kind), states in sorted(targets.items()):
         if states.keys() != predictions.keys():
             raise ValueError(f"Cell IDs differ for target {target}")
@@ -221,10 +227,10 @@ def _target_scores(targets, predictions):
         sizes, hits = Counter(), Counter()
         for cell, state in states.items():
             if state in {"positive", "negative"}:
-                group = predictions[cell]
-                sizes[group] += 1
-                if state == "positive":
-                    hits[group] += 1
+                for group in predictions[cell] if multiple else (predictions[cell],):
+                    sizes[group] += 1
+                    if state == "positive":
+                        hits[group] += 1
         # Optimistic matching independently within each callable target endpoint.
         group = min(hits, key=lambda g: (-hits[g] / (sizes[g] + positive), g), default=None)
         tp, n = hits[group], sizes[group]
@@ -307,6 +313,23 @@ def evaluate(run: Path, gt: Path, out: Path):
         truth = read_truth(gt)
         scorer = _partition_scores
         final, extra_tables, extra_metrics = _fine_evaluation(run, truth, part)
+    if "memberships.tsv" in frozen["files"]:
+        memberships = defaultdict(set)
+        primary = {}
+        for row in _read(run / "memberships.tsv", {"cell_id", "group_id", "is_primary"}):
+            c, g, flag = row["cell_id"], row["group_id"], row["is_primary"]
+            if c not in part or not g or g in memberships[c] or flag not in ("1", "0"):
+                raise ValueError("Invalid or duplicate submitted membership")
+            memberships[c].add(g)
+            if flag == "1":
+                if c in primary or part[c]["group_id"] != g:
+                    raise ValueError("Primary membership differs from frozen partition")
+                primary[c] = g
+        if primary.keys() != part.keys():
+            raise ValueError("Primary membership missing for a submitted cell")
+        overlap_scores = scorer(truth, memberships, multiple=True)
+        extra_metrics["submitted_memberships"] = overlap_scores
+        extra_tables["membership_targets.tsv"] = (overlap_scores["per_target"], list(overlap_scores["per_target"][0]))
     baseline_rows = defaultdict(dict)
     for row in _read(run / "artifacts/baselines.tsv", {"view", "resolution", "cell_id", "group_id"}):
         group = baseline_rows[row["view"], row["resolution"]]

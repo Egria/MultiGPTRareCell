@@ -240,7 +240,7 @@ class RoutedDiscovery:
             )
         else:
             context["actions"]["freeze"] = FREEZE
-            if self.ctrl.cfg.get("routed_conflict_policy") == "single":
+            if self.ctrl.cfg.get("routed_conflict_policy") in ("single", "multiple"):
                 context["actions"]["freeze"] += " Include label_reliability (supported or uncertain) for identity independent of boundary precision."
             context["instruction"] = (
                 "Use biological knowledge to choose genes and evaluate competing explanations. "
@@ -294,7 +294,7 @@ class RoutedDiscovery:
             return None, self.triage_context(pending)
         frozen = {r["job"] for r in self.s.all("RouteFreeze")}
         job = next((j for j in self.jobs() if j["id"] not in frozen), None)
-        if job is None and self.ctrl.cfg.get("routed_conflict_policy") == "single":
+        if job is None and self.ctrl.cfg.get("routed_conflict_policy") in ("single", "multiple"):
             return None, None
         return job or next(self.pending_pairs(), None), None
 
@@ -369,7 +369,7 @@ class RoutedDiscovery:
             message_id=mid,
             query_key=key,
         )
-        if self.ctrl.cfg.get("routed_conflict_policy") == "single" and "label_reliability" in req:
+        if self.ctrl.cfg.get("routed_conflict_policy") in ("single", "multiple") and "label_reliability" in req:
             reliability = req["label_reliability"]
             if reliability not in ("supported", "uncertain"):
                 raise ValueError("label_reliability must be supported or uncertain")
@@ -600,7 +600,7 @@ class RoutedDiscovery:
             else:
                 job, ctx = self.next_task()
             if job is None and ctx is None:
-                if self.ctrl.cfg.get("routed_conflict_policy") == "single":
+                if self.ctrl.cfg.get("routed_conflict_policy") in ("single", "multiple"):
                     from .forced_routing import finish
                     return finish(self, obtain, pause_after, retry_unknown)
                 with self.s.transaction():
