@@ -50,11 +50,12 @@ def artifacts(root, task):
     dest = root / task["id"]
     run = jobs.run_path(root, task)
     base = dest / "demo" if task["kind"] == "demo" else dest
-    locations = {base / "evaluation": ["metrics.json", "targets.tsv"],
+    locations = {base / "evaluation": ["metrics.json", "targets.tsv", "membership_targets.tsv"],
                  base / "snapshot": ["manifest.json"],
                  base / ("annotation" if task["kind"] == "demo" else "annotations"): ["annotation_status.json"]}
     if run:
-        locations[run] = ["run_summary.json", "usage.json", "partition.tsv", "groups.tsv", "seed_reviews.tsv"]
+        locations[run] = ["run_summary.json", "usage.json", "partition.tsv", "groups.tsv", "seed_reviews.tsv",
+                          "memberships.tsv", "ambiguous_cells.tsv"]
     return {name: directory / name for directory, names in locations.items()
             for name in names if (directory / name).is_file()}
 
@@ -81,12 +82,13 @@ def detail(root, task_id):
         settings = run / "config_resolved.yaml"
     cfg = yaml.safe_load(settings.read_text()) if settings.is_file() else {}
     task["models"] = {section: cfg.get(section, {}).get("model") for section in ("provider", "annotation")}
-    task["run_path"] = str(run) if run and (run / "checkpoint.json").is_file() else None
+    task["run_path"] = str(run) if run and ((run / "checkpoint.json").is_file() or
+                                            (task["kind"] == "reconcile" and (run / "frozen.json").is_file())) else None
     summary = read_json(outputs["run_summary.json"]) if "run_summary.json" in outputs else {}
-    task["resumable"] = (task["kind"] not in {"evaluate", "inspect"} and bool(task["run_path"]) and
+    task["resumable"] = (task["kind"] not in {"evaluate", "inspect", "reconcile"} and bool(task["run_path"]) and
                          task["status"] not in jobs.ACTIVE and (summary.get("resumable", True)
                          or (not summary.get("submitted") and summary.get("detail") in ROUTED_BUDGET_STOPS)))
-    task["metrics"] = {key: summary[key] for key in ("n_cells", "n_candidates", "n_groups", "unresolved_cells")
+    task["metrics"] = {key: summary[key] for key in ("n_cells", "n_candidates", "n_groups", "unresolved_cells", "n_ambiguous_cells", "n_memberships")
                        if key in summary}
     if "usage.json" in outputs:
         usage = read_json(outputs["usage.json"])

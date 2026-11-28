@@ -105,7 +105,7 @@ def parser():
     d.add_argument("--context-bytes", type=int, help="discovery context size in serialized bytes")
     d.add_argument("--seed-review-batch-size", type=int, help="maximum cases per dedicated review request")
     d.add_argument("--max-agent-turns", type=int, help="total turns in A3_routed; ordinary discovery turns excluding dedicated reviews in other modes")
-    d.add_argument("--routed-conflict-policy", choices=["legacy", "single"], help="reconcile frozen routed claims cell by cell")
+    d.add_argument("--routed-conflict-policy", choices=["legacy", "single", "multiple"], help="reconcile frozen routed claims cell by cell")
     d.add_argument("--routed-workers", type=int, help="concurrent independent A3_routed model calls (1..16, default 1)")
     d.add_argument("--replication-id")
     d.add_argument("--pause-after", type=int, help="checkpoint after this completed turn")
@@ -128,6 +128,8 @@ def parser():
     origin.add_argument("--snapshot", type=Path)
     origin.add_argument("--dataset", type=Path, help="exact original input bound to the review book")
     forced.add_argument("--review-book", type=Path, help="Defaults to the review book saved by the source run")
+    forced.add_argument("--routed-conflict-policy", choices=("single", "multiple"),
+                        help="export exclusive or overlapping membership; defaults to the archived policy")
     forced.add_argument("--direct-votes", action="store_true",
                         help="verify the historical owners, then adjudicate them using the frozen direct votes")
     forced.add_argument("--out", type=Path, required=True)
@@ -166,7 +168,7 @@ def dispatch(a, default_model=""):
     if cmd == "evaluate":
         from .evaluation import evaluate
         metrics = evaluate(a.run, a.gt, a.out)
-        return {"output": str(a.out), "freeze_sha256": metrics["freeze_sha256"], "submitted_partition": metrics["submitted_partition"]}
+        return {"output": str(a.out), "freeze_sha256": metrics["freeze_sha256"], **{k: metrics[k] for k in ("submitted_partition", "submitted_memberships") if k in metrics}}
     overrides = model_overrides(a.model or default_model)
     if cmd == "discover":
         if a.routed_workers is not None:
@@ -187,7 +189,8 @@ def dispatch(a, default_model=""):
     cfg = config(a.config, overrides)
     if cmd == "reconcile-routed":
         from .forced_replay import replay
-        return replay(a.run, a.snapshot, a.dataset, a.review_book, a.out, cfg, direct_votes=a.direct_votes)
+        return replay(a.run, a.snapshot, a.dataset, a.review_book, a.out, cfg, direct_votes=a.direct_votes,
+                      membership_policy=a.routed_conflict_policy)
     if cmd == "doctor":
         return doctor(cfg)
     if cmd == "prepare":

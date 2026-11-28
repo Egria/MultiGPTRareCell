@@ -222,13 +222,13 @@ def test_direct_vote_challenges_respect_cycles_parents_and_stages():
             ("x", "nominated"), ("z", "nominated"), ("u", "unclaimed")]
 
 
-@pytest.mark.parametrize("historical", [False, True])
-def test_direct_vote_submission_and_offline_replay(tmp_path, monkeypatch, historical):
+@pytest.mark.parametrize("historical,policy", [(False, "single"), (True, "single"), (False, "multiple")])
+def test_direct_vote_submission_and_offline_replay(tmp_path, monkeypatch, historical, policy):
     from rarecell import forced_routing
     from rarecell.forced_replay import replay
 
     cfg, snap, ann, _ = setup_input(tmp_path)
-    cfg.update(routed_conflict_policy="single", potential_names=["A", "B", "C"])
+    cfg.update(routed_conflict_policy=policy, potential_names=["A", "B", "C"])
     monkeypatch.setattr("rarecell.run.verify_annotation", lambda *args, **kw: [])
     measure = forced_routing.measure
 
@@ -275,9 +275,41 @@ def test_direct_vote_submission_and_offline_replay(tmp_path, monkeypatch, histor
     assert summary["submitted"]
     source = read_json(run / summary["forced_choice"]["artifact_ref"])
     assert [g["label"] for g in source["groups"] if g["members"]] == ["B" if historical else "A"]
+    if policy == "multiple":
+        from rarecell.evaluation import evaluate
+
+        assert summary["n_ambiguous_cells"] == 6 and summary["n_memberships"] == 12
+        memberships = list(csv.DictReader((run / "memberships.tsv").read_text().splitlines(), delimiter="\t"))
+        assert {r["proposed_label"] for r in memberships if r["is_primary"] == "1"} == {"A"}
+        assert {r["proposed_label"] for r in memberships if r["is_primary"] == "0"} == {"C"}
+        assert all(r["group_id"].startswith("vote/") for r in memberships if r["proposed_label"] == "C")
+        ambiguous = list(csv.DictReader((run / "ambiguous_cells.tsv").read_text().splitlines(), delimiter="\t"))
+        assert {r["cell_id"] for r in ambiguous} == set("abcdef")
+        for row in ambiguous:
+            assert json.loads(row["labels"]) == ["A", "C"]
+            assert json.loads(row["group_ids"]) == [r["group_id"] for r in memberships if r["cell_id"] == row["cell_id"]]
+        gt = tmp_path / "reference.tsv"
+        gt.write_text("cell_id\ttarget_id\treference_kind\tstate\n" + "".join(
+            c + "\tT\ttest\t" + state + "\n" for c,state in zip("abcdef", ["positive"]*3+["negative","unknown","disputed"])))
+        score = evaluate(run, gt, tmp_path / "eval")
+        assert score["submitted_memberships"]["per_target"][0]["tp"] == 3
+        assert score["submitted_memberships"]["per_target"][0]["fp"] == 1
+        assert (tmp_path / "eval/membership_targets.tsv").is_file()
+        gt.write_text("cell_id\tlabel\n" + "".join(c+"\t"+("T" if c < "d" else "U")+"\n" for c in "abcdef"))
+        scores = evaluate(run, gt, tmp_path / "fine")
+        assert scores["submitted_memberships"]["ari"] is None
+        assert scores["submitted_memberships"]["macro_f1"] > scores["submitted_partition"]["macro_f1"]
+    else:
+        assert not (run / "memberships.tsv").exists()
     for change in (False, True):
         out = tmp_path / str(change)
         replay(run, snap, None, None, out, cfg, direct_votes=change)
+        if policy == "multiple":
+            assert (out / "ambiguous_cells.tsv").is_file()
+            with (out / "memberships.tsv").open() as stream:
+                replayed = list(csv.DictReader(stream, delimiter="\t"))
+            assert [(r["cell_id"], r["vote_group_id"], r["is_primary"]) for r in replayed] == [
+                (r["cell_id"], r["vote_group_id"], r["is_primary"]) for r in memberships]
         new = read_json(out / "artifacts/forced_choice.json")
         label = "B" if historical and not change else "A"
         assert [(g["label"], g["members"]) for g in new["groups"] if g["members"]] == [(label, list("abcdef"))]
@@ -323,3 +355,33 @@ def test_nb_high_needs_counts_and_reports_an_unsupported_split(tmp_path):
     sparse.save_npz(snap/"raw.npz",sparse.csr_matrix(np.array([[0,0,0]]+[[0,1,0]]*5)))
     assert e.mask({"nb_high":"G"},{}).tolist()==[False]*6
     assert e.nb_fits[e.index["G"]][0]["status"]=="insufficient_signal"
+
+
+def test_multiple_membership_evidence_precedence_and_cycles():
+    from rarecell.overlap_membership import retained_groups
+    labels = {g: g for g in "ABCP"}
+    # Biology removes B. Its geometry win cannot then remove C.
+    ballots = [("A", "B", "A", "biology", 0), ("B", "C", "B", "geometry", 1),
+               ("A", "C", "A", "geometry", .99), ("P", "C", "P", "geometry", 1)]
+    assert retained_groups("A", ballots, labels, {"C": {"P"}}) == {"A", "C"}
+    ballots[2] = ("A", "C", "A", "geometry", 1)
+    assert retained_groups("A", ballots, labels, {"C": {"P"}}) == {"A"}
+    cycle = [("A", "B", "A", "biology", .5), ("B", "C", "B", "biology", .5),
+             ("A", "C", "C", "cross_fitted_modules", .5)]
+    assert retained_groups("A", cycle, labels, {}) == {"A", "B", "C"}
+    cycle.append(("P", "C", "P", "biology", .5))
+    assert retained_groups("P", cycle, labels, {}) == {"P"}
+
+
+def test_multiple_membership_unclaimed_ballots_and_empty_ambiguity(tmp_path):
+    from rarecell.overlap_membership import write_memberships
+    groups = [dict(id="A", label="alpha", reliable=False, members=["c"]),
+              dict(id="B", label="beta", reliable=False, members=[])]
+    result = dict(groups=groups, panels={}, unclaimed_conflicts={"pair_votes": [
+        {"pair": "A/B", "outcomes": [["c", "A", "stable_id_tie", .5]]}]})
+    part = [dict(cell_id="c", group_id="claim/a", proposed_label="alpha", status="provisional"),
+            dict(cell_id="u", group_id="residual/u", proposed_label="unknown", status="unresolved")]
+    assert write_memberships(tmp_path, result, part)["n_memberships"] == 3
+    result.pop("unclaimed_conflicts")
+    assert write_memberships(tmp_path, result, part)["n_ambiguous_cells"] == 0
+    assert len((tmp_path / "ambiguous_cells.tsv").read_text().splitlines()) == 1

@@ -6,6 +6,7 @@ const kinds = {
   prepare: "准备快照",
   annotate: "注释快照",
   discover: "从快照发现",
+  reconcile: "离线重做争议裁决",
   resume: "恢复发现",
   evaluate: "评估结果",
   demo: "离线 Core demo",
@@ -28,6 +29,7 @@ const stages = {
   prepare: "准备",
   annotate: "注释",
   discover: "发现",
+  "reconcile-routed": "争议细胞裁决",
   evaluate: "评估",
   resume: "恢复",
   demo: "Core demo"
@@ -36,6 +38,8 @@ const metricNames = {
   n_cells: "细胞数",
   n_candidates: "候选数",
   n_groups: "群体数",
+  n_ambiguous_cells: "多归属细胞",
+  n_memberships: "细胞归属条目",
   unresolved_cells: "未决细胞",
   provider_dispatches: "发现 API 请求",
   reported_total_tokens: "已报告 token"
@@ -216,10 +220,13 @@ function updateForm() {
   field("imported-field", needsDataset && $("imported-view").options.length > 1);
   field(
     "snapshot-field",
-    ["annotate", "discover"].includes(kind) || (full && $("start").value === "snapshot"),
+    ["annotate", "discover", "reconcile"].includes(kind) || (full && $("start").value === "snapshot"),
     true
   );
   const annotated = ["A1", "A3", "A3_adaptive", "A3_routed"].includes(mode);
+  field("conflict-policy-field", kind === "reconcile" || ((full || kind === "discover") && mode === "A3_routed"));
+  form.elements.routed_conflict_policy.options[0].textContent =
+    kind === "reconcile" ? "沿用原提交的归属方式" : "沿用配置（默认强制单选）";
   field("routed-workers-field", ((full || kind === "discover") && mode === "A3_routed") || kind === "resume");
   field("seed-review-field", (full || kind === "discover") && ["A2", "A3", "A3_adaptive"].includes(mode));
   const showAnnotations = (full || kind === "discover") && annotated;
@@ -236,6 +243,7 @@ function updateForm() {
   form.elements.gt.required = kind === "evaluate";
   $("gt-hint").textContent = kind === "evaluate" ? "必填" : "可选，结束后评估";
   const hints = {
+    reconcile: "选择原提交目录和对应的准备快照。复用已保存的直接投票，新结果写入本任务目录。",
     inspect: "填写含 checkpoint.json 的发现运行目录，只读查看已有记录。",
     demo: "使用内置合成数据运行并评估，不调用模型 API。",
     pipeline: "模型从服务端环境读取密钥。相对路径以启动控制台的目录为准。",

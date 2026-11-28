@@ -26,7 +26,7 @@ def code_fingerprint():
     files = ("discovery.py", "run.py", "protocol.py", "science.py", "state.py", "providers.py",
              "config.py", "seed_review.py", "exhaustive.py", "adaptive.py", "base_evidence.py", "finalize.py", "annotation.py",
              "contrast_panels.py", "singleton_markers.py", "pool_followup.py", "nb_mixture.py", "claim_resolution.py", "handoff.py", "expansion_review.py", "routed.py", "rule_search.py",
-             "single_choice.py", "forced_routing.py", "lineage_review.py", "unclaimed_review.py", "routed_parallel.py", "review_recovery.py")
+             "single_choice.py", "overlap_membership.py", "forced_routing.py", "lineage_review.py", "unclaimed_review.py", "routed_parallel.py", "review_recovery.py")
     return fingerprint({name: hash_file(module / name) for name in files})
 
 
@@ -574,7 +574,7 @@ def _execute(run, spec, cfg, pause_after=None, retry_unknown=False, resumed=Fals
                               and previous["detail"] == "routed_action_blocked" and not previous["submitted"]
                               and (previous.get("issue") or "").startswith("Routed task pair/"))
         retry_blocked_review = (resumed and spec["mode"] == ROUTED_MODE and spec["policy"] == "live"
-                                and cfg.get("routed_conflict_policy") == "single" and not previous["submitted"]
+                                and cfg.get("routed_conflict_policy") in ("single", "multiple") and not previous["submitted"]
                                 and previous["detail"] == previous.get("issue") == "routed_action_blocked")
         # The effective extension is checkpointed before executing the first new action.
         # A killed process can therefore restart with plain resume and the same old freeze.

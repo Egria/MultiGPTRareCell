@@ -15,7 +15,7 @@ from .prepare import verify_snapshot
 from .single_choice import apply_direct_votes
 
 
-def replay(source, snapshot, dataset, book_path, out, cfg, *, direct_votes=False):
+def replay(source, snapshot, dataset, book_path, out, cfg, *, direct_votes=False, membership_policy=None):
     source, out = Path(source).resolve(), Path(out).resolve()
     if out.exists():
         raise ValueError("Choose a new output directory")
@@ -24,6 +24,9 @@ def replay(source, snapshot, dataset, book_path, out, cfg, *, direct_votes=False
         raise ValueError("Expected a submitted routed source run")
     book_path = book_path or source / "forced_review_book.json"
     book = read_json(book_path)
+    membership_policy = membership_policy or book.get("membership_policy", "single")
+    if membership_policy not in ("single", "multiple"):
+        raise ValueError("Expected single or multiple membership policy")
     version = book.get("version", 1)
     if version not in (1, 2):
         raise ValueError("Unsupported forced review book version")
@@ -173,6 +176,10 @@ def replay(source, snapshot, dataset, book_path, out, cfg, *, direct_votes=False
                     review_book_sha256=hash_file(book_path))
         report.update(ownership_policy=result.get("ownership_policy", policy),
                       ownership_changes=len(result.get("ownership_changes", [])))
+        report["membership_policy"] = membership_policy
+        if membership_policy == "multiple":
+            from .overlap_membership import write_memberships
+            report.update(write_memberships(stage, result, partition))
         write_json(stage / "run_summary.json", report)
         files = {p.relative_to(stage).as_posix(): hash_file(p) for p in sorted(stage.rglob("*")) if p.is_file()}
         write_json(stage / "frozen.json", dict(version=1, snapshot_hash=summary["snapshot_hash"], files=files))
